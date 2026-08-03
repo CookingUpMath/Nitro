@@ -5,70 +5,124 @@
 import os
 import json
 import time
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import requests
+import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 FORTNITE_API_KEY = os.getenv("FORTNITE_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# In-memory user database: {discord_id: {...}}
-# {
+# In-memory caches, backed by Postgres. Shape of each value:
+#
+# user_db[discord_id] = {
+#   "guild_id": str,                 # the server they linked from (single-server assumption)
 #   "display_name": str | None,
 #   "account_id": str | None,
 #   "locked": bool,
-#   "last_wins": int | None,
-#   "last_kills": int | None,
+#   "last_wins": int | None,         # lifetime total, refreshed every poll
+#   "last_kills": int | None,        # lifetime total, refreshed every poll
 #   "last_mode_wins": dict | None,   # {"solo": 10, "duo": 3, ...} snapshot for playlist detection
 #   "last_win_ts": int | None,       # unix timestamp of the last detected win
+#   "weekly_baseline_wins": int,     # lifetime wins as of the most recent Friday reset
+#   "weekly_baseline_kills": int,    # lifetime kills as of the most recent Friday reset
 #   "skin_name": str | None,         # cosmetic the member picked for their card
 #   "skin_icon_url": str | None
 # }
 user_db = {}
-# In-memory guild config: {guild_id: {"win_channel_id": int}}
+
+# guild_config[guild_id] = {
+#   "win_channel_id": int | None,
+#   "fortboard_role_id": int | None,
+#   "fortboard_role_holders": [discord_id, ...]   # who currently holds the weekly role
+# }
 guild_config = {}
 
+# weekly_state = {"last_reset_week": "2026-W31"}  # guards against double-firing the reset
+weekly_state = {}
+
 API_BASE = "https://fortnite-api.com"
+ET = ZoneInfo("America/New_York")
 
 
 ###############################################
-#           JSON PERSISTENCE HELPERS         #
+#           POSTGRES PERSISTENCE             #
 ###############################################
+# Simple key/value table — one JSONB blob per top-level piece of state.
+# This keeps the rest of the bot's code (which reads/writes user_db and
+# guild_config as plain dicts) essentially unchanged from the JSON-file
+# version; only save_db()/load_db() know Postgres exists.
 
-def save_db():
-    data = {
-        "users": user_db,
-        "guilds": guild_config
-    }
-    try:
-        with open("database.json", "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+db_pool = None
 
 
-def load_db():
-    global user_db, guild_config
-    if not os.path.exists("database.json"):
+async def init_db_pool():
+    global db_pool
+    if db_pool is not None:
+        return
+    if not DATABASE_URL:
+        print("[db] DATABASE_URL is not set — the bot will not remember anything between restarts.")
+        return
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value JSONB NOT NULL
+            )
+            """
+        )
+
+
+async def save_db():
+    if db_pool is None:
         return
     try:
-        with open("database.json", "r") as f:
-            data = json.load(f)
+        async with db_pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO bot_state (key, value) VALUES ($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                [
+                    ("users", json.dumps(user_db)),
+                    ("guilds", json.dumps(guild_config)),
+                    ("weekly", json.dumps(weekly_state)),
+                ],
+            )
+    except Exception as e:
+        print(f"[db] save failed: {e}")
+
+
+async def load_db():
+    global user_db, guild_config, weekly_state
+    if db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM bot_state")
+            data = {row["key"]: json.loads(row["value"]) for row in rows}
             user_db = data.get("users", {})
             guild_config = data.get("guilds", {})
-    except Exception:
+            weekly_state = data.get("weekly", {})
+    except Exception as e:
+        print(f"[db] load failed: {e}")
         user_db = {}
         guild_config = {}
-
-
-load_db()
+        weekly_state = {}
 
 
 ###############################################
@@ -147,8 +201,8 @@ def extract_all_stats(stats_data: dict):
 
 def extract_mode_wins(stats_data: dict):
     """Return {mode_key: wins} for each per-playlist bucket (solo/duo/trio/squad),
-    skipping the 'overall' aggregate. Used to figure out which playlist a new
-    win came from, since the API doesn't expose individual match history.
+    skipping the 'overall' aggregate. Used both for playlist detection on new
+    wins and for the per-mode breakdown on the /fortnite card.
     """
     all_stats = (stats_data or {}).get("stats", {}).get("all", {}) or {}
     modes = {}
@@ -168,6 +222,7 @@ PLAYLIST_LABELS = {
     "squad": "Squad",
     "squads": "Squad",
 }
+PLAYLIST_ORDER = ["solo", "duo", "trio", "squad"]
 
 
 def format_playlist_label(mode_key: str) -> str:
@@ -234,15 +289,42 @@ def color_to_emoji(color: discord.Color) -> str:
     return closest[1]
 
 
+def weekly_wins_for(info: dict) -> int:
+    baseline = info.get("weekly_baseline_wins")
+    total = info.get("last_wins") or 0
+    if baseline is None:
+        return 0
+    return max(total - baseline, 0)
+
+
+def weekly_kills_for(info: dict) -> int:
+    baseline = info.get("weekly_baseline_kills")
+    total = info.get("last_kills") or 0
+    if baseline is None:
+        return 0
+    return max(total - baseline, 0)
+
+
 ###############################################
 #                BOT READY EVENT             #
 ###############################################
 
+_startup_done = False
+
+
 @bot.event
 async def on_ready():
+    global _startup_done
+    if not _startup_done:
+        await init_db_pool()
+        await load_db()
+        _startup_done = True
     await bot.tree.sync()
     print(f"Bot is online as {bot.user}")
-    check_wins.start()
+    if not check_wins.is_running():
+        check_wins.start()
+    if not weekly_reset_loop.is_running():
+        weekly_reset_loop.start()
 
 
 ###############################################
@@ -290,6 +372,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
     mode_wins = extract_mode_wins(stats_data)
 
     user_db[discord_id] = {
+        "guild_id": str(interaction.guild.id) if interaction.guild else None,
         "display_name": display_name,
         "account_id": account_id,
         "locked": True,
@@ -297,10 +380,12 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         "last_kills": totals["kills"],
         "last_mode_wins": mode_wins,
         "last_win_ts": None,
+        "weekly_baseline_wins": totals["wins"],
+        "weekly_baseline_kills": totals["kills"],
         "skin_name": None,
         "skin_icon_url": None,
     }
-    save_db()
+    await save_db()
 
     return await interaction.followup.send(
         f"Your Fortnite account has been linked!\n"
@@ -341,6 +426,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
         )
 
     totals = extract_all_stats(stats_data)
+    mode_wins = extract_mode_wins(stats_data)
 
     last_win_ts = record.get("last_win_ts")
     last_win_str = f"<t:{last_win_ts}:f>" if last_win_ts else "Not tracked yet"
@@ -348,16 +434,19 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     role_color = target.color if target.color.value != 0 else discord.Color.blurple()
     dot = color_to_emoji(target.color)
 
-    embed = discord.Embed(
-        description=(
-            f"## {dot} {display_name}\n"
-            f"-# 🏆 Wins: {totals['wins']}\n"
-            f"-#  🔫 Kills: {totals['kills']}\n"
-            f"-# 🕹️ Played: {totals['matches']}\n"
-            f"-# ⏳ Last Win: {last_win_str}"
-        ),
-        color=role_color,
-    )
+    lines = [
+        f"## {dot} {display_name}",
+        f"🕹️ Played: {totals['matches']}",
+        f"🔫 Kills: {totals['kills']}",
+        f"⏳ Last win: {last_win_str}",
+        f"🏆 Wins: {totals['wins']}",
+    ]
+    for mode in PLAYLIST_ORDER:
+        wins = mode_wins.get(mode, 0)
+        if wins > 0:
+            lines.append(f"-# ▪️ {format_playlist_label(mode)}: {wins}")
+
+    embed = discord.Embed(description="\n".join(lines), color=role_color)
 
     skin_icon_url = record.get("skin_icon_url")
     if skin_icon_url:
@@ -398,7 +487,7 @@ async def fortniteskin(interaction: discord.Interaction, outfit_name: str):
     matched_name, icon_url = result
     user_db[discord_id]["skin_name"] = matched_name
     user_db[discord_id]["skin_icon_url"] = icon_url
-    save_db()
+    await save_db()
 
     preview = discord.Embed(
         description=f"Thumbnail set to **{matched_name}**",
@@ -407,6 +496,103 @@ async def fortniteskin(interaction: discord.Interaction, outfit_name: str):
     preview.set_thumbnail(url=icon_url)
 
     await interaction.followup.send(embed=preview)
+
+
+###############################################
+#             /fortboard COMMAND             #
+###############################################
+
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def format_leaderboard_section(title: str, rows: list) -> str:
+    lines = [f"# 🏆 {title}"]
+    if not rows:
+        lines.append("-# Nobody has linked a Fortnite account yet.")
+        return "\n".join(lines)
+    for i, (display_name, value) in enumerate(rows):
+        if i < 3:
+            lines.append(f"{MEDALS[i]} - {display_name}: {value}")
+        else:
+            lines.append(f"-# ▪️ - {display_name}: {value}")
+    return "\n".join(lines)
+
+
+@bot.tree.command(
+    name="fortboard",
+    description="This week's Fortnite wins and kills leaderboard."
+)
+async def fortboard(interaction: discord.Interaction):
+
+    if not interaction.guild:
+        return await interaction.response.send_message(
+            "This command only works inside a server.", ephemeral=True
+        )
+
+    guild_id = str(interaction.guild.id)
+
+    entries = []
+    for discord_id, info in user_db.items():
+        if info.get("guild_id") != guild_id or not info.get("account_id"):
+            continue
+        entries.append({
+            "display_name": info.get("display_name") or "Unknown",
+            "wins": weekly_wins_for(info),
+            "kills": weekly_kills_for(info),
+        })
+
+    top_wins = sorted(
+        [(e["display_name"], e["wins"]) for e in entries],
+        key=lambda pair: pair[1], reverse=True
+    )[:10]
+    top_kills = sorted(
+        [(e["display_name"], e["kills"]) for e in entries],
+        key=lambda pair: pair[1], reverse=True
+    )[:10]
+
+    description = (
+        format_leaderboard_section("Wins", top_wins)
+        + "\n\n"
+        + format_leaderboard_section("Kills", top_kills)
+    )
+
+    embed = discord.Embed(description=description, color=discord.Color.gold())
+    embed.set_footer(text="Resets every Friday at 12:00 AM ET")
+
+    await interaction.response.send_message(embed=embed)
+
+
+###############################################
+#            /setfbrole COMMAND              #
+###############################################
+
+@bot.tree.command(
+    name="setfbrole",
+    description="Staff: set the role awarded to the weekly leaderboard #1."
+)
+@app_commands.describe(role="Role to grant to the weekly wins/kills leader")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setfbrole(interaction: discord.Interaction, role: discord.Role):
+
+    guild_id = str(interaction.guild.id)
+    guild_config.setdefault(guild_id, {})
+    guild_config[guild_id]["fortboard_role_id"] = role.id
+    guild_config[guild_id].setdefault("fortboard_role_holders", [])
+    await save_db()
+
+    await interaction.response.send_message(
+        f"The weekly leaderboard champion role is now {role.mention}.",
+        ephemeral=True
+    )
+
+
+@setfbrole.error
+async def setfbrole_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
 
 
 ###############################################
@@ -430,6 +616,7 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         )
 
     user_db[discord_id] = {
+        "guild_id": None,
         "display_name": None,
         "account_id": None,
         "locked": False,
@@ -437,10 +624,12 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         "last_kills": None,
         "last_mode_wins": None,
         "last_win_ts": None,
+        "weekly_baseline_wins": None,
+        "weekly_baseline_kills": None,
         "skin_name": None,
         "skin_icon_url": None,
     }
-    save_db()
+    await save_db()
 
     await interaction.response.send_message(
         f"{member.display_name}'s Fortnite account link has been reset.",
@@ -471,10 +660,9 @@ async def setwinchannel(interaction: discord.Interaction, channel: discord.TextC
 
     guild_id = str(interaction.guild.id)
 
-    guild_config[guild_id] = {
-        "win_channel_id": channel.id
-    }
-    save_db()
+    guild_config.setdefault(guild_id, {})
+    guild_config[guild_id]["win_channel_id"] = channel.id
+    await save_db()
 
     await interaction.response.send_message(
         f"Win announcements will be posted in {channel.mention}.",
@@ -497,19 +685,24 @@ async def setwinchannel_error(interaction: discord.Interaction, error):
 # fortnite-api.com has no public match-history endpoint, so we can't get
 # per-match details (playlist, duration, exact kill count for that game).
 # Instead we poll each linked user's lifetime stats and detect a win by
-# watching the "wins" counter go up. We report the kill delta since the
-# last check as a reasonable stand-in for "kills that match."
+# watching the "wins" counter go up.
 
 @tasks.loop(seconds=120)
 async def check_wins():
+    winners_this_cycle = []
     for discord_id, info in list(user_db.items()):
         try:
-            await check_wins_for_user(discord_id, info)
+            winner_name = await check_wins_for_user(discord_id, info)
+            if winner_name:
+                winners_this_cycle.append(winner_name)
         except Exception as e:
             # Never let one user's bad data or a flaky API response kill the
             # whole loop for everyone else.
             print(f"[check_wins] error processing {discord_id}: {e}")
             continue
+
+    if winners_this_cycle:
+        await update_status(winners_this_cycle)
 
 
 @check_wins.error
@@ -521,15 +714,31 @@ async def check_wins_error(error):
         check_wins.start()
 
 
+async def update_status(winner_names: list):
+    names = list(dict.fromkeys(winner_names))  # de-dupe, keep order
+    if len(names) == 1:
+        status_text = f"🏆 {names[0]}"
+    elif len(names) == 2:
+        status_text = f"🏆 {names[0]} & {names[1]}"
+    else:
+        status_text = f"🏆 {', '.join(names[:-1])} & {names[-1]}"
+
+    try:
+        await bot.change_presence(activity=discord.CustomActivity(name=status_text))
+    except Exception as e:
+        print(f"[status] failed to update presence: {e}")
+
+
 async def check_wins_for_user(discord_id, info):
+    """Returns the display name if a new win was detected this poll, else None."""
     account_id = info.get("account_id")
     display_name = info.get("display_name")
     if not account_id:
-        return
+        return None
 
     stats_data = lookup_stats_by_account_id(account_id)
     if stats_data is None:
-        return
+        return None
 
     totals = extract_all_stats(stats_data)
     current_wins = totals["wins"]
@@ -545,17 +754,15 @@ async def check_wins_for_user(discord_id, info):
         user_db[discord_id]["last_wins"] = current_wins
         user_db[discord_id]["last_kills"] = current_kills
         user_db[discord_id]["last_mode_wins"] = current_mode_wins
-        save_db()
-        return
+        await save_db()
+        return None
 
     if current_wins <= last_wins:
-        # Still update the per-mode snapshot so future playlist detection stays accurate.
         user_db[discord_id]["last_mode_wins"] = current_mode_wins
-        save_db()
-        return
+        await save_db()
+        return None
 
     win_count = current_wins - last_wins
-    kill_delta = max(current_kills - last_kills, 0)
     win_ts = int(time.time())
 
     # Figure out which playlist the win came from by seeing whose bucket grew the most.
@@ -574,7 +781,7 @@ async def check_wins_for_user(discord_id, info):
     user_db[discord_id]["last_kills"] = current_kills
     user_db[discord_id]["last_mode_wins"] = current_mode_wins
     user_db[discord_id]["last_win_ts"] = win_ts
-    save_db()
+    await save_db()
 
     member = None
     for guild in bot.guilds:
@@ -589,16 +796,16 @@ async def check_wins_for_user(discord_id, info):
             break
 
     if not member or not member.guild:
-        return
+        return display_name  # still report for status purposes
 
     guild_id = str(member.guild.id)
     config = guild_config.get(guild_id)
     if not config or not config.get("win_channel_id"):
-        return
+        return display_name
 
     channel = member.guild.get_channel(config["win_channel_id"])
     if not channel:
-        return
+        return display_name
 
     dot = color_to_emoji(member.color)
     win_word = f"{win_count} matches" if win_count > 1 else "a match"
@@ -621,10 +828,99 @@ async def check_wins_for_user(discord_id, info):
     except Exception:
         pass
 
+    return display_name
+
 
 @check_wins.before_loop
 async def before_check_wins():
     await bot.wait_until_ready()
+
+
+###############################################
+#         WEEKLY LEADERBOARD RESET           #
+###############################################
+# Fires once, at the first minute that's Friday 00:00 in America/New_York.
+# Guarded by weekly_state["last_reset_week"] (an ISO year-week string) so a
+# restart or a slightly-late tick can't trigger it twice for the same week.
+
+@tasks.loop(minutes=1)
+async def weekly_reset_loop():
+    now = datetime.now(ET)
+    if now.weekday() != 4 or now.hour != 0 or now.minute != 0:
+        return
+
+    current_week_id = now.strftime("%G-W%V")
+    if weekly_state.get("last_reset_week") == current_week_id:
+        return
+
+    weekly_state["last_reset_week"] = current_week_id
+    await run_weekly_reset()
+    await save_db()
+
+
+@weekly_reset_loop.before_loop
+async def before_weekly_reset_loop():
+    await bot.wait_until_ready()
+
+
+@weekly_reset_loop.error
+async def weekly_reset_loop_error(error):
+    print(f"[weekly_reset] loop crashed, restarting: {error}")
+    if not weekly_reset_loop.is_running():
+        weekly_reset_loop.start()
+
+
+async def run_weekly_reset():
+    by_guild = {}
+    for discord_id, info in user_db.items():
+        gid = info.get("guild_id")
+        if not gid or not info.get("account_id"):
+            continue
+        by_guild.setdefault(gid, []).append((discord_id, info))
+
+    for guild_id, members in by_guild.items():
+        config = guild_config.get(guild_id, {})
+        role_id = config.get("fortboard_role_id")
+        guild = bot.get_guild(int(guild_id))
+
+        if guild and role_id:
+            role = guild.get_role(role_id)
+            if role:
+                wins_ranked = sorted(members, key=lambda kv: weekly_wins_for(kv[1]), reverse=True)
+                kills_ranked = sorted(members, key=lambda kv: weekly_kills_for(kv[1]), reverse=True)
+
+                winners = set()
+                if wins_ranked and weekly_wins_for(wins_ranked[0][1]) > 0:
+                    winners.add(wins_ranked[0][0])
+                if kills_ranked and weekly_kills_for(kills_ranked[0][1]) > 0:
+                    winners.add(kills_ranked[0][0])
+
+                previous_holders = config.get("fortboard_role_holders", [])
+                for old_id in previous_holders:
+                    if old_id in winners:
+                        continue
+                    try:
+                        m = await guild.fetch_member(int(old_id))
+                        await m.remove_roles(role)
+                    except Exception:
+                        pass
+
+                for win_id in winners:
+                    try:
+                        m = await guild.fetch_member(int(win_id))
+                        await m.add_roles(role)
+                    except Exception:
+                        pass
+
+                guild_config.setdefault(guild_id, {})["fortboard_role_holders"] = list(winners)
+
+    # Reset every linked user's weekly baseline, regardless of whether their
+    # guild has a role configured.
+    for discord_id, info in user_db.items():
+        if info.get("last_wins") is None:
+            continue
+        info["weekly_baseline_wins"] = info.get("last_wins", 0)
+        info["weekly_baseline_kills"] = info.get("last_kills", 0)
 
 
 ###############################################
