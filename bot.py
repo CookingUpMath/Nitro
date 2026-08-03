@@ -3,6 +3,7 @@
 ###############################################
 
 import os
+import json
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -19,8 +20,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory user database: {discord_id: {...}}
 # {
-#   "display_name": str,
-#   "account_id": str,
+#   "display_name": str | None,
+#   "account_id": str | None,
 #   "locked": bool,
 #   "last_match_id": str | None
 # }
@@ -29,6 +30,39 @@ user_db = {}
 guild_config = {}
 
 API_BASE = "https://fortnite-api.com"
+
+
+###############################################
+#           JSON PERSISTENCE HELPERS         #
+###############################################
+
+def save_db():
+    data = {
+        "users": user_db,
+        "guilds": guild_config
+    }
+    try:
+        with open("database.json", "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_db():
+    global user_db, guild_config
+    if not os.path.exists("database.json"):
+        return
+    try:
+        with open("database.json", "r") as f:
+            data = json.load(f)
+            user_db = data.get("users", {})
+            guild_config = data.get("guilds", {})
+    except Exception:
+        user_db = {}
+        guild_config = {}
+
+
+load_db()
 
 
 ###############################################
@@ -208,6 +242,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
             "locked": True,
             "last_match_id": None
         }
+        save_db()
 
         return await interaction.followup.send(
             f"Your Fortnite account has been linked!\n"
@@ -230,6 +265,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
             "locked": True,
             "last_match_id": None
         }
+        save_db()
 
         return await interaction.followup.send(
             f"Your Fortnite account has been linked!\n"
@@ -264,6 +300,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         "locked": True,
         "last_match_id": None
     }
+    save_db()
 
     return await interaction.followup.send(
         f"Your Fortnite account has been linked!\n"
@@ -312,7 +349,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
         color=discord.Color.blue()
     )
     embed.add_field(name="Wins", value=wins)
-    embed.add_field(name="Kills", value{kills})
+    embed.add_field(name="Kills", value=kills)
     embed.add_field(name="Games Played", value=matches)
 
     await interaction.response.send_message(embed=embed)
@@ -344,6 +381,7 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         "locked": False,
         "last_match_id": None
     }
+    save_db()
 
     await interaction.response.send_message(
         f"{member.display_name}'s Fortnite account link has been reset.",
@@ -377,6 +415,7 @@ async def setwinchannel(interaction: discord.Interaction, channel: discord.TextC
     guild_config[guild_id] = {
         "win_channel_id": channel.id
     }
+    save_db()
 
     await interaction.response.send_message(
         f"Win announcements will be posted in {channel.mention}.",
@@ -424,6 +463,7 @@ async def check_wins():
 
         if result != "victory":
             user_db[discord_id]["last_match_id"] = match_id
+            save_db()
             continue
 
         if mode_id not in [
@@ -433,6 +473,7 @@ async def check_wins():
             "battle_royale_reload"
         ]:
             user_db[discord_id]["last_match_id"] = match_id
+            save_db()
             continue
 
         member = None
@@ -444,17 +485,20 @@ async def check_wins():
 
         if not member or not member.guild:
             user_db[discord_id]["last_match_id"] = match_id
+            save_db()
             continue
 
         guild_id = str(member.guild.id)
         config = guild_config.get(guild_id)
         if not config or not config.get("win_channel_id"):
             user_db[discord_id]["last_match_id"] = match_id
+            save_db()
             continue
 
         channel = member.guild.get_channel(config["win_channel_id"])
         if not channel:
             user_db[discord_id]["last_match_id"] = match_id
+            save_db()
             continue
 
         mode_title = format_mode_title(mode_id)
@@ -476,6 +520,7 @@ async def check_wins():
             pass
 
         user_db[discord_id]["last_match_id"] = match_id
+        save_db()
 
 
 @check_wins.before_loop
