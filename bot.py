@@ -17,7 +17,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 FORTNITE_API_KEY = os.getenv("FORTNITE_API_KEY")
 
 intents = discord.Intents.default()
-intents.members = True  # required for guild.get_member() to reliably find users
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory user database: {discord_id: {...}}
@@ -27,6 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #   "locked": bool,
 #   "last_wins": int | None,
 #   "last_kills": int | None,
+#   "last_mode_wins": dict | None,   # {"solo": 10, "duo": 3, ...} snapshot for playlist detection
 #   "last_win_ts": int | None,       # unix timestamp of the last detected win
 #   "skin_name": str | None,         # cosmetic the member picked for their card
 #   "skin_icon_url": str | None
@@ -145,6 +145,35 @@ def extract_all_stats(stats_data: dict):
     }
 
 
+def extract_mode_wins(stats_data: dict):
+    """Return {mode_key: wins} for each per-playlist bucket (solo/duo/trio/squad),
+    skipping the 'overall' aggregate. Used to figure out which playlist a new
+    win came from, since the API doesn't expose individual match history.
+    """
+    all_stats = (stats_data or {}).get("stats", {}).get("all", {}) or {}
+    modes = {}
+    for key, value in all_stats.items():
+        if key == "overall" or not isinstance(value, dict):
+            continue
+        modes[key] = value.get("wins", 0)
+    return modes
+
+
+PLAYLIST_LABELS = {
+    "solo": "Solo",
+    "duo": "Duo",
+    "duos": "Duo",
+    "trio": "Trio",
+    "trios": "Trio",
+    "squad": "Squad",
+    "squads": "Squad",
+}
+
+
+def format_playlist_label(mode_key: str) -> str:
+    return PLAYLIST_LABELS.get(mode_key.lower(), mode_key.title())
+
+
 def search_outfit_icon(name: str):
     """Search the BR cosmetics catalog for an outfit and return (name, icon_url)
     for the best match, or None if nothing was found. No API key required.
@@ -258,6 +287,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         display_name = stats_data["account"]["name"]
 
     totals = extract_all_stats(stats_data)
+    mode_wins = extract_mode_wins(stats_data)
 
     user_db[discord_id] = {
         "display_name": display_name,
@@ -265,6 +295,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         "locked": True,
         "last_wins": totals["wins"],
         "last_kills": totals["kills"],
+        "last_mode_wins": mode_wins,
         "last_win_ts": None,
         "skin_name": None,
         "skin_icon_url": None,
@@ -319,7 +350,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
     embed = discord.Embed(
         description=(
-            f"## {dot} {display_name}\n"
+            f"**{dot} {display_name}**\n"
             f"-# 🏆 Wins: {totals['wins']}\n"
             f"-#  🔫 Kills: {totals['kills']}\n"
             f"-# 🕹️ Played: {totals['matches']}\n"
@@ -404,6 +435,7 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         "locked": False,
         "last_wins": None,
         "last_kills": None,
+        "last_mode_wins": None,
         "last_win_ts": None,
         "skin_name": None,
         "skin_icon_url": None,
@@ -471,81 +503,123 @@ async def setwinchannel_error(interaction: discord.Interaction, error):
 @tasks.loop(seconds=120)
 async def check_wins():
     for discord_id, info in list(user_db.items()):
-        account_id = info.get("account_id")
-        display_name = info.get("display_name")
-        if not account_id:
+        try:
+            await check_wins_for_user(discord_id, info)
+        except Exception as e:
+            # Never let one user's bad data or a flaky API response kill the
+            # whole loop for everyone else.
+            print(f"[check_wins] error processing {discord_id}: {e}")
             continue
 
-        stats_data = lookup_stats_by_account_id(account_id)
-        if stats_data is None:
-            continue
 
-        totals = extract_all_stats(stats_data)
-        current_wins = totals["wins"]
-        current_kills = totals["kills"]
+@check_wins.error
+async def check_wins_error(error):
+    # Belt-and-suspenders: if something still slips past the try/except
+    # above and the loop dies, log it and restart it instead of going silent.
+    print(f"[check_wins] loop crashed, restarting: {error}")
+    if not check_wins.is_running():
+        check_wins.start()
 
-        last_wins = info.get("last_wins")
-        last_kills = info.get("last_kills")
 
-        # First time we've ever seen this user's stats: just baseline, don't announce.
-        if last_wins is None:
-            user_db[discord_id]["last_wins"] = current_wins
-            user_db[discord_id]["last_kills"] = current_kills
-            save_db()
-            continue
+async def check_wins_for_user(discord_id, info):
+    account_id = info.get("account_id")
+    display_name = info.get("display_name")
+    if not account_id:
+        return
 
-        if current_wins <= last_wins:
-            continue  # no new win
+    stats_data = lookup_stats_by_account_id(account_id)
+    if stats_data is None:
+        return
 
-        win_count = current_wins - last_wins
-        kill_delta = max(current_kills - last_kills, 0)
-        win_ts = int(time.time())
+    totals = extract_all_stats(stats_data)
+    current_wins = totals["wins"]
+    current_kills = totals["kills"]
+    current_mode_wins = extract_mode_wins(stats_data)
 
+    last_wins = info.get("last_wins")
+    last_kills = info.get("last_kills")
+    last_mode_wins = info.get("last_mode_wins") or {}
+
+    # First time we've ever seen this user's stats: just baseline, don't announce.
+    if last_wins is None:
         user_db[discord_id]["last_wins"] = current_wins
         user_db[discord_id]["last_kills"] = current_kills
-        user_db[discord_id]["last_win_ts"] = win_ts
+        user_db[discord_id]["last_mode_wins"] = current_mode_wins
         save_db()
+        return
 
-        member = None
-        for guild in bot.guilds:
-            m = guild.get_member(int(discord_id))
-            if m:
-                member = m
-                break
+    if current_wins <= last_wins:
+        # Still update the per-mode snapshot so future playlist detection stays accurate.
+        user_db[discord_id]["last_mode_wins"] = current_mode_wins
+        save_db()
+        return
 
-        if not member or not member.guild:
-            continue
+    win_count = current_wins - last_wins
+    kill_delta = max(current_kills - last_kills, 0)
+    win_ts = int(time.time())
 
-        guild_id = str(member.guild.id)
-        config = guild_config.get(guild_id)
-        if not config or not config.get("win_channel_id"):
-            continue
+    # Figure out which playlist the win came from by seeing whose bucket grew the most.
+    increased = [
+        (mode, wins - last_mode_wins.get(mode, wins))
+        for mode, wins in current_mode_wins.items()
+        if wins > last_mode_wins.get(mode, wins)
+    ]
+    if increased:
+        increased.sort(key=lambda pair: pair[1], reverse=True)
+        playlist_label = format_playlist_label(increased[0][0])
+    else:
+        playlist_label = "Unknown"
 
-        channel = member.guild.get_channel(config["win_channel_id"])
-        if not channel:
-            continue
+    user_db[discord_id]["last_wins"] = current_wins
+    user_db[discord_id]["last_kills"] = current_kills
+    user_db[discord_id]["last_mode_wins"] = current_mode_wins
+    user_db[discord_id]["last_win_ts"] = win_ts
+    save_db()
 
-        dot = color_to_emoji(member.color)
-        win_word = f"{win_count} matches" if win_count > 1 else "a match"
-
-        embed = discord.Embed(
-            description=(
-                f"# {dot} Victory Royale!\n"
-                f"-# **{display_name}** just won {win_word}\n"
-                f"-# 🔫 Kills since last check: {kill_delta}\n"
-                f"-# 🏆 Total Wins: {current_wins}\n"
-                f"-# ⏳ {f'<t:{win_ts}:R>'}"
-            ),
-            color=member.color if member.color.value != 0 else discord.Color.gold(),
-        )
-        skin_icon_url = user_db[discord_id].get("skin_icon_url")
-        if skin_icon_url:
-            embed.set_thumbnail(url=skin_icon_url)
-
+    member = None
+    for guild in bot.guilds:
         try:
-            await channel.send(embed=embed)
-        except Exception:
-            pass
+            m = await guild.fetch_member(int(discord_id))
+        except discord.NotFound:
+            continue
+        except discord.HTTPException:
+            continue
+        if m:
+            member = m
+            break
+
+    if not member or not member.guild:
+        return
+
+    guild_id = str(member.guild.id)
+    config = guild_config.get(guild_id)
+    if not config or not config.get("win_channel_id"):
+        return
+
+    channel = member.guild.get_channel(config["win_channel_id"])
+    if not channel:
+        return
+
+    dot = color_to_emoji(member.color)
+    win_word = f"{win_count} matches" if win_count > 1 else "a match"
+
+    embed = discord.Embed(
+        description=(
+            f"# {dot} Victory Royale!\n"
+            f"**{display_name}** just won {win_word}\n"
+            f"-# 🔫 Playlist: {playlist_label}\n"
+            f"-# 🏆 Total Wins: {current_wins}"
+        ),
+        color=member.color if member.color.value != 0 else discord.Color.gold(),
+    )
+    skin_icon_url = user_db[discord_id].get("skin_icon_url")
+    if skin_icon_url:
+        embed.set_thumbnail(url=skin_icon_url)
+
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        pass
 
 
 @check_wins.before_loop
