@@ -66,52 +66,25 @@ load_db()
 
 
 ###############################################
-#           FORTNITE API FUNCTIONS           #
+#           FORTNITE API FUNCTIONS (2026)    #
 ###############################################
 
-def lookup_fortnite_user_by_name(username: str):
-    """Validate Fortnite username and return stats if real (name-based)."""
-    url = f"{API_BASE}/v2/stats/br/v2?name={username}"
-    headers = {"Authorization": FORTNITE_API_KEY}
-
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-    if data.get("status") != 200:
-        return None
-
-    return data
-
-
-def lookup_fortnite_user_by_account(account_id: str):
-    """Validate Fortnite account ID and return stats if real (account-based)."""
-    url = f"{API_BASE}/v2/stats/br/v2?account={account_id}"
-    headers = {"Authorization": FORTNITE_API_KEY}
-
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-    if data.get("status") != 200:
-        return None
-
-    return data
+def api_headers():
+    return {
+        "Authorization": f"Bearer {FORTNITE_API_KEY}"
+    }
 
 
 def get_account_id_from_username(username: str):
-    """Resolve Epic account ID from display name."""
-    url = f"{API_BASE}/v2/account/id?username={username}"
-    headers = {"Authorization": FORTNITE_API_KEY}
+    """Resolve Epic account ID from display name (2026 endpoint)."""
+    url = f"{API_BASE}/v2/account?username={username}"
+    response = requests.get(url, headers=api_headers())
 
-    response = requests.get(url, headers=headers)
     if response.status_code != 200:
         return None
 
     data = response.json()
-    if data.get("status") != 200 or "data" not in data or "id" not in data["data"]:
+    if data.get("status") != 200:
         return None
 
     return data["data"]["id"]
@@ -120,25 +93,38 @@ def get_account_id_from_username(username: str):
 def get_display_name_from_account(account_id: str):
     """Fetch Epic display name from account ID."""
     url = f"{API_BASE}/v2/account/{account_id}"
-    headers = {"Authorization": FORTNITE_API_KEY}
+    response = requests.get(url, headers=api_headers())
 
-    response = requests.get(url, headers=headers)
     if response.status_code != 200:
         return None
 
     data = response.json()
-    if data.get("status") != 200 or "data" not in data or "name" not in data["data"]:
+    if data.get("status") != 200:
         return None
 
     return data["data"]["name"]
 
 
+def lookup_fortnite_user_by_account(account_id: str):
+    """Fetch BR stats using account ID (2026)."""
+    url = f"{API_BASE}/v2/stats/br/v2?account={account_id}"
+    response = requests.get(url, headers=api_headers())
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    if data.get("status") != 200:
+        return None
+
+    return data
+
+
 def get_recent_matches(account_id: str):
     """Fetch recent matches for a user by account ID."""
     url = f"{API_BASE}/v2/matches?account={account_id}"
-    headers = {"Authorization": FORTNITE_API_KEY}
+    response = requests.get(url, headers=api_headers())
 
-    response = requests.get(url, headers=headers)
     if response.status_code != 200:
         return None
 
@@ -150,7 +136,6 @@ def get_recent_matches(account_id: str):
 
 
 def format_mode_title(mode_id: str) -> str:
-    """Convert mode ID to human-readable title."""
     mode_map = {
         "battle_royale": "Battle Royale",
         "battle_royale_zero_build": "Battle Royale Zero Build",
@@ -161,7 +146,6 @@ def format_mode_title(mode_id: str) -> str:
 
 
 def format_playlist_name(playlist_id: str) -> str:
-    """Convert playlist ID to Solo/Duos/Trios/Squads."""
     pid = (playlist_id or "").lower()
 
     if "solo" in pid:
@@ -177,7 +161,6 @@ def format_playlist_name(playlist_id: str) -> str:
 
 
 def format_duration(seconds: int) -> str:
-    """Format duration in MM:SS."""
     minutes = seconds // 60
     secs = seconds % 60
     return f"{minutes:02d}:{secs:02d}"
@@ -200,7 +183,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="fortniteuser",
-    description="Link your Fortnite account using either display name or account ID."
+    description="Link your Fortnite account using display name or account ID."
 )
 @app_commands.describe(user_input="Your Epic display name OR your Epic Account ID")
 async def fortniteuser(interaction: discord.Interaction, user_input: str):
@@ -213,27 +196,23 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
             "You already linked your Fortnite account. Staff can reset it if needed."
         )
 
-    # Detect if input looks like an Account ID (32+ chars, alphanumeric)
     is_account_id = len(user_input) >= 32 and user_input.isalnum()
 
-    # -----------------------------
-    # CASE 1: USER ENTERED ACCOUNT ID
-    # -----------------------------
+    # CASE 1: Account ID
     if is_account_id:
         account_id = user_input
 
         stats_data = lookup_fortnite_user_by_account(account_id)
         if stats_data is None:
             return await interaction.followup.send(
-                "This Account ID has no Battle Royale stats. "
-                "You must play at least one BR match before linking."
+                "This Account ID has no Battle Royale stats yet. "
+                "Play one BR match and try again."
             )
 
         display_name = get_display_name_from_account(account_id)
         if display_name is None:
             return await interaction.followup.send(
-                "I validated your Account ID, but I couldn’t fetch your display name. "
-                "Please check your Epic account."
+                "I validated your Account ID, but couldn't fetch your display name."
             )
 
         user_db[discord_id] = {
@@ -249,50 +228,24 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
             f"**Display Name:** {display_name}"
         )
 
-    # -----------------------------
-    # CASE 2: USER ENTERED DISPLAY NAME
-    # -----------------------------
+    # CASE 2: Display name
     display_name = user_input
 
-    # Try normal stats lookup by name
-    stats_data = lookup_fortnite_user_by_name(display_name)
-    if stats_data is not None:
-        account_id = stats_data["data"]["account"]["id"]
-
-        user_db[discord_id] = {
-            "display_name": display_name,
-            "account_id": account_id,
-            "locked": True,
-            "last_match_id": None
-        }
-        save_db()
-
-        return await interaction.followup.send(
-            f"Your Fortnite account has been linked!\n"
-            f"**Display Name:** {display_name}"
-        )
-
-    # If stats lookup fails → try account ID lookup from username
     account_id = get_account_id_from_username(display_name)
     if account_id is None:
         return await interaction.followup.send(
-            "I couldn’t find your Epic account. "
-            "If your display name isn’t recognized, please paste your Epic Account ID instead."
+            "I couldn't find your Epic account. "
+            "Double-check your display name or paste your Account ID."
         )
 
     stats_data = lookup_fortnite_user_by_account(account_id)
     if stats_data is None:
         return await interaction.followup.send(
-            "I found your Epic Account ID, but it has no Battle Royale stats. "
-            "You must play at least one BR match before linking."
+            "I found your account, but you have no BR stats yet. "
+            "Play one BR match and try again."
         )
 
-    display_name_resolved = get_display_name_from_account(account_id)
-    if display_name_resolved is None:
-        return await interaction.followup.send(
-            "I validated your Account ID, but I couldn’t fetch your display name. "
-            "Please check your Epic account."
-        )
+    display_name_resolved = get_display_name_from_account(account_id) or display_name
 
     user_db[discord_id] = {
         "display_name": display_name_resolved,
@@ -334,15 +287,15 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     stats_data = lookup_fortnite_user_by_account(account_id)
     if stats_data is None:
         return await interaction.response.send_message(
-            "Could not fetch stats. Fortnite API may be down.",
+            "Could not fetch stats. Fortnite API may be down or stats are still hidden.",
             ephemeral=True
         )
 
     stats = stats_data["data"]["stats"]["all"]
 
-    wins = stats["wins"]
-    kills = stats["kills"]
-    matches = stats["matches"]
+    wins = stats.get("wins", 0)
+    kills = stats.get("kills", 0)
+    matches = stats.get("matches", 0)
 
     embed = discord.Embed(
         title=f"{display_name}'s Fortnite Stats",
