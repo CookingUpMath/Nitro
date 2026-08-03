@@ -23,7 +23,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #   "display_name": str | None,
 #   "account_id": str | None,
 #   "locked": bool,
-#   "last_match_id": str | None
+#   "last_wins": int | None,
+#   "last_kills": int | None
 # }
 user_db = {}
 # In-memory guild config: {guild_id: {"win_channel_id": int}}
@@ -68,102 +69,75 @@ load_db()
 ###############################################
 #           FORTNITE API FUNCTIONS (2026)    #
 ###############################################
+# Real, documented endpoints only:
+#   GET /v2/stats/br/v2?name=...            -> resolve name + fetch stats in one call
+#   GET /v2/stats/br/v2/{accountId}         -> fetch stats by account ID
+# There is no separate "account lookup" endpoint and no public match-history
+# endpoint on fortnite-api.com — stats are the only source of truth we have,
+# so wins are detected by diffing the stats counter over time.
 
 def api_headers():
     return {
-        "Authorization": f"Bearer {FORTNITE_API_KEY}"
+        "Authorization": FORTNITE_API_KEY
     }
 
 
-def get_account_id_from_username(username: str):
-    """Resolve Epic account ID from display name (2026 endpoint)."""
-    url = f"{API_BASE}/v2/account?username={username}"
-    response = requests.get(url, headers=api_headers())
+def lookup_stats_by_name(name: str):
+    """Resolve a display name AND fetch stats in a single call.
+    Returns the 'data' object (contains data['account'] and data['stats']), or None.
+    """
+    url = f"{API_BASE}/v2/stats/br/v2"
+    try:
+        response = requests.get(
+            url,
+            headers=api_headers(),
+            params={"name": name, "accountType": "epic", "timeWindow": "lifetime"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return None
 
     if response.status_code != 200:
         return None
 
-    data = response.json()
-    if data.get("status") != 200:
+    payload = response.json()
+    if payload.get("status") != 200:
         return None
 
-    return data["data"]["id"]
+    return payload.get("data")
 
 
-def get_display_name_from_account(account_id: str):
-    """Fetch Epic display name from account ID."""
-    url = f"{API_BASE}/v2/account/{account_id}"
-    response = requests.get(url, headers=api_headers())
+def lookup_stats_by_account_id(account_id: str):
+    """Fetch stats directly by account ID. Returns the 'data' object, or None."""
+    url = f"{API_BASE}/v2/stats/br/v2/{account_id}"
+    try:
+        response = requests.get(
+            url,
+            headers=api_headers(),
+            params={"timeWindow": "lifetime"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return None
 
     if response.status_code != 200:
         return None
 
-    data = response.json()
-    if data.get("status") != 200:
+    payload = response.json()
+    if payload.get("status") != 200:
         return None
 
-    return data["data"]["name"]
+    return payload.get("data")
 
 
-def lookup_fortnite_user_by_account(account_id: str):
-    """Fetch BR stats using account ID (2026)."""
-    url = f"{API_BASE}/v2/stats/br/v2?account={account_id}"
-    response = requests.get(url, headers=api_headers())
-
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-    if data.get("status") != 200:
-        return None
-
-    return data
-
-
-def get_recent_matches(account_id: str):
-    """Fetch recent matches for a user by account ID."""
-    url = f"{API_BASE}/v2/matches?account={account_id}"
-    response = requests.get(url, headers=api_headers())
-
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-    if data.get("status") != 200:
-        return None
-
-    return data.get("data", [])
-
-
-def format_mode_title(mode_id: str) -> str:
-    mode_map = {
-        "battle_royale": "Battle Royale",
-        "battle_royale_zero_build": "Battle Royale Zero Build",
-        "battle_royale_og": "OG Battle Royale",
-        "battle_royale_reload": "Reload",
+def extract_all_stats(stats_data: dict):
+    """Pull wins/kills/matches out of a stats 'data' object, defaulting to 0."""
+    stats = (stats_data or {}).get("stats", {}).get("all", {}).get("overall", {})
+    return {
+        "wins": stats.get("wins", 0),
+        "kills": stats.get("kills", 0),
+        "matches": stats.get("matches", 0),
     }
-    return mode_map.get(mode_id, "Battle Royale")
-
-
-def format_playlist_name(playlist_id: str) -> str:
-    pid = (playlist_id or "").lower()
-
-    if "solo" in pid:
-        return "Solo"
-    if "duo" in pid:
-        return "Duos"
-    if "trio" in pid:
-        return "Trios"
-    if "squad" in pid:
-        return "Squads"
-
-    return "Unknown"
-
-
-def format_duration(seconds: int) -> str:
-    minutes = seconds // 60
-    secs = seconds % 60
-    return f"{minutes:02d}:{secs:02d}"
 
 
 ###############################################
@@ -198,66 +172,40 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
 
     is_account_id = len(user_input) >= 32 and user_input.isalnum()
 
-    # CASE 1: Account ID
     if is_account_id:
-        account_id = user_input
-
-        stats_data = lookup_fortnite_user_by_account(account_id)
+        stats_data = lookup_stats_by_account_id(user_input)
         if stats_data is None:
             return await interaction.followup.send(
-                "This Account ID has no Battle Royale stats yet. "
-                "Play one BR match and try again."
+                "I couldn't find stats for that Account ID. Make sure it's correct "
+                "and that you've played at least one BR match."
             )
-
-        display_name = get_display_name_from_account(account_id)
-        if display_name is None:
+        account_id = stats_data["account"]["id"]
+        display_name = stats_data["account"]["name"]
+    else:
+        stats_data = lookup_stats_by_name(user_input)
+        if stats_data is None:
             return await interaction.followup.send(
-                "I validated your Account ID, but couldn't fetch your display name."
+                "I couldn't find that Epic account, or it has no BR stats yet. "
+                "Double-check the spelling (it's case- and character-sensitive), "
+                "or paste your Account ID instead."
             )
+        account_id = stats_data["account"]["id"]
+        display_name = stats_data["account"]["name"]
 
-        user_db[discord_id] = {
-            "display_name": display_name,
-            "account_id": account_id,
-            "locked": True,
-            "last_match_id": None
-        }
-        save_db()
-
-        return await interaction.followup.send(
-            f"Your Fortnite account has been linked!\n"
-            f"**Display Name:** {display_name}"
-        )
-
-    # CASE 2: Display name
-    display_name = user_input
-
-    account_id = get_account_id_from_username(display_name)
-    if account_id is None:
-        return await interaction.followup.send(
-            "I couldn't find your Epic account. "
-            "Double-check your display name or paste your Account ID."
-        )
-
-    stats_data = lookup_fortnite_user_by_account(account_id)
-    if stats_data is None:
-        return await interaction.followup.send(
-            "I found your account, but you have no BR stats yet. "
-            "Play one BR match and try again."
-        )
-
-    display_name_resolved = get_display_name_from_account(account_id) or display_name
+    totals = extract_all_stats(stats_data)
 
     user_db[discord_id] = {
-        "display_name": display_name_resolved,
+        "display_name": display_name,
         "account_id": account_id,
         "locked": True,
-        "last_match_id": None
+        "last_wins": totals["wins"],
+        "last_kills": totals["kills"],
     }
     save_db()
 
     return await interaction.followup.send(
         f"Your Fortnite account has been linked!\n"
-        f"**Display Name:** {display_name_resolved}"
+        f"**Display Name:** {display_name}"
     )
 
 
@@ -284,26 +232,22 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     display_name = user_db[discord_id]["display_name"]
     account_id = user_db[discord_id]["account_id"]
 
-    stats_data = lookup_fortnite_user_by_account(account_id)
+    stats_data = lookup_stats_by_account_id(account_id)
     if stats_data is None:
         return await interaction.response.send_message(
             "Could not fetch stats. Fortnite API may be down or stats are still hidden.",
             ephemeral=True
         )
 
-    stats = stats_data["data"]["stats"]["all"]
-
-    wins = stats.get("wins", 0)
-    kills = stats.get("kills", 0)
-    matches = stats.get("matches", 0)
+    totals = extract_all_stats(stats_data)
 
     embed = discord.Embed(
         title=f"{display_name}'s Fortnite Stats",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Wins", value=wins)
-    embed.add_field(name="Kills", value=kills)
-    embed.add_field(name="Games Played", value=matches)
+    embed.add_field(name="Wins", value=totals["wins"])
+    embed.add_field(name="Kills", value=totals["kills"])
+    embed.add_field(name="Games Played", value=totals["matches"])
 
     await interaction.response.send_message(embed=embed)
 
@@ -332,7 +276,8 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         "display_name": None,
         "account_id": None,
         "locked": False,
-        "last_match_id": None
+        "last_wins": None,
+        "last_kills": None,
     }
     save_db()
 
@@ -388,46 +333,47 @@ async def setwinchannel_error(interaction: discord.Interaction, error):
 ###############################################
 #           WIN DETECTION BACKGROUND         #
 ###############################################
+# fortnite-api.com has no public match-history endpoint, so we can't get
+# per-match details (playlist, duration, exact kill count for that game).
+# Instead we poll each linked user's lifetime stats and detect a win by
+# watching the "wins" counter go up. We report the kill delta since the
+# last check as a reasonable stand-in for "kills that match."
 
 @tasks.loop(seconds=120)
 async def check_wins():
-    """Check for new wins every 120 seconds and post them."""
-    for discord_id, info in user_db.items():
+    for discord_id, info in list(user_db.items()):
         account_id = info.get("account_id")
         display_name = info.get("display_name")
         if not account_id:
             continue
 
-        matches = get_recent_matches(account_id)
-        if not matches:
+        stats_data = lookup_stats_by_account_id(account_id)
+        if stats_data is None:
             continue
 
-        latest = matches[0]
-        match_id = latest.get("id")
+        totals = extract_all_stats(stats_data)
+        current_wins = totals["wins"]
+        current_kills = totals["kills"]
 
-        if info.get("last_match_id") == match_id:
-            continue
+        last_wins = info.get("last_wins")
+        last_kills = info.get("last_kills")
 
-        result = latest.get("result")
-        mode_id = latest.get("mode")
-        playlist_id = latest.get("playlist")
-        kills = latest.get("kills", 0)
-        duration = latest.get("duration", 0)
-
-        if result != "victory":
-            user_db[discord_id]["last_match_id"] = match_id
+        # First time we've ever seen this user's stats: just baseline, don't announce.
+        if last_wins is None:
+            user_db[discord_id]["last_wins"] = current_wins
+            user_db[discord_id]["last_kills"] = current_kills
             save_db()
             continue
 
-        if mode_id not in [
-            "battle_royale",
-            "battle_royale_zero_build",
-            "battle_royale_og",
-            "battle_royale_reload"
-        ]:
-            user_db[discord_id]["last_match_id"] = match_id
-            save_db()
-            continue
+        if current_wins <= last_wins:
+            continue  # no new win
+
+        win_count = current_wins - last_wins
+        kill_delta = max(current_kills - last_kills, 0)
+
+        user_db[discord_id]["last_wins"] = current_wins
+        user_db[discord_id]["last_kills"] = current_kills
+        save_db()
 
         member = None
         for guild in bot.guilds:
@@ -437,43 +383,32 @@ async def check_wins():
                 break
 
         if not member or not member.guild:
-            user_db[discord_id]["last_match_id"] = match_id
-            save_db()
             continue
 
         guild_id = str(member.guild.id)
         config = guild_config.get(guild_id)
         if not config or not config.get("win_channel_id"):
-            user_db[discord_id]["last_match_id"] = match_id
-            save_db()
             continue
 
         channel = member.guild.get_channel(config["win_channel_id"])
         if not channel:
-            user_db[discord_id]["last_match_id"] = match_id
-            save_db()
             continue
 
-        mode_title = format_mode_title(mode_id)
-        playlist_name = format_playlist_name(playlist_id or "")
-        time_str = format_duration(duration or 0)
-
         embed = discord.Embed(
-            title=f"🏆 {mode_title}",
+            title="🏆 Victory Royale!",
             color=member.color if member.color.value != 0 else discord.Color.gold()
         )
-        embed.description = f"**{display_name}** just won a match!"
-        embed.add_field(name="Kills", value=str(kills), inline=False)
-        embed.add_field(name="Playlist", value=playlist_name, inline=False)
-        embed.add_field(name="Time", value=time_str, inline=False)
+        if win_count > 1:
+            embed.description = f"**{display_name}** just won {win_count} matches!"
+        else:
+            embed.description = f"**{display_name}** just won a match!"
+        embed.add_field(name="Kills (since last check)", value=str(kill_delta), inline=False)
+        embed.add_field(name="Total Wins", value=str(current_wins), inline=False)
 
         try:
             await channel.send(embed=embed)
         except Exception:
             pass
-
-        user_db[discord_id]["last_match_id"] = match_id
-        save_db()
 
 
 @check_wins.before_loop
