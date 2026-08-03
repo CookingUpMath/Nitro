@@ -17,6 +17,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 FORTNITE_API_KEY = os.getenv("FORTNITE_API_KEY")
 
 intents = discord.Intents.default()
+intents.members = True  # required for guild.get_member() to reliably find users
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory user database: {discord_id: {...}}
@@ -318,7 +319,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
     embed = discord.Embed(
         description=(
-            f"## {dot} {display_name}\n"
+            f"**{dot} {display_name}**\n"
             f"-# 🏆 Wins: {totals['wins']}\n"
             f"-#  🔫 Kills: {totals['kills']}\n"
             f"-# 🕹️ Played: {totals['matches']}\n"
