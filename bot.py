@@ -318,7 +318,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
     embed = discord.Embed(
         description=(
-            f"# {dot} Cooking up {display_name}\n"
+            f"# {dot} {display_name}\n"
             f"-# 🏆 Wins: {totals['wins']}\n"
             f"-#  🔫 Kills: {totals['kills']}\n"
             f"-# 🕹️ Played: {totals['matches']}\n"
@@ -498,9 +498,11 @@ async def check_wins():
 
         win_count = current_wins - last_wins
         kill_delta = max(current_kills - last_kills, 0)
+        win_ts = int(time.time())
 
         user_db[discord_id]["last_wins"] = current_wins
         user_db[discord_id]["last_kills"] = current_kills
+        user_db[discord_id]["last_win_ts"] = win_ts
         save_db()
 
         member = None
@@ -522,16 +524,22 @@ async def check_wins():
         if not channel:
             continue
 
+        dot = color_to_emoji(member.color)
+        win_word = f"{win_count} matches" if win_count > 1 else "a match"
+
         embed = discord.Embed(
-            title="🏆 Victory Royale!",
-            color=member.color if member.color.value != 0 else discord.Color.gold()
+            description=(
+                f"# {dot} Victory Royale!\n"
+                f"-# **{display_name}** just won {win_word}\n"
+                f"-# 🔫 Kills since last check: {kill_delta}\n"
+                f"-# 🏆 Total Wins: {current_wins}\n"
+                f"-# ⏳ {f'<t:{win_ts}:R>'}"
+            ),
+            color=member.color if member.color.value != 0 else discord.Color.gold(),
         )
-        if win_count > 1:
-            embed.description = f"**{display_name}** just won {win_count} matches!"
-        else:
-            embed.description = f"**{display_name}** just won a match!"
-        embed.add_field(name="Kills (since last check)", value=str(kill_delta), inline=False)
-        embed.add_field(name="Total Wins", value=str(current_wins), inline=False)
+        skin_icon_url = user_db[discord_id].get("skin_icon_url")
+        if skin_icon_url:
+            embed.set_thumbnail(url=skin_icon_url)
 
         try:
             await channel.send(embed=embed)
