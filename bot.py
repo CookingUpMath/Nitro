@@ -222,7 +222,7 @@ PLAYLIST_LABELS = {
     "squad": "Squad",
     "squads": "Squad",
 }
-PLAYLIST_ORDER = ["solo", "duo", "trio", "squad"]
+PLAYLIST_ORDER = ["solo", "duo", "squad"]
 
 
 def format_playlist_label(mode_key: str) -> str:
@@ -508,7 +508,7 @@ MEDALS = ["🥇", "🥈", "🥉"]
 def format_leaderboard_section(title: str, rows: list) -> str:
     lines = [f"# 🏆 {title}"]
     if not rows:
-        lines.append("-# Nobody has linked a Fortnite account yet.")
+        lines.append("-# No one has any yet this week.")
         return "\n".join(lines)
     for i, (display_name, value) in enumerate(rows):
         if i < 3:
@@ -542,11 +542,11 @@ async def fortboard(interaction: discord.Interaction):
         })
 
     top_wins = sorted(
-        [(e["display_name"], e["wins"]) for e in entries],
+        [(e["display_name"], e["wins"]) for e in entries if e["wins"] > 0],
         key=lambda pair: pair[1], reverse=True
     )[:10]
     top_kills = sorted(
-        [(e["display_name"], e["kills"]) for e in entries],
+        [(e["display_name"], e["kills"]) for e in entries if e["kills"] > 0],
         key=lambda pair: pair[1], reverse=True
     )[:10]
 
