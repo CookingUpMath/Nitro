@@ -18,20 +18,25 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory user database: {discord_id: {...}}
+# {
+#   "display_name": str,
+#   "account_id": str,
+#   "locked": bool,
+#   "last_match_id": str | None
+# }
 user_db = {}
 # In-memory guild config: {guild_id: {"win_channel_id": int}}
 guild_config = {}
+
+API_BASE = "https://fortnite-api.com"
 
 
 ###############################################
 #           FORTNITE API FUNCTIONS           #
 ###############################################
 
-API_BASE = "https://fortnite-api.com"
-
-
-def lookup_fortnite_user(username: str):
-    """Validate Fortnite username and return stats if real."""
+def lookup_fortnite_user_by_name(username: str):
+    """Validate Fortnite username and return stats if real (name-based)."""
     url = f"{API_BASE}/v2/stats/br/v2?name={username}"
     headers = {"Authorization": FORTNITE_API_KEY}
 
@@ -40,15 +45,15 @@ def lookup_fortnite_user(username: str):
         return None
 
     data = response.json()
-    if data.get("status") == 404:
+    if data.get("status") != 200:
         return None
 
     return data
 
 
-def get_recent_matches(username: str):
-    """Fetch recent matches for a user."""
-    url = f"{API_BASE}/v2/matches?name={username}"
+def lookup_fortnite_user_by_account(account_id: str):
+    """Validate Fortnite account ID and return stats if real (account-based)."""
+    url = f"{API_BASE}/v2/stats/br/v2?account={account_id}"
     headers = {"Authorization": FORTNITE_API_KEY}
 
     response = requests.get(url, headers=headers)
@@ -56,7 +61,55 @@ def get_recent_matches(username: str):
         return None
 
     data = response.json()
-    if data.get("status") == 404:
+    if data.get("status") != 200:
+        return None
+
+    return data
+
+
+def get_account_id_from_username(username: str):
+    """Resolve Epic account ID from display name."""
+    url = f"{API_BASE}/v2/account/id?username={username}"
+    headers = {"Authorization": FORTNITE_API_KEY}
+
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    if data.get("status") != 200 or "data" not in data or "id" not in data["data"]:
+        return None
+
+    return data["data"]["id"]
+
+
+def get_display_name_from_account(account_id: str):
+    """Fetch Epic display name from account ID."""
+    url = f"{API_BASE}/v2/account/{account_id}"
+    headers = {"Authorization": FORTNITE_API_KEY}
+
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    if data.get("status") != 200 or "data" not in data or "name" not in data["data"]:
+        return None
+
+    return data["data"]["name"]
+
+
+def get_recent_matches(account_id: str):
+    """Fetch recent matches for a user by account ID."""
+    url = f"{API_BASE}/v2/matches?account={account_id}"
+    headers = {"Authorization": FORTNITE_API_KEY}
+
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    if data.get("status") != 200:
         return None
 
     return data.get("data", [])
@@ -75,7 +128,7 @@ def format_mode_title(mode_id: str) -> str:
 
 def format_playlist_name(playlist_id: str) -> str:
     """Convert playlist ID to Solo/Duos/Trios/Squads."""
-    pid = playlist_id.lower()
+    pid = (playlist_id or "").lower()
 
     if "solo" in pid:
         return "Solo"
@@ -113,37 +166,108 @@ async def on_ready():
 
 @bot.tree.command(
     name="fortniteuser",
-    description="Set your Fortnite username (locked after setting)."
+    description="Link your Fortnite account using either display name or account ID."
 )
-@app_commands.describe(username="Your Fortnite username")
-async def fortniteuser(interaction: discord.Interaction, username: str):
+@app_commands.describe(user_input="Your Epic display name OR your Epic Account ID")
+async def fortniteuser(interaction: discord.Interaction, user_input: str):
 
+    await interaction.response.defer(ephemeral=True)
     discord_id = str(interaction.user.id)
 
-    if discord_id in user_db and user_db[discord_id]["locked"]:
-        await interaction.response.send_message(
-            "You already set your Fortnite username. Contact staff to reset it.",
-            ephemeral=True
+    if discord_id in user_db and user_db[discord_id].get("locked"):
+        return await interaction.followup.send(
+            "You already linked your Fortnite account. Staff can reset it if needed."
         )
-        return
 
-    data = lookup_fortnite_user(username)
-    if data is None:
-        await interaction.response.send_message(
-            "That Fortnite username does not exist. Double-check your spelling.",
-            ephemeral=True
+    # Detect if input looks like an Account ID (32+ chars, alphanumeric)
+    is_account_id = len(user_input) >= 32 and user_input.isalnum()
+
+    # -----------------------------
+    # CASE 1: USER ENTERED ACCOUNT ID
+    # -----------------------------
+    if is_account_id:
+        account_id = user_input
+
+        stats_data = lookup_fortnite_user_by_account(account_id)
+        if stats_data is None:
+            return await interaction.followup.send(
+                "This Account ID has no Battle Royale stats. "
+                "You must play at least one BR match before linking."
+            )
+
+        display_name = get_display_name_from_account(account_id)
+        if display_name is None:
+            return await interaction.followup.send(
+                "I validated your Account ID, but I couldn’t fetch your display name. "
+                "Please check your Epic account."
+            )
+
+        user_db[discord_id] = {
+            "display_name": display_name,
+            "account_id": account_id,
+            "locked": True,
+            "last_match_id": None
+        }
+
+        return await interaction.followup.send(
+            f"Your Fortnite account has been linked!\n"
+            f"**Display Name:** {display_name}"
         )
-        return
+
+    # -----------------------------
+    # CASE 2: USER ENTERED DISPLAY NAME
+    # -----------------------------
+    display_name = user_input
+
+    # Try normal stats lookup by name
+    stats_data = lookup_fortnite_user_by_name(display_name)
+    if stats_data is not None:
+        account_id = stats_data["data"]["account"]["id"]
+
+        user_db[discord_id] = {
+            "display_name": display_name,
+            "account_id": account_id,
+            "locked": True,
+            "last_match_id": None
+        }
+
+        return await interaction.followup.send(
+            f"Your Fortnite account has been linked!\n"
+            f"**Display Name:** {display_name}"
+        )
+
+    # If stats lookup fails → try account ID lookup from username
+    account_id = get_account_id_from_username(display_name)
+    if account_id is None:
+        return await interaction.followup.send(
+            "I couldn’t find your Epic account. "
+            "If your display name isn’t recognized, please paste your Epic Account ID instead."
+        )
+
+    stats_data = lookup_fortnite_user_by_account(account_id)
+    if stats_data is None:
+        return await interaction.followup.send(
+            "I found your Epic Account ID, but it has no Battle Royale stats. "
+            "You must play at least one BR match before linking."
+        )
+
+    display_name_resolved = get_display_name_from_account(account_id)
+    if display_name_resolved is None:
+        return await interaction.followup.send(
+            "I validated your Account ID, but I couldn’t fetch your display name. "
+            "Please check your Epic account."
+        )
 
     user_db[discord_id] = {
-        "username": username,
+        "display_name": display_name_resolved,
+        "account_id": account_id,
         "locked": True,
         "last_match_id": None
     }
 
-    await interaction.response.send_message(
-        f"Your Fortnite username has been set to **{username}** and is now locked.",
-        ephemeral=True
+    return await interaction.followup.send(
+        f"Your Fortnite account has been linked!\n"
+        f"**Display Name:** {display_name_resolved}"
     )
 
 
@@ -161,35 +285,34 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     target = user or interaction.user
     discord_id = str(target.id)
 
-    if discord_id not in user_db or not user_db[discord_id]["username"]:
-        await interaction.response.send_message(
-            f"{target.display_name} has not set a Fortnite username.",
+    if discord_id not in user_db or not user_db[discord_id].get("account_id"):
+        return await interaction.response.send_message(
+            f"{target.display_name} has not linked a Fortnite account.",
             ephemeral=True
         )
-        return
 
-    username = user_db[discord_id]["username"]
+    display_name = user_db[discord_id]["display_name"]
+    account_id = user_db[discord_id]["account_id"]
 
-    data = lookup_fortnite_user(username)
-    if data is None:
-        await interaction.response.send_message(
+    stats_data = lookup_fortnite_user_by_account(account_id)
+    if stats_data is None:
+        return await interaction.response.send_message(
             "Could not fetch stats. Fortnite API may be down.",
             ephemeral=True
         )
-        return
 
-    stats = data["data"]["stats"]["all"]
+    stats = stats_data["data"]["stats"]["all"]
 
     wins = stats["wins"]
     kills = stats["kills"]
     matches = stats["matches"]
 
     embed = discord.Embed(
-        title=f"{username}'s Fortnite Stats",
+        title=f"{display_name}'s Fortnite Stats",
         color=discord.Color.blue()
     )
     embed.add_field(name="Wins", value=wins)
-    embed.add_field(name="Kills", value=kills)
+    embed.add_field(name="Kills", value{kills})
     embed.add_field(name="Games Played", value=matches)
 
     await interaction.response.send_message(embed=embed)
@@ -201,7 +324,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
 @bot.tree.command(
     name="resetuser",
-    description="Staff: Reset a user's Fortnite username."
+    description="Staff: Reset a user's linked Fortnite account."
 )
 @app_commands.describe(member="The member to reset")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -209,21 +332,21 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
 
     discord_id = str(member.id)
 
-    if discord_id not in user_db or not user_db[discord_id]["username"]:
-        await interaction.response.send_message(
-            f"{member.display_name} does not have a Fortnite username set.",
+    if discord_id not in user_db or not user_db[discord_id].get("account_id"):
+        return await interaction.response.send_message(
+            f"{member.display_name} does not have a Fortnite account linked.",
             ephemeral=True
         )
-        return
 
     user_db[discord_id] = {
-        "username": None,
+        "display_name": None,
+        "account_id": None,
         "locked": False,
         "last_match_id": None
     }
 
     await interaction.response.send_message(
-        f"{member.display_name}'s Fortnite username has been reset.",
+        f"{member.display_name}'s Fortnite account link has been reset.",
         ephemeral=True
     )
 
@@ -278,18 +401,18 @@ async def setwinchannel_error(interaction: discord.Interaction, error):
 async def check_wins():
     """Check for new wins every 120 seconds and post them."""
     for discord_id, info in user_db.items():
-        username = info.get("username")
-        if not username:
+        account_id = info.get("account_id")
+        display_name = info.get("display_name")
+        if not account_id:
             continue
 
-        matches = get_recent_matches(username)
+        matches = get_recent_matches(account_id)
         if not matches:
             continue
 
         latest = matches[0]
         match_id = latest.get("id")
 
-        # Avoid duplicate announcements
         if info.get("last_match_id") == match_id:
             continue
 
@@ -299,7 +422,6 @@ async def check_wins():
         kills = latest.get("kills", 0)
         duration = latest.get("duration", 0)
 
-        # Only announce wins in official modes
         if result != "victory":
             user_db[discord_id]["last_match_id"] = match_id
             continue
@@ -313,7 +435,6 @@ async def check_wins():
             user_db[discord_id]["last_match_id"] = match_id
             continue
 
-        # Find member and guilds
         member = None
         for guild in bot.guilds:
             m = guild.get_member(int(discord_id))
@@ -336,7 +457,6 @@ async def check_wins():
             user_db[discord_id]["last_match_id"] = match_id
             continue
 
-        # Build embed
         mode_title = format_mode_title(mode_id)
         playlist_name = format_playlist_name(playlist_id or "")
         time_str = format_duration(duration or 0)
@@ -345,7 +465,7 @@ async def check_wins():
             title=f"🏆 {mode_title}",
             color=member.color if member.color.value != 0 else discord.Color.gold()
         )
-        embed.description = f"**{username}** just won a match!"
+        embed.description = f"**{display_name}** just won a match!"
         embed.add_field(name="Kills", value=str(kills), inline=False)
         embed.add_field(name="Playlist", value=playlist_name, inline=False)
         embed.add_field(name="Time", value=time_str, inline=False)
