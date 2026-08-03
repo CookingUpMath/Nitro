@@ -318,7 +318,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
     embed = discord.Embed(
         description=(
-            f"# {dot} {display_name}\n"
+            f"## {dot} {display_name}\n"
             f"-# 🏆 Wins: {totals['wins']}\n"
             f"-#  🔫 Kills: {totals['kills']}\n"
             f"-# 🕹️ Played: {totals['matches']}\n"
