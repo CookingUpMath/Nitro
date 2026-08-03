@@ -4,6 +4,7 @@
 
 import os
 import json
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -24,7 +25,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #   "account_id": str | None,
 #   "locked": bool,
 #   "last_wins": int | None,
-#   "last_kills": int | None
+#   "last_kills": int | None,
+#   "last_win_ts": int | None,       # unix timestamp of the last detected win
+#   "skin_name": str | None,         # cosmetic the member picked for their card
+#   "skin_icon_url": str | None
 # }
 user_db = {}
 # In-memory guild config: {guild_id: {"win_channel_id": int}}
@@ -140,6 +144,66 @@ def extract_all_stats(stats_data: dict):
     }
 
 
+def search_outfit_icon(name: str):
+    """Search the BR cosmetics catalog for an outfit and return (name, icon_url)
+    for the best match, or None if nothing was found. No API key required.
+    """
+    url = f"{API_BASE}/v2/cosmetics/br/search/all"
+    try:
+        response = requests.get(
+            url,
+            params={"name": name, "matchMethod": "contains", "type": "outfit"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    payload = response.json()
+    if payload.get("status") != 200:
+        return None
+
+    results = payload.get("data") or []
+    if not results:
+        return None
+
+    best = results[0]
+    images = best.get("images", {}) or {}
+    icon_url = images.get("icon") or images.get("smallIcon")
+    if not icon_url:
+        return None
+
+    return best.get("name", name), icon_url
+
+
+# Standard Discord "color circle" emoji, used to pick a title emoji that
+# roughly matches a member's role color.
+COLOR_EMOJIS = {
+    (237, 66, 69): "🔴",     # red
+    (230, 126, 34): "🟠",    # orange
+    (241, 196, 15): "🟡",    # yellow
+    (67, 181, 129): "🟢",    # green
+    (52, 152, 219): "🔵",    # blue
+    (155, 89, 182): "🟣",    # purple
+    (121, 85, 72): "🟤",     # brown
+    (35, 39, 42): "⚫",      # black / dark
+    (255, 255, 255): "⚪",   # white
+}
+
+
+def color_to_emoji(color: discord.Color) -> str:
+    if color is None or color.value == 0:
+        return "⚪"
+    r, g, b = color.r, color.g, color.b
+    closest = min(
+        COLOR_EMOJIS.items(),
+        key=lambda kv: (kv[0][0] - r) ** 2 + (kv[0][1] - g) ** 2 + (kv[0][2] - b) ** 2,
+    )
+    return closest[1]
+
+
 ###############################################
 #                BOT READY EVENT             #
 ###############################################
@@ -200,12 +264,16 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         "locked": True,
         "last_wins": totals["wins"],
         "last_kills": totals["kills"],
+        "last_win_ts": None,
+        "skin_name": None,
+        "skin_icon_url": None,
     }
     save_db()
 
     return await interaction.followup.send(
         f"Your Fortnite account has been linked!\n"
-        f"**Display Name:** {display_name}"
+        f"**Display Name:** {display_name}\n\n"
+        f"Tip: run `/fortniteskin <outfit name>` to set a thumbnail for your `/fortnite` card."
     )
 
 
@@ -229,8 +297,9 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
             ephemeral=True
         )
 
-    display_name = user_db[discord_id]["display_name"]
-    account_id = user_db[discord_id]["account_id"]
+    record = user_db[discord_id]
+    display_name = record["display_name"]
+    account_id = record["account_id"]
 
     stats_data = lookup_stats_by_account_id(account_id)
     if stats_data is None:
@@ -241,15 +310,71 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
 
     totals = extract_all_stats(stats_data)
 
+    last_win_ts = record.get("last_win_ts")
+    last_win_str = f"<t:{last_win_ts}:f>" if last_win_ts else "Not tracked yet"
+
+    role_color = target.color if target.color.value != 0 else discord.Color.blurple()
+    dot = color_to_emoji(target.color)
+
     embed = discord.Embed(
-        title=f"{display_name}'s Fortnite Stats",
-        color=discord.Color.blue()
+        description=(
+            f"# {dot} Cooking up {display_name}\n"
+            f"-# 🏆 Wins: {totals['wins']}\n"
+            f"-#  🔫 Kills: {totals['kills']}\n"
+            f"-# 🕹️ Played: {totals['matches']}\n"
+            f"-# ⏳ Last Win: {last_win_str}"
+        ),
+        color=role_color,
     )
-    embed.add_field(name="Wins", value=totals["wins"])
-    embed.add_field(name="Kills", value=totals["kills"])
-    embed.add_field(name="Games Played", value=totals["matches"])
+
+    skin_icon_url = record.get("skin_icon_url")
+    if skin_icon_url:
+        embed.set_thumbnail(url=skin_icon_url)
 
     await interaction.response.send_message(embed=embed)
+
+
+###############################################
+#          /fortniteskin COMMAND             #
+###############################################
+# There's no public API for "what skin is this account currently wearing" —
+# that data lives inside Epic's private, authenticated game session and
+# isn't exposed anywhere. Instead, members pick a favorite outfit from the
+# public cosmetics catalog and we pin its icon to their stats card.
+
+@bot.tree.command(
+    name="fortniteskin",
+    description="Pick an outfit icon to show on your /fortnite stats card."
+)
+@app_commands.describe(outfit_name="Search for an outfit by name, e.g. 'Peely'")
+async def fortniteskin(interaction: discord.Interaction, outfit_name: str):
+
+    await interaction.response.defer(ephemeral=True)
+    discord_id = str(interaction.user.id)
+
+    if discord_id not in user_db or not user_db[discord_id].get("account_id"):
+        return await interaction.followup.send(
+            "Link your Fortnite account first with `/fortniteuser`."
+        )
+
+    result = search_outfit_icon(outfit_name)
+    if result is None:
+        return await interaction.followup.send(
+            f"Couldn't find an outfit matching **{outfit_name}**. Try a different spelling."
+        )
+
+    matched_name, icon_url = result
+    user_db[discord_id]["skin_name"] = matched_name
+    user_db[discord_id]["skin_icon_url"] = icon_url
+    save_db()
+
+    preview = discord.Embed(
+        description=f"Thumbnail set to **{matched_name}**",
+        color=discord.Color.blurple(),
+    )
+    preview.set_thumbnail(url=icon_url)
+
+    await interaction.followup.send(embed=preview)
 
 
 ###############################################
@@ -278,6 +403,9 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
         "locked": False,
         "last_wins": None,
         "last_kills": None,
+        "last_win_ts": None,
+        "skin_name": None,
+        "skin_icon_url": None,
     }
     save_db()
 
