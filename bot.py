@@ -46,7 +46,8 @@ user_db = {}
 # guild_config[guild_id] = {
 #   "win_channel_id": int | None,
 #   "fortboard_role_id": int | None,
-#   "fortboard_role_holders": [discord_id, ...]   # who currently holds the weekly role
+#   "fortboard_role_holders": [discord_id, ...],  # who currently holds the weekly role
+#   "linked_role_id": int | None                  # granted on link, removed on /resetuser
 # }
 guild_config = {}
 
@@ -387,6 +388,16 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
     }
     await save_db()
 
+    if interaction.guild:
+        role_id = guild_config.get(str(interaction.guild.id), {}).get("linked_role_id")
+        if role_id:
+            role = interaction.guild.get_role(role_id)
+            if role:
+                try:
+                    await interaction.user.add_roles(role)
+                except Exception:
+                    pass
+
     return await interaction.followup.send(
         f"Your Fortnite account has been linked!\n"
         f"**Display Name:** {display_name}\n\n"
@@ -563,115 +574,114 @@ async def fortboard(interaction: discord.Interaction):
 
 
 ###############################################
-#            /setfbrole COMMAND              #
+#              /settings COMMAND             #
 ###############################################
+# One consolidated staff command with dropdown pickers instead of three
+# separate slash commands. Each dropdown saves immediately on selection.
+
+def build_settings_embed(guild_id: str) -> discord.Embed:
+    config = guild_config.get(guild_id, {})
+
+    win_channel_id = config.get("win_channel_id")
+    fb_role_id = config.get("fortboard_role_id")
+    linked_role_id = config.get("linked_role_id")
+
+    win_channel_str = f"<#{win_channel_id}>" if win_channel_id else "*Not set*"
+    fb_role_str = f"<@&{fb_role_id}>" if fb_role_id else "*Not set*"
+    linked_role_str = f"<@&{linked_role_id}>" if linked_role_id else "*Not set*"
+
+    embed = discord.Embed(
+        title="⚙️ Fortnite Bot Settings",
+        description=(
+            f"🏆 **Win Announcement Channel:** {win_channel_str}\n"
+            f"🥇 **Weekly Leaderboard Champion Role:** {fb_role_str}\n"
+            f"🔗 **Linked Account Role:** {linked_role_str}"
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Pick an option below to update a setting.")
+    return embed
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self, guild_id: str):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+        self.win_channel_select = discord.ui.ChannelSelect(
+            placeholder="🏆 Set win announcement channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.win_channel_select.callback = self.on_win_channel
+        self.add_item(self.win_channel_select)
+
+        self.fb_role_select = discord.ui.RoleSelect(
+            placeholder="🥇 Set weekly leaderboard champion role",
+            min_values=1,
+            max_values=1,
+        )
+        self.fb_role_select.callback = self.on_fb_role
+        self.add_item(self.fb_role_select)
+
+        self.linked_role_select = discord.ui.RoleSelect(
+            placeholder="🔗 Set linked account role",
+            min_values=1,
+            max_values=1,
+        )
+        self.linked_role_select.callback = self.on_linked_role
+        self.add_item(self.linked_role_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You do not have permission to change these settings.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=build_settings_embed(self.guild_id), view=self
+        )
+
+    async def on_win_channel(self, interaction: discord.Interaction):
+        channel = self.win_channel_select.values[0]
+        guild_config.setdefault(self.guild_id, {})["win_channel_id"] = channel.id
+        await save_db()
+        await self._refresh(interaction)
+
+    async def on_fb_role(self, interaction: discord.Interaction):
+        role = self.fb_role_select.values[0]
+        guild_config.setdefault(self.guild_id, {})
+        guild_config[self.guild_id]["fortboard_role_id"] = role.id
+        guild_config[self.guild_id].setdefault("fortboard_role_holders", [])
+        await save_db()
+        await self._refresh(interaction)
+
+    async def on_linked_role(self, interaction: discord.Interaction):
+        role = self.linked_role_select.values[0]
+        guild_config.setdefault(self.guild_id, {})["linked_role_id"] = role.id
+        await save_db()
+        await self._refresh(interaction)
+
 
 @bot.tree.command(
-    name="setfbrole",
-    description="Staff: set the role awarded to the weekly leaderboard #1."
+    name="settings",
+    description="Staff: configure the bot's channel and role settings."
 )
-@app_commands.describe(role="Role to grant to the weekly wins/kills leader")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setfbrole(interaction: discord.Interaction, role: discord.Role):
-
+async def settings_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
-    guild_config.setdefault(guild_id, {})
-    guild_config[guild_id]["fortboard_role_id"] = role.id
-    guild_config[guild_id].setdefault("fortboard_role_holders", [])
-    await save_db()
-
-    await interaction.response.send_message(
-        f"The weekly leaderboard champion role is now {role.mention}.",
-        ephemeral=True
-    )
+    view = SettingsView(guild_id)
+    embed = build_settings_embed(guild_id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@setfbrole.error
-async def setfbrole_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "You do not have permission to use this command.",
-            ephemeral=True
-        )
-
-
-###############################################
-#            /resetuser COMMAND              #
-###############################################
-
-@bot.tree.command(
-    name="resetuser",
-    description="Staff: Reset a user's linked Fortnite account."
-)
-@app_commands.describe(member="The member to reset")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def resetuser(interaction: discord.Interaction, member: discord.Member):
-
-    discord_id = str(member.id)
-
-    if discord_id not in user_db or not user_db[discord_id].get("account_id"):
-        return await interaction.response.send_message(
-            f"{member.display_name} does not have a Fortnite account linked.",
-            ephemeral=True
-        )
-
-    user_db[discord_id] = {
-        "guild_id": None,
-        "display_name": None,
-        "account_id": None,
-        "locked": False,
-        "last_wins": None,
-        "last_kills": None,
-        "last_mode_wins": None,
-        "last_win_ts": None,
-        "weekly_baseline_wins": None,
-        "weekly_baseline_kills": None,
-        "skin_name": None,
-        "skin_icon_url": None,
-    }
-    await save_db()
-
-    await interaction.response.send_message(
-        f"{member.display_name}'s Fortnite account link has been reset.",
-        ephemeral=True
-    )
-
-
-@resetuser.error
-async def resetuser_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "You do not have permission to use this command.",
-            ephemeral=True
-        )
-
-
-###############################################
-#          /setwinchannel COMMAND            #
-###############################################
-
-@bot.tree.command(
-    name="setwinchannel",
-    description="Set the channel where win messages will be posted."
-)
-@app_commands.describe(channel="Channel for win announcements")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def setwinchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-
-    guild_id = str(interaction.guild.id)
-
-    guild_config.setdefault(guild_id, {})
-    guild_config[guild_id]["win_channel_id"] = channel.id
-    await save_db()
-
-    await interaction.response.send_message(
-        f"Win announcements will be posted in {channel.mention}.",
-        ephemeral=True
-    )
-
-
-@setwinchannel.error
-async def setwinchannel_error(interaction: discord.Interaction, error):
+@settings_cmd.error
+async def settings_cmd_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "You do not have permission to use this command.",
