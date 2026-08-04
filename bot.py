@@ -439,7 +439,10 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     stats_data = await lookup_stats_by_account_id(account_id)
     if stats_data is None:
         return await interaction.followup.send(
-            "Could not fetch stats. Fortnite API may be down or stats are still hidden.",
+            "Could not fetch stats. This usually means **Public Game Stats** got turned off "
+            "in Fortnite (Settings → Account and Privacy → Gameplay Privacy) — it needs to "
+            "stay on for this bot to read your stats. Could also just be the Fortnite API "
+            "being temporarily down.",
             ephemeral=True
         )
 
@@ -689,6 +692,79 @@ async def settings_cmd(interaction: discord.Interaction):
 
 @settings_cmd.error
 async def settings_cmd_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+
+
+###############################################
+#          /fortnitedebug COMMAND            #
+###############################################
+# Staff-only diagnostic tool: shows exactly what's stored for a member,
+# plus makes a fresh, direct API call using their stored account_id so you
+# can see the raw status code and API response instead of just "it doesn't
+# work" — separates a bad stored value from an Epic-side issue.
+
+@bot.tree.command(
+    name="fortnitedebug",
+    description="Staff: inspect a member's stored Fortnite data and test the live API."
+)
+@app_commands.describe(member="The member to inspect")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def fortnitedebug(interaction: discord.Interaction, member: discord.Member):
+
+    await interaction.response.defer(ephemeral=True)
+    discord_id = str(member.id)
+    record = user_db.get(discord_id)
+
+    if not record:
+        return await interaction.followup.send(
+            "No stored record at all for this member — they've never run `/fortniteuser`."
+        )
+
+    account_id = record.get("account_id")
+    lines = [
+        "**Stored data**",
+        f"Discord ID: `{discord_id}`",
+        f"Account ID: `{account_id}`",
+        f"Display name: `{record.get('display_name')}`",
+        f"Guild ID stored: `{record.get('guild_id')}`",
+        f"Locked: `{record.get('locked')}`",
+        f"Last wins/kills seen: `{record.get('last_wins')}` / `{record.get('last_kills')}`",
+        "",
+        "**Live API test (using the stored account_id)**",
+    ]
+
+    if not account_id:
+        lines.append("No account_id stored — nothing to test against.")
+    else:
+        url = f"{API_BASE}/v2/stats/br/v2/{account_id}"
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                url,
+                headers=api_headers(),
+                params={"timeWindow": "lifetime"},
+                timeout=10,
+            )
+            lines.append(f"HTTP status code: `{response.status_code}`")
+            try:
+                payload = response.json()
+                lines.append(f"API 'status' field: `{payload.get('status')}`")
+                if payload.get("status") != 200:
+                    lines.append(f"API error message: `{payload.get('error', 'none given')}`")
+            except ValueError:
+                lines.append("Response body was not valid JSON.")
+        except requests.RequestException as e:
+            lines.append(f"Request itself failed: `{e}`")
+
+    await interaction.followup.send("\n".join(lines))
+
+
+@fortnitedebug.error
+async def fortnitedebug_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "You do not have permission to use this command.",
