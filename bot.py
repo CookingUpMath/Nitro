@@ -142,13 +142,16 @@ def api_headers():
     }
 
 
-def lookup_stats_by_name(name: str):
+async def lookup_stats_by_name(name: str):
     """Resolve a display name AND fetch stats in a single call.
     Returns the 'data' object (contains data['account'] and data['stats']), or None.
+    Runs the blocking HTTP call in a worker thread so it never freezes the
+    bot's event loop while waiting on a slow API response.
     """
     url = f"{API_BASE}/v2/stats/br/v2"
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             url,
             headers=api_headers(),
             params={"name": name, "accountType": "epic", "timeWindow": "lifetime"},
@@ -167,11 +170,12 @@ def lookup_stats_by_name(name: str):
     return payload.get("data")
 
 
-def lookup_stats_by_account_id(account_id: str):
+async def lookup_stats_by_account_id(account_id: str):
     """Fetch stats directly by account ID. Returns the 'data' object, or None."""
     url = f"{API_BASE}/v2/stats/br/v2/{account_id}"
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             url,
             headers=api_headers(),
             params={"timeWindow": "lifetime"},
@@ -230,13 +234,14 @@ def format_playlist_label(mode_key: str) -> str:
     return PLAYLIST_LABELS.get(mode_key.lower(), mode_key.title())
 
 
-def search_outfit_icon(name: str):
+async def search_outfit_icon(name: str):
     """Search the BR cosmetics catalog for an outfit and return (name, icon_url)
     for the best match, or None if nothing was found. No API key required.
     """
     url = f"{API_BASE}/v2/cosmetics/br/search/all"
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             url,
             params={"name": name, "matchMethod": "contains", "type": "outfit"},
             timeout=10,
@@ -350,7 +355,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
     is_account_id = len(user_input) >= 32 and user_input.isalnum()
 
     if is_account_id:
-        stats_data = lookup_stats_by_account_id(user_input)
+        stats_data = await lookup_stats_by_account_id(user_input)
         if stats_data is None:
             return await interaction.followup.send(
                 "I couldn't find stats for that Account ID. Make sure it's correct "
@@ -359,7 +364,7 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         account_id = stats_data["account"]["id"]
         display_name = stats_data["account"]["name"]
     else:
-        stats_data = lookup_stats_by_name(user_input)
+        stats_data = await lookup_stats_by_name(user_input)
         if stats_data is None:
             return await interaction.followup.send(
                 "I couldn't find that Epic account, or it has no BR stats yet. "
@@ -425,13 +430,15 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
             ephemeral=True
         )
 
+    await interaction.response.defer()
+
     record = user_db[discord_id]
     display_name = record["display_name"]
     account_id = record["account_id"]
 
-    stats_data = lookup_stats_by_account_id(account_id)
+    stats_data = await lookup_stats_by_account_id(account_id)
     if stats_data is None:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "Could not fetch stats. Fortnite API may be down or stats are still hidden.",
             ephemeral=True
         )
@@ -463,7 +470,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     if skin_icon_url:
         embed.set_thumbnail(url=skin_icon_url)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 ###############################################
@@ -489,7 +496,7 @@ async def fortniteskin(interaction: discord.Interaction, outfit_name: str):
             "Link your Fortnite account first with `/fortniteuser`."
         )
 
-    result = search_outfit_icon(outfit_name)
+    result = await search_outfit_icon(outfit_name)
     if result is None:
         return await interaction.followup.send(
             f"Couldn't find an outfit matching **{outfit_name}**. Try a different spelling."
@@ -746,7 +753,7 @@ async def check_wins_for_user(discord_id, info):
     if not account_id:
         return None
 
-    stats_data = lookup_stats_by_account_id(account_id)
+    stats_data = await lookup_stats_by_account_id(account_id)
     if stats_data is None:
         return None
 
