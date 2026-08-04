@@ -584,6 +584,66 @@ async def fortboard(interaction: discord.Interaction):
 
 
 ###############################################
+#            /resetuser COMMAND              #
+###############################################
+
+@bot.tree.command(
+    name="resetuser",
+    description="Staff: Reset a user's linked Fortnite account."
+)
+@app_commands.describe(member="The member to reset")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def resetuser(interaction: discord.Interaction, member: discord.Member):
+
+    discord_id = str(member.id)
+
+    if discord_id not in user_db or not user_db[discord_id].get("account_id"):
+        return await interaction.response.send_message(
+            f"{member.display_name} does not have a Fortnite account linked.",
+            ephemeral=True
+        )
+
+    role_id = guild_config.get(str(interaction.guild.id), {}).get("linked_role_id")
+    if role_id:
+        role = interaction.guild.get_role(role_id)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role)
+            except Exception:
+                pass
+
+    user_db[discord_id] = {
+        "guild_id": None,
+        "display_name": None,
+        "account_id": None,
+        "locked": False,
+        "last_wins": None,
+        "last_kills": None,
+        "last_mode_wins": None,
+        "last_win_ts": None,
+        "weekly_baseline_wins": None,
+        "weekly_baseline_kills": None,
+        "skin_name": None,
+        "skin_icon_url": None,
+    }
+    await save_db()
+
+    await interaction.response.send_message(
+        f"{member.display_name}'s Fortnite account link has been reset.",
+        ephemeral=True
+    )
+
+
+@resetuser.error
+async def resetuser_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+
+
+###############################################
 #              /settings COMMAND             #
 ###############################################
 # One consolidated staff command with dropdown pickers instead of three
