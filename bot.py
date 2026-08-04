@@ -808,16 +808,16 @@ async def check_wins_for_user(discord_id, info):
             break
 
     if not member or not member.guild:
-        return display_name  # still report for status purposes
+        return display_name  # no Discord member found — fall back to the Epic name
 
     guild_id = str(member.guild.id)
     config = guild_config.get(guild_id)
     if not config or not config.get("win_channel_id"):
-        return display_name
+        return member.display_name
 
     channel = member.guild.get_channel(config["win_channel_id"])
     if not channel:
-        return display_name
+        return member.display_name
 
     dot = color_to_emoji(member.color)
     win_word = f"{win_count} matches" if win_count > 1 else "a match"
@@ -840,7 +840,7 @@ async def check_wins_for_user(discord_id, info):
     except Exception:
         pass
 
-    return display_name
+    return member.display_name
 
 
 @check_wins.before_loop
