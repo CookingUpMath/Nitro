@@ -758,6 +758,8 @@ async def check_wins_for_user(discord_id, info):
         return None
 
     if current_wins <= last_wins:
+        user_db[discord_id]["last_wins"] = current_wins
+        user_db[discord_id]["last_kills"] = current_kills
         user_db[discord_id]["last_mode_wins"] = current_mode_wins
         await save_db()
         return None
