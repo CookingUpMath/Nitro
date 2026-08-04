@@ -94,9 +94,10 @@ async def init_db_pool():
         )
 
 
-async def save_db():
+async def save_db() -> bool:
     if db_pool is None:
-        return
+        print("[db] save skipped — no database connection")
+        return False
     try:
         async with db_pool.acquire() as conn:
             await conn.executemany(
@@ -110,8 +111,10 @@ async def save_db():
                     ("weekly", json.dumps(weekly_state)),
                 ],
             )
+        return True
     except Exception as e:
         print(f"[db] save failed: {e}")
+        return False
 
 
 async def load_db():
@@ -325,6 +328,12 @@ _startup_done = False
 
 
 @bot.event
+async def on_interaction(interaction: discord.Interaction):
+    cmd_name = getattr(interaction.command, "name", None)
+    print(f"[interaction] received — command={cmd_name}, user={interaction.user}, type={interaction.type}")
+
+
+@bot.event
 async def on_ready():
     global _startup_done
     if not _startup_done:
@@ -338,6 +347,7 @@ async def on_ready():
     synced = await bot.tree.sync()
     print(f"[startup] synced {len(synced)} command(s)")
     print(f"Bot is online as {bot.user}")
+    print(f"[startup] Application ID: {bot.application_id}")
     if not check_wins.is_running():
         check_wins.start()
     if not weekly_reset_loop.is_running():
@@ -402,7 +412,13 @@ async def fortniteuser(interaction: discord.Interaction, user_input: str):
         "skin_name": None,
         "skin_icon_url": None,
     }
-    await save_db()
+    saved = await save_db()
+    if not saved:
+        del user_db[discord_id]
+        return await interaction.followup.send(
+            "I found your account, but couldn't save the link due to a database error. "
+            "Please try again in a moment — if it keeps failing, let staff know."
+        )
 
     if interaction.guild:
         role_id = guild_config.get(str(interaction.guild.id), {}).get("linked_role_id")
