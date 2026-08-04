@@ -3,11 +3,17 @@
 ###############################################
 
 import os
+import sys
 import json
 import time
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# Railway (and most container platforms) buffer stdout by default, which can
+# make print() output show up late or not at all in the log viewer. Force
+# line-buffering so every print() is visible immediately.
+sys.stdout.reconfigure(line_buffering=True)
 
 import discord
 from discord import app_commands
@@ -322,10 +328,15 @@ _startup_done = False
 async def on_ready():
     global _startup_done
     if not _startup_done:
+        print("[startup] connecting to database...")
         await init_db_pool()
+        print("[startup] database connected, loading state...")
         await load_db()
+        print(f"[startup] loaded {len(user_db)} user(s), {len(guild_config)} guild config(s)")
         _startup_done = True
-    await bot.tree.sync()
+    print("[startup] syncing slash commands...")
+    synced = await bot.tree.sync()
+    print(f"[startup] synced {len(synced)} command(s)")
     print(f"Bot is online as {bot.user}")
     if not check_wins.is_running():
         check_wins.start()
