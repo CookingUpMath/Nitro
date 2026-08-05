@@ -221,11 +221,10 @@ def group_by_rarity(duck_ids):
     return grouped
 
 
-def format_grouped(grouped) -> str:
-    """Large-emoji, emoji-only style: '-# Rarity (x%)' subtext label, each
-    duck as its own '#' header line (emoji only — staff name the emoji
-    after the duck itself, so no separate title is needed). Used by
-    /index and /collection.
+def format_grouped_row(grouped) -> str:
+    """Large-emoji, emoji-only style, but all ducks in a rarity tier share
+    ONE '#' line instead of one line each — compresses the display
+    horizontally. Used by /index.
     """
     lines = []
     for r in RARITY_ORDER:
@@ -233,8 +232,7 @@ def format_grouped(grouped) -> str:
         if not ducks:
             continue
         lines.append(f"-# {rarity_header(r)}")
-        for duck in ducks:
-            lines.append(f"# {duck['emoji']}")
+        lines.append("# " + " ".join(duck["emoji"] for duck in ducks))
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -771,9 +769,9 @@ class DuckCog(commands.Cog):
         else:
             sections = []
             if active_ids:
-                sections.append("### Currently Earnable\n" + format_grouped(group_by_rarity(active_ids)))
+                sections.append("### Currently Earnable\n" + format_grouped_row(group_by_rarity(active_ids)))
             if inactive_ids:
-                sections.append("### Not Currently Active\n" + format_grouped(group_by_rarity(inactive_ids)))
+                sections.append("### Not Currently Active\n" + format_grouped_row(group_by_rarity(inactive_ids)))
             embed.description = "\n\n".join(sections)
 
         await interaction.response.send_message(embed=embed)
@@ -785,7 +783,7 @@ class DuckCog(commands.Cog):
         discord_id = str(target.id)
         rec = duck_users.get(discord_id, default_user_record())
 
-        content = format_grouped(group_by_rarity(rec["collection"])) or "No ducks collected yet."
+        content = format_grouped_row(group_by_rarity(rec["collection"])) or "No ducks collected yet."
         embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=discord.Color.teal())
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
         await interaction.response.send_message(embed=embed)
