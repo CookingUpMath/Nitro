@@ -521,12 +521,16 @@ class DuckCog(commands.Cog):
         inactive_ids = [d for d, v in duck_index.items() if not v["active"]]
 
         embed = discord.Embed(title="📖 Duck Index", color=discord.Color.blurple())
+
         if not duck_index:
             embed.description = "No ducks have been added yet."
-        if active_ids:
-            embed.add_field(name="Currently Earnable", value=format_grouped(group_by_rarity(active_ids)), inline=False)
-        if inactive_ids:
-            embed.add_field(name="Not Currently Active", value=format_grouped(group_by_rarity(inactive_ids)), inline=False)
+        else:
+            sections = []
+            if active_ids:
+                sections.append("### Currently Earnable\n" + format_grouped(group_by_rarity(active_ids)))
+            if inactive_ids:
+                sections.append("### Not Currently Active\n" + format_grouped(group_by_rarity(inactive_ids)))
+            embed.description = "\n\n".join(sections)
 
         await interaction.response.send_message(embed=embed)
 
