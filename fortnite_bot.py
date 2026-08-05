@@ -341,6 +341,7 @@ async def on_ready():
     if not _startup_done:
         print("[startup] connecting to database...")
         await init_db_pool()
+        bot.db_pool = db_pool
         print("[startup] database connected, loading state...")
         await load_db()
         print(f"[startup] loaded {len(user_db)} user(s), {len(guild_config)} guild config(s)")
