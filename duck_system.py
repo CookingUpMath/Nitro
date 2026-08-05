@@ -205,9 +205,9 @@ def format_grouped(grouped, show_title: bool = True) -> str:
         ducks = grouped.get(r, [])
         if not ducks:
             continue
-        lines.append(f"**{RARITY_DISPLAY[r]}**")
+        lines.append(f"-# {RARITY_DISPLAY[r]}")
         for duck in ducks:
-            lines.append(f"{duck['emoji']} {duck['title']}" if show_title else duck["emoji"])
+            lines.append(f"# {duck['emoji']} {duck['title']}" if show_title else f"# {duck['emoji']}")
         lines.append("")
     return "\n".join(lines).strip()
 
