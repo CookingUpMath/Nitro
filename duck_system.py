@@ -4,8 +4,8 @@
 # A standalone gacha/collection feature, unrelated to the Fortnite side of
 # the bot. Lives entirely in this file and is loaded into the main bot as a
 # Cog. Shares the main bot's Postgres connection pool (see fortnite_bot.py)
-# but keeps its own state and its own three storage keys in the same
-# key/value bot_state table: 'duck_index', 'duck_users', 'duck_config'.
+# but keeps its own state and its own storage keys in the same key/value
+# bot_state table: 'duck_index', 'duck_users', 'duck_config', 'duck_stats'.
 #
 # HOW A DROP WORKS (worth understanding before touching this file):
 # A normal chat message can never produce a truly private ("ephemeral")
@@ -18,6 +18,10 @@
 #      prompt that only Alex can see.
 # This gives a public "something happened" moment plus a private outcome,
 # without needing DMs.
+#
+# ALL staff/config actions live behind the single /editor command (a
+# dropdown menu), mirroring the Fortnite side's /settings command. There
+# are no separate /duckadd, /duckon, etc. slash commands anymore.
 
 import re
 import json
@@ -53,10 +57,20 @@ RARITY_DISPLAY = {
     "ghost": "Ghost",
 }
 
-DROP_CHANCE = 0.02          # 2% per eligible message
+DROP_CHANCE = 0.05           # 5% per eligible message
 DUPLICATE_BONUS_CHANCE = 0.01  # 1% extra egg on a duplicate hatch
-DROP_COOLDOWN_SECONDS = 120  # 2 minutes between roll attempts, per user
-CLAIM_TIMEOUT_SECONDS = 600  # 10 minutes to claim a spawned egg
+DROP_COOLDOWN_SECONDS = 120   # 2 minutes between roll attempts, per user
+CLAIM_TIMEOUT_SECONDS = 600   # 10 minutes to claim a spawned egg
+EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
+
+
+def format_rarity_percent(r: str) -> str:
+    w = RARITY_WEIGHTS[r]
+    return f"{int(w)}%" if w == int(w) else f"{w}%"
+
+
+def rarity_header(r: str) -> str:
+    return f"{RARITY_DISPLAY[r]} ({format_rarity_percent(r)})"
 
 
 ###############################################
@@ -73,8 +87,14 @@ duck_index = {}
 # }
 duck_users = {}
 
-# duck_config[guild_id] = {"hatching_enabled": bool}
+# duck_config[guild_id] = {
+#   "hatching_enabled": bool, "egg_counter_channel_id": int | None
+# }
 duck_config = {}
+
+# duck_stats = {"total_dropped": int}  — global count of eggs that have
+# ever spawned in the pond (i.e. successful passive-chat drops).
+duck_stats = {"total_dropped": 0}
 
 
 def default_user_record():
@@ -87,18 +107,20 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config
+    global duck_index, duck_users, duck_config, duck_stats
     if _pool is None:
         return
     try:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT key, value FROM bot_state WHERE key IN ('duck_index','duck_users','duck_config')"
+                "SELECT key, value FROM bot_state WHERE key IN "
+                "('duck_index','duck_users','duck_config','duck_stats')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
             duck_users = data.get("duck_users", {})
             duck_config = data.get("duck_config", {})
+            duck_stats = data.get("duck_stats", {"total_dropped": 0})
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
     except Exception as e:
         print(f"[duck_db] load failed: {e}")
@@ -118,13 +140,13 @@ async def save_duck_state() -> bool:
                     ("duck_index", json.dumps(duck_index)),
                     ("duck_users", json.dumps(duck_users)),
                     ("duck_config", json.dumps(duck_config)),
+                    ("duck_stats", json.dumps(duck_stats)),
                 ],
             )
         return True
     except Exception as e:
         print(f"[duck_db] save failed: {e}")
         return False
-
 
 
 ###############################################
@@ -199,17 +221,42 @@ def group_by_rarity(duck_ids):
     return grouped
 
 
-def format_grouped(grouped, show_title: bool = True) -> str:
+def format_grouped(grouped) -> str:
+    """Large-emoji, emoji-only style: '-# Rarity (x%)' subtext label, each
+    duck as its own '#' header line (emoji only — staff name the emoji
+    after the duck itself, so no separate title is needed). Used by
+    /index and /collection.
+    """
     lines = []
     for r in RARITY_ORDER:
         ducks = grouped.get(r, [])
         if not ducks:
             continue
-        lines.append(f"-# {RARITY_DISPLAY[r]}")
+        lines.append(f"-# {rarity_header(r)}")
         for duck in ducks:
-            lines.append(f"# {duck['emoji']} {duck['title']}" if show_title else f"# {duck['emoji']}")
+            lines.append(f"# {duck['emoji']}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def format_grouped_plain(grouped) -> str:
+    """Regular-sized style: bold 'Rarity (x%)' label, normal-size
+    'emoji title' lines underneath. Used by /hatchpool.
+    """
+    lines = []
+    for r in RARITY_ORDER:
+        ducks = grouped.get(r, [])
+        if not ducks:
+            continue
+        lines.append(f"**{rarity_header(r)}**")
+        for duck in ducks:
+            lines.append(f"{duck['emoji']} {duck['title']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def format_egg_channel_name(count: int) -> str:
+    return f"🥚: {count}"
 
 
 ###############################################
@@ -302,44 +349,23 @@ class DuckClaimView(discord.ui.View):
 
 
 class RaritySelectView(discord.ui.View):
-    def __init__(self, title: str, emoji: str):
-        super().__init__(timeout=180)
-        self.title_text = title
-        self.emoji = emoji
+    """Used by both Add and Edit flows — on_result is called with the
+    chosen rarity value instead of hardcoding what happens next.
+    """
 
+    def __init__(self, on_result):
+        super().__init__(timeout=180)
+        self.on_result = on_result
         select = discord.ui.Select(
             placeholder="Choose a rarity",
-            options=[discord.SelectOption(label=RARITY_DISPLAY[r], value=r) for r in RARITY_ORDER],
+            options=[discord.SelectOption(label=rarity_header(r), value=r) for r in RARITY_ORDER],
         )
-        select.callback = self.on_select
+        select.callback = self._callback
         self.add_item(select)
 
-    async def on_select(self, interaction: discord.Interaction):
+    async def _callback(self, interaction: discord.Interaction):
         rarity = interaction.data["values"][0]
-        duck_id = slugify(self.title_text)
-
-        if duck_id in duck_index:
-            return await interaction.response.edit_message(
-                content=f"A duck titled **{self.title_text}** already exists in the index.",
-                view=None,
-            )
-
-        duck_index[duck_id] = {
-            "title": self.title_text,
-            "emoji": self.emoji,
-            "rarity": rarity,
-            "active": False,
-            "limited_until": None,
-        }
-        await save_duck_state()
-
-        await interaction.response.edit_message(
-            content=(
-                f"{self.emoji} **{self.title_text}** added to the index as {RARITY_DISPLAY[rarity]}.\n"
-                f"Use `/duckon title:{self.title_text}` to move it into the earnable pool."
-            ),
-            view=None,
-        )
+        await self.on_result(interaction, rarity)
 
 
 class DuckAddModal(discord.ui.Modal, title="Add a New Duck"):
@@ -351,12 +377,260 @@ class DuckAddModal(discord.ui.Modal, title="Add a New Duck"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        view = RaritySelectView(str(self.duck_title), str(self.duck_emoji))
+        title_text = str(self.duck_title)
+        emoji_text = str(self.duck_emoji)
+
+        async def finish(inner_interaction: discord.Interaction, rarity: str):
+            duck_id = slugify(title_text)
+            if duck_id in duck_index:
+                return await inner_interaction.response.edit_message(
+                    content=f"A duck titled **{title_text}** already exists in the index.",
+                    view=None,
+                )
+            duck_index[duck_id] = {
+                "title": title_text,
+                "emoji": emoji_text,
+                "rarity": rarity,
+                "active": False,
+                "limited_until": None,
+            }
+            await save_duck_state()
+            await inner_interaction.response.edit_message(
+                content=(
+                    f"{emoji_text} **{title_text}** added to the index as {RARITY_DISPLAY[rarity]}.\n"
+                    f"Use `/editor` → Activate Duck to move it into the earnable pool."
+                ),
+                view=None,
+            )
+
         await interaction.response.send_message(
-            f"Pick a rarity for **{self.duck_title}** {self.duck_emoji}:",
-            view=view,
+            f"Pick a rarity for **{title_text}** {emoji_text}:",
+            view=RaritySelectView(finish),
             ephemeral=True,
         )
+
+
+class DuckEditModal(discord.ui.Modal, title="Edit Duck Emoji"):
+    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+    new_emoji = discord.ui.TextInput(label="New Emoji", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        duck_id = slugify(str(self.duck_title))
+        duck = duck_index.get(duck_id)
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck found matching **{self.duck_title}**.", ephemeral=True
+            )
+        old_emoji = duck["emoji"]
+        duck["emoji"] = str(self.new_emoji)
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"Updated **{duck['title']}**: {old_emoji} → {duck['emoji']}\n"
+            f"This applies everywhere instantly, including everyone's existing collections.",
+            ephemeral=True,
+        )
+
+
+class ConfirmRemoveView(discord.ui.View):
+    def __init__(self, duck_id: str, owner_id: int):
+        super().__init__(timeout=60)
+        self.duck_id = duck_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        duck = duck_index.pop(self.duck_id, None)
+        if not duck:
+            return await interaction.response.edit_message(content="That duck no longer exists.", view=None)
+
+        affected = 0
+        for rec in duck_users.values():
+            if self.duck_id in rec.get("collection", []):
+                rec["collection"].remove(self.duck_id)
+                affected += 1
+        await save_duck_state()
+
+        await interaction.response.edit_message(
+            content=(
+                f"🗑️ **{duck['title']}** has been permanently removed from the system, "
+                f"including {affected} member collection(s) that had it."
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — nothing was removed.", view=None)
+
+
+class DuckRemoveModal(discord.ui.Modal, title="Remove a Duck"):
+    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        duck_id = slugify(str(self.duck_title))
+        duck = duck_index.get(duck_id)
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck found matching **{self.duck_title}**.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            f"Are you sure you want to permanently delete {duck['emoji']} **{duck['title']}**?\n"
+            f"This removes it from the index **and** from every member's collection who owns it. "
+            f"This can't be undone.",
+            view=ConfirmRemoveView(duck_id, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class DuckActivateModal(discord.ui.Modal):
+    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+
+    def __init__(self, activate: bool):
+        super().__init__(title="Activate Duck" if activate else "Deactivate Duck")
+        self.activate = activate
+
+    async def on_submit(self, interaction: discord.Interaction):
+        duck_id = slugify(str(self.duck_title))
+        duck = duck_index.get(duck_id)
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck found matching **{self.duck_title}**.", ephemeral=True
+            )
+        duck["active"] = self.activate
+        duck["limited_until"] = None
+        await save_duck_state()
+        state = "earnable" if self.activate else "no longer earnable"
+        await interaction.response.send_message(f"{duck['emoji']} **{duck['title']}** is now {state}.", ephemeral=True)
+
+
+class DuckLimitedModal(discord.ui.Modal, title="Limited-Time Duck"):
+    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+    hours = discord.ui.TextInput(label="Hours Active", placeholder="e.g. 48", max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        duck_id = slugify(str(self.duck_title))
+        duck = duck_index.get(duck_id)
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck found matching **{self.duck_title}**.", ephemeral=True
+            )
+        try:
+            hours_val = int(str(self.hours))
+            if hours_val < 1:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "Hours must be a whole number of at least 1.", ephemeral=True
+            )
+        duck["active"] = True
+        duck["limited_until"] = time.time() + hours_val * 3600
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"{duck['emoji']} **{duck['title']}** is earnable for the next **{hours_val} hour(s)**.",
+            ephemeral=True,
+        )
+
+
+class HatchToggleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
+    async def turn_on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["hatching_enabled"] = True
+        await save_duck_state()
+        await interaction.response.edit_message(content="Egg drops are now **On**.", view=None)
+
+    @discord.ui.button(label="Turn Off", style=discord.ButtonStyle.danger)
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["hatching_enabled"] = False
+        await save_duck_state()
+        await interaction.response.edit_message(content="Egg drops are now **Off**.", view=None)
+
+
+class EggChannelSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.ChannelSelect(
+            placeholder="Choose a voice channel for the egg counter",
+            channel_types=[discord.ChannelType.voice],
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        channel = self.select.values[0]
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["egg_counter_channel_id"] = channel.id
+        await save_duck_state()
+        try:
+            resolved = await channel.fetch()
+            await resolved.edit(name=format_egg_channel_name(duck_stats.get("total_dropped", 0)))
+        except Exception as e:
+            print(f"[duck_system] initial egg counter rename failed: {e}")
+        await interaction.response.edit_message(
+            content=f"Egg counter channel set to {channel.mention}. It refreshes every "
+                    f"{EGG_COUNTER_UPDATE_MINUTES} minutes.",
+            view=None,
+        )
+
+
+class EditorView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        options = [
+            discord.SelectOption(label="Add Duck", value="add", emoji="➕"),
+            discord.SelectOption(label="Edit Duck Emoji", value="edit", emoji="✏️"),
+            discord.SelectOption(label="Remove Duck", value="remove", emoji="🗑️"),
+            discord.SelectOption(label="Activate Duck", value="on", emoji="✅"),
+            discord.SelectOption(label="Deactivate Duck", value="off", emoji="⛔"),
+            discord.SelectOption(label="Limited-Time Duck", value="limited", emoji="⏳"),
+            discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
+            discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
+        ]
+        select = discord.ui.Select(placeholder="Choose an action", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You do not have permission to use this.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        if choice == "add":
+            await interaction.response.send_modal(DuckAddModal())
+        elif choice == "edit":
+            await interaction.response.send_modal(DuckEditModal())
+        elif choice == "remove":
+            await interaction.response.send_modal(DuckRemoveModal())
+        elif choice == "on":
+            await interaction.response.send_modal(DuckActivateModal(activate=True))
+        elif choice == "off":
+            await interaction.response.send_modal(DuckActivateModal(activate=False))
+        elif choice == "limited":
+            await interaction.response.send_modal(DuckLimitedModal())
+        elif choice == "toggle":
+            await interaction.response.send_message(
+                "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
+            )
+        elif choice == "counter":
+            await interaction.response.send_message(
+                "Pick the voice channel to use as the live egg counter:",
+                view=EggChannelSelectView(),
+                ephemeral=True,
+            )
 
 
 ###############################################
@@ -372,9 +646,11 @@ class DuckCog(commands.Cog):
         _pool = self.bot.db_pool
         await load_duck_state()
         self.check_expired_limited.start()
+        self.update_egg_counter_channels.start()
 
     async def cog_unload(self):
         self.check_expired_limited.cancel()
+        self.update_egg_counter_channels.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
@@ -419,76 +695,23 @@ class DuckCog(commands.Cog):
                 view=view,
             )
             view.message = sent
+            duck_stats["total_dropped"] = duck_stats.get("total_dropped", 0) + 1
+            await save_duck_state()
         except Exception as e:
             print(f"[duck_system] failed to post egg drop: {e}")
 
-    # ---------- staff: toggle hatching ----------
+    # ---------- staff: single consolidated config/management command ----------
 
-    @app_commands.command(name="hatchtoggle", description="Staff: turn egg drops on or off.")
-    @app_commands.describe(state="Turn drops on or off")
-    @app_commands.choices(state=[
-        app_commands.Choice(name="On", value="on"),
-        app_commands.Choice(name="Off", value="off"),
-    ])
+    @app_commands.command(name="editor", description="Staff: manage ducks, activation, and settings from one menu.")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def hatchtoggle(self, interaction: discord.Interaction, state: app_commands.Choice[str]):
-        guild_id = str(interaction.guild.id)
-        duck_config.setdefault(guild_id, {})["hatching_enabled"] = (state.value == "on")
-        await save_duck_state()
-        await interaction.response.send_message(f"Egg drops are now **{state.name}**.", ephemeral=True)
-
-    # ---------- staff: add a duck to the index ----------
-
-    @app_commands.command(name="duckadd", description="Staff: add a new duck to the index.")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def duckadd(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(DuckAddModal())
-
-    # ---------- staff: activate / deactivate ----------
-
-    @app_commands.command(name="duckon", description="Staff: move a duck into the earnable pool.")
-    @app_commands.describe(title="The exact title of the duck")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def duckon(self, interaction: discord.Interaction, title: str):
-        duck_id = slugify(title)
-        duck = duck_index.get(duck_id)
-        if not duck:
-            return await interaction.response.send_message(f"No duck found matching **{title}**.", ephemeral=True)
-        duck["active"] = True
-        duck["limited_until"] = None
-        await save_duck_state()
-        await interaction.response.send_message(f"{duck['emoji']} **{duck['title']}** is now earnable!", ephemeral=True)
-
-    @app_commands.command(name="duckoff", description="Staff: remove a duck from the earnable pool.")
-    @app_commands.describe(title="The exact title of the duck")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def duckoff(self, interaction: discord.Interaction, title: str):
-        duck_id = slugify(title)
-        duck = duck_index.get(duck_id)
-        if not duck:
-            return await interaction.response.send_message(f"No duck found matching **{title}**.", ephemeral=True)
-        duck["active"] = False
-        duck["limited_until"] = None
-        await save_duck_state()
-        await interaction.response.send_message(f"{duck['emoji']} **{duck['title']}** is no longer earnable.", ephemeral=True)
-
-    # ---------- staff: limited-time availability ----------
-
-    @app_commands.command(name="ducklimited", description="Staff: make a duck earnable for a limited number of hours.")
-    @app_commands.describe(title="The exact title of the duck", hours="How many hours it stays earnable")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def ducklimited(self, interaction: discord.Interaction, title: str, hours: app_commands.Range[int, 1, 8760]):
-        duck_id = slugify(title)
-        duck = duck_index.get(duck_id)
-        if not duck:
-            return await interaction.response.send_message(f"No duck found matching **{title}**.", ephemeral=True)
-        duck["active"] = True
-        duck["limited_until"] = time.time() + hours * 3600
-        await save_duck_state()
+    async def editor(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            f"{duck['emoji']} **{duck['title']}** is earnable for the next **{hours} hour(s)**.",
+            "**🛠️ Duck System Editor**\nChoose an action below:",
+            view=EditorView(),
             ephemeral=True,
         )
+
+    # ---------- background: expire limited-time ducks ----------
 
     @tasks.loop(minutes=1)
     async def check_expired_limited(self):
@@ -506,12 +729,33 @@ class DuckCog(commands.Cog):
     async def before_check_expired_limited(self):
         await self.bot.wait_until_ready()
 
+    # ---------- background: keep the egg counter VC name in sync ----------
+
+    @tasks.loop(minutes=EGG_COUNTER_UPDATE_MINUTES)
+    async def update_egg_counter_channels(self):
+        desired_name = format_egg_channel_name(duck_stats.get("total_dropped", 0))
+        for guild_id, config in duck_config.items():
+            channel_id = config.get("egg_counter_channel_id")
+            if not channel_id:
+                continue
+            channel = self.bot.get_channel(channel_id)
+            if not channel or channel.name == desired_name:
+                continue
+            try:
+                await channel.edit(name=desired_name)
+            except Exception as e:
+                print(f"[duck_system] failed to rename egg counter channel: {e}")
+
+    @update_egg_counter_channels.before_loop
+    async def before_update_egg_counter_channels(self):
+        await self.bot.wait_until_ready()
+
     # ---------- public: view pool / index / collection ----------
 
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
     async def hatchpool(self, interaction: discord.Interaction):
         active_ids = [d for d, v in duck_index.items() if v["active"]]
-        content = format_grouped(group_by_rarity(active_ids)) or "The pool is currently empty."
+        content = format_grouped_plain(group_by_rarity(active_ids)) or "The pool is currently empty."
         embed = discord.Embed(title="🥚 Current Hatch Pool", description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed)
 
@@ -541,7 +785,7 @@ class DuckCog(commands.Cog):
         discord_id = str(target.id)
         rec = duck_users.get(discord_id, default_user_record())
 
-        content = format_grouped(group_by_rarity(rec["collection"]), show_title=False) or "No ducks collected yet."
+        content = format_grouped(group_by_rarity(rec["collection"])) or "No ducks collected yet."
         embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=discord.Color.teal())
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
         await interaction.response.send_message(embed=embed)
