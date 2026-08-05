@@ -240,7 +240,7 @@ PLAYLIST_ORDER = ["solo", "duo", "squad"]
 
 
 def format_playlist_label(mode_key: str) -> str:
-    return PLAYLIST_LABELS.get(mode_key.lower(), mode_key.title())
+    return PLAYLIST_LABELS.get(mode_key.lower(), "Limited")
 
 
 async def search_outfit_icon(name: str):
