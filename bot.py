@@ -477,7 +477,7 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
     mode_wins = extract_mode_wins(stats_data)
 
     last_win_ts = record.get("last_win_ts")
-    last_win_str = f"<t:{last_win_ts}:f>" if last_win_ts else "Not tracked yet"
+    last_win_str = f"<t:{last_win_ts}:R>" if last_win_ts else "Not tracked yet"
 
     role_color = target.color if target.color.value != 0 else discord.Color.blurple()
     dot = color_to_emoji(target.color)
@@ -493,6 +493,13 @@ async def fortnite(interaction: discord.Interaction, user: discord.Member = None
         wins = mode_wins.get(mode, 0)
         if wins > 0:
             lines.append(f"-# ▪️ {format_playlist_label(mode)}: {wins}")
+
+    # Everything that isn't solo/duo/squad (trios, arena, LTMs, etc.) gets
+    # bucketed together, since the API doesn't track most of it separately.
+    core_wins = sum(mode_wins.get(mode, 0) for mode in PLAYLIST_ORDER)
+    limited_wins = max(totals["wins"] - core_wins, 0)
+    if limited_wins > 0:
+        lines.append(f"-# ▪️ Limited: {limited_wins}")
 
     embed = discord.Embed(description="\n".join(lines), color=role_color)
 
