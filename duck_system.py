@@ -28,8 +28,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-import fortnite_bot  # for the shared Postgres pool (fortnite_bot.db_pool)
-
 
 ###############################################
 #                CONSTANTS                   #
@@ -83,12 +81,17 @@ def default_user_record():
     return {"inventory": 0, "collection": [], "last_roll_check_ts": 0}
 
 
+# Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
+# import back into the main bot file.
+_pool = None
+
+
 async def load_duck_state():
     global duck_index, duck_users, duck_config
-    if fortnite_bot.db_pool is None:
+    if _pool is None:
         return
     try:
-        async with fortnite_bot.db_pool.acquire() as conn:
+        async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN ('duck_index','duck_users','duck_config')"
             )
@@ -102,10 +105,10 @@ async def load_duck_state():
 
 
 async def save_duck_state() -> bool:
-    if fortnite_bot.db_pool is None:
+    if _pool is None:
         return False
     try:
-        async with fortnite_bot.db_pool.acquire() as conn:
+        async with _pool.acquire() as conn:
             await conn.executemany(
                 """
                 INSERT INTO bot_state (key, value) VALUES ($1, $2::jsonb)
@@ -121,6 +124,7 @@ async def save_duck_state() -> bool:
     except Exception as e:
         print(f"[duck_db] save failed: {e}")
         return False
+
 
 
 ###############################################
@@ -364,6 +368,8 @@ class DuckCog(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
+        global _pool
+        _pool = self.bot.db_pool
         await load_duck_state()
         self.check_expired_limited.start()
 
