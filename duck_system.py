@@ -221,6 +221,16 @@ def group_by_rarity(duck_ids):
     return grouped
 
 
+def format_flat_row(duck_ids) -> str:
+    """All ducks together on one '#' line, no rarity grouping/labels at
+    all. Used by /collection.
+    """
+    ducks = [duck_index[d] for d in duck_ids if d in duck_index]
+    if not ducks:
+        return ""
+    return "# " + " ".join(duck["emoji"] for duck in ducks)
+
+
 def format_grouped_row(grouped) -> str:
     """Large-emoji, emoji-only style, but all ducks in a rarity tier share
     ONE '#' line instead of one line each — compresses the display
@@ -783,7 +793,7 @@ class DuckCog(commands.Cog):
         discord_id = str(target.id)
         rec = duck_users.get(discord_id, default_user_record())
 
-        content = format_grouped_row(group_by_rarity(rec["collection"])) or "No ducks collected yet."
+        content = format_flat_row(rec["collection"]) or "No ducks collected yet."
         embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=discord.Color.teal())
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
         await interaction.response.send_message(embed=embed)
