@@ -7,17 +7,13 @@
 # but keeps its own state and its own storage keys in the same key/value
 # bot_state table: 'duck_index', 'duck_users', 'duck_config', 'duck_stats'.
 #
-# HOW A DROP WORKS (worth understanding before touching this file):
-# A normal chat message can never produce a truly private ("ephemeral")
-# Discord message — that only exists as a reply to an interaction. So a
-# passive chat-triggered drop can't be private on its own. Instead:
-#   1. On a successful roll, the bot posts a normal PUBLIC message
-#      ("🥚 Alex found an egg!") with a "Claim" button restricted to Alex.
-#   2. When Alex clicks it, THAT click is a fresh interaction — so the bot
-#      can respond to it with a genuinely private (ephemeral) Hatch/Store
-#      prompt that only Alex can see.
-# This gives a public "something happened" moment plus a private outcome,
-# without needing DMs.
+# HOW A DROP WORKS:
+# A drop is fully public — the bot posts a normal message in the channel
+# ("🥚 Alex found an egg!") with "Hatch" and "Inventory" buttons attached
+# right away. Only the person who found it can press them (everyone else
+# gets a quiet ephemeral "not yours" notice). Whichever button they press
+# edits that same message in place with the outcome — no private/ephemeral
+# step, no DMs.
 #
 # ALL staff/config actions live behind the single /editor command (a
 # dropdown menu), mirroring the Fortnite side's /settings command. There
@@ -57,10 +53,10 @@ RARITY_DISPLAY = {
     "ghost": "Ghost",
 }
 
-DROP_CHANCE = 0.06           # 6% per eligible message
+DROP_CHANCE = 0.06             # 6% per eligible message
 DUPLICATE_BONUS_CHANCE = 0.05  # 5% extra egg on a duplicate hatch
-DROP_COOLDOWN_SECONDS = 120   # 2 minutes between roll attempts, per user
-CLAIM_TIMEOUT_SECONDS = 600   # 10 minutes to claim a spawned egg
+DROP_COOLDOWN_SECONDS = 120    # 2 minutes between roll attempts, per user
+CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
 
 
@@ -71,6 +67,41 @@ def format_rarity_percent(r: str) -> str:
 
 def rarity_header(r: str) -> str:
     return f"{RARITY_DISPLAY[r]} ({format_rarity_percent(r)})"
+
+
+# How much of a "win" a hatch announcement should feel like, scaled to how
+# hard the rarity actually is to get. Common barely registers; Ghost gets
+# the full fanfare treatment.
+HYPE_STYLE = {
+    "common": {
+        "color": discord.Color.light_grey(),
+        "banner": "{emoji} {mention} hatched **{title}**.",
+    },
+    "rare": {
+        "color": discord.Color.blue(),
+        "banner": "✨ {emoji} {mention} hatched **{title}**!",
+    },
+    "legendary": {
+        "color": discord.Color.gold(),
+        "banner": "🌟 **{emoji} {mention} hatched a {title}!** 🌟",
+    },
+    "mythic": {
+        "color": discord.Color.purple(),
+        "banner": "💥 **{emoji} {mention} HATCHED A {title}!!** 💥",
+    },
+    "secret": {
+        "color": discord.Color.red(),
+        "banner": "🎇🎇 **{emoji} {mention} UNCOVERED THE SECRET {title}!!** 🎇🎇",
+    },
+    "ghost": {
+        "color": discord.Color.dark_purple(),
+        "banner": (
+            "👻═══════════👻\n"
+            "**{emoji} {mention} HATCHED THE GHOST DUCK — {title}!!!**\n"
+            "👻═══════════👻"
+        ),
+    },
+}
 
 
 ###############################################
@@ -271,57 +302,12 @@ def format_egg_channel_name(count: int) -> str:
 #                 UI: VIEWS                   #
 ###############################################
 
-class DuckHatchStoreView(discord.ui.View):
-    """Ephemeral — only the person who claimed the egg ever sees this."""
-
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.owner_id
-
-    @discord.ui.button(label="Hatch Now", style=discord.ButtonStyle.success, emoji="🐣")
-    async def hatch_now(self, interaction: discord.Interaction, button: discord.ui.Button):
-        discord_id = str(interaction.user.id)
-        result = resolve_hatch(discord_id)
-
-        if result is None:
-            await save_duck_state()
-            return await interaction.response.edit_message(
-                content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
-                view=None,
-            )
-
-        await save_duck_state()
-
-        if result["duplicate"]:
-            text = f"{result['emoji']} **{result['title']}** — you already have this one, duplicate!"
-            if result["bonus_egg"]:
-                inv = duck_users[discord_id]["inventory"]
-                text += f"\n🍀 Lucky! You got a bonus egg for the trouble. Inventory: **{inv}**"
-        else:
-            text = (
-                f"{result['emoji']} **{result['title']}** ({RARITY_DISPLAY[result['rarity']]}) "
-                f"— new duck added to your collection!"
-            )
-
-        await interaction.response.edit_message(content=text, view=None)
-
-    @discord.ui.button(label="Store in Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
-    async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
-        discord_id = str(interaction.user.id)
-        rec = duck_users.setdefault(discord_id, default_user_record())
-        rec["inventory"] += 1
-        await save_duck_state()
-        await interaction.response.edit_message(
-            content=f"🥚 Stored! You now have **{rec['inventory']}** egg(s) in your inventory.",
-            view=None,
-        )
-
-
-class DuckClaimView(discord.ui.View):
-    """Public message, but only the owner can actually claim it."""
+class EggDropView(discord.ui.View):
+    """Fully public — the drop message itself has the Hatch/Inventory
+    buttons. Only the person who found it can press them; anyone else gets
+    a quiet ephemeral 'not yours' notice. Whichever button is pressed edits
+    the original public message in place with the outcome.
+    """
 
     def __init__(self, owner_id: int):
         super().__init__(timeout=CLAIM_TIMEOUT_SECONDS)
@@ -330,22 +316,53 @@ class DuckClaimView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("This egg isn't yours to claim!", ephemeral=True)
+            await interaction.response.send_message("This egg isn't yours!", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Claim Egg", style=discord.ButtonStyle.success, emoji="🥚")
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "You found an egg! What would you like to do with it?",
-            view=DuckHatchStoreView(self.owner_id),
-            ephemeral=True,
-        )
-        try:
-            await interaction.message.edit(content=f"~~{interaction.message.content}~~ (claimed)", view=None)
-        except Exception:
-            pass
+    @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
+    async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        discord_id = str(interaction.user.id)
+        result = resolve_hatch(discord_id)
+
+        if result is None:
+            await save_duck_state()
+            return await interaction.response.edit_message(
+                content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
+                embed=None,
+                view=None,
+            )
+
+        await save_duck_state()
         self.stop()
+
+        if result["duplicate"]:
+            text = f"{result['emoji']} {interaction.user.mention} hatched **{result['title']}** — already owned, duplicate!"
+            if result["bonus_egg"]:
+                inv = duck_users[discord_id]["inventory"]
+                text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
+            await interaction.response.edit_message(content=text, embed=None, view=None)
+        else:
+            style = HYPE_STYLE[result["rarity"]]
+            banner = style["banner"].format(
+                emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
+            )
+            embed = discord.Embed(description=banner, color=style["color"])
+            embed.set_footer(text=rarity_header(result["rarity"]))
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+    @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
+    async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
+        discord_id = str(interaction.user.id)
+        rec = duck_users.setdefault(discord_id, default_user_record())
+        rec["inventory"] += 1
+        await save_duck_state()
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"🎒 {interaction.user.mention} stored the egg! Inventory: **{rec['inventory']}**",
+            embed=None,
+            view=None,
+        )
 
     async def on_timeout(self):
         if self.message is None:
@@ -696,7 +713,7 @@ class DuckCog(commands.Cog):
         if roll_duck_id() is None:
             return  # pool is empty, nothing to give right now
 
-        view = DuckClaimView(message.author.id)
+        view = EggDropView(message.author.id)
         try:
             sent = await message.channel.send(
                 content=f"🥚 {message.author.mention} found an egg on the ground!",
@@ -794,7 +811,8 @@ class DuckCog(commands.Cog):
         rec = duck_users.get(discord_id, default_user_record())
 
         content = format_flat_row(rec["collection"]) or "No ducks collected yet."
-        embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=discord.Color.teal())
+        role_color = target.color if target.color.value != 0 else discord.Color.teal()
+        embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=role_color)
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
         await interaction.response.send_message(embed=embed)
 
