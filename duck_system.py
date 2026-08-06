@@ -59,6 +59,14 @@ DROP_COOLDOWN_SECONDS = 120    # 2 minutes between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
 
+# --- Karma ---
+HEART_EMOJI_ID = 1295255068483784786  # <:D_ZLove:...>
+KARMA_PER_EGG = 10
+REACTION_KARMA_WINDOW_SECONDS = 60 * 60   # heart reaction must land within 1 hour of the post
+WELCOME_WINDOW_SECONDS = 30 * 60          # welcome must happen within 30 min of the join
+GM_PATTERN = re.compile(r"\b(gm|good\s?morning)\b", re.IGNORECASE)
+WELCOME_PATTERN = re.compile(r"\bwelcome\b", re.IGNORECASE)
+
 
 def format_rarity_percent(r: str) -> str:
     w = RARITY_WEIGHTS[r]
@@ -127,9 +135,58 @@ duck_config = {}
 # ever spawned in the pond (i.e. successful passive-chat drops).
 duck_stats = {"total_dropped": 0}
 
+# pending_invite_karma[str(new_member_id)] = str(inviter_id)  — set on join,
+# consumed (and karma awarded) the moment that new member sends their first
+# message. Persisted so a restart between join and first message doesn't
+# lose the credit.
+pending_invite_karma = {}
+
+# --- In-memory only (short-lived windows, fine to lose on restart) ---
+# reaction_karma_granted[str(message_id)] = set of user_ids who have
+# already earned a point for reacting to that message — lets every
+# distinct reactor earn their own point, while still stopping any single
+# person from farming it by removing/re-adding their own reaction.
+reaction_karma_granted = {}
+# recent_joins[member_id] = {"joined_at": float, "welcomed": bool}
+recent_joins = {}
+# invite_cache[guild_id] = {invite_code: uses} — snapshot used to detect
+# which invite incremented on a new join.
+invite_cache = {}
+
 
 def default_user_record():
-    return {"inventory": 0, "collection": [], "last_roll_check_ts": 0}
+    return {
+        "inventory": 0,
+        "collection": [],
+        "last_roll_check_ts": 0,
+        "last_daily_egg_date": None,
+        "last_gm_date": None,
+        "karma": 0,
+    }
+
+
+def get_user_record(discord_id: str) -> dict:
+    """Like duck_users.setdefault(), but also backfills new fields onto
+    older records that were saved before this feature existed.
+    """
+    rec = duck_users.setdefault(discord_id, default_user_record())
+    rec.setdefault("last_daily_egg_date", None)
+    rec.setdefault("last_gm_date", None)
+    rec.setdefault("karma", 0)
+    return rec
+
+
+def award_karma(discord_id: str, points: int = 1):
+    rec = get_user_record(discord_id)
+    rec["karma"] = rec.get("karma", 0) + points
+    while rec["karma"] >= KARMA_PER_EGG:
+        rec["karma"] -= KARMA_PER_EGG
+        rec["inventory"] += 1
+
+
+def remove_karma(discord_id: str, points: int = 1):
+    rec = get_user_record(discord_id)
+    rec["karma"] = max(rec.get("karma", 0) - points, 0)
 
 
 # Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
@@ -138,20 +195,21 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma
     if _pool is None:
         return
     try:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN "
-                "('duck_index','duck_users','duck_config','duck_stats')"
+                "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
             duck_users = data.get("duck_users", {})
             duck_config = data.get("duck_config", {})
             duck_stats = data.get("duck_stats", {"total_dropped": 0})
+            pending_invite_karma = data.get("duck_pending_invites", {})
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
     except Exception as e:
         print(f"[duck_db] load failed: {e}")
@@ -172,6 +230,7 @@ async def save_duck_state() -> bool:
                     ("duck_users", json.dumps(duck_users)),
                     ("duck_config", json.dumps(duck_config)),
                     ("duck_stats", json.dumps(duck_stats)),
+                    ("duck_pending_invites", json.dumps(pending_invite_karma)),
                 ],
             )
         return True
@@ -607,6 +666,35 @@ class EggChannelSelectView(discord.ui.View):
         )
 
 
+class KarmaChannelSelectView(discord.ui.View):
+    """Pick which text channels count for heart-reaction karma. Selecting
+    zero channels means 'allow everywhere' (the default).
+    """
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.ChannelSelect(
+            placeholder="Channels where heart reactions grant karma (none = all channels)",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        channels = self.select.values
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["karma_reaction_channel_ids"] = [c.id for c in channels]
+        await save_duck_state()
+
+        if channels:
+            content = "Heart-reaction karma is now limited to: " + ", ".join(c.mention for c in channels)
+        else:
+            content = "Heart-reaction karma is now allowed in every channel."
+        await interaction.response.edit_message(content=content, view=None)
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -619,6 +707,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Limited-Time Duck", value="limited", emoji="⏳"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
+            discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
         ]
         select = discord.ui.Select(placeholder="Choose an action", options=options)
         select.callback = self.on_select
@@ -656,6 +745,12 @@ class EditorView(discord.ui.View):
                 view=EggChannelSelectView(),
                 ephemeral=True,
             )
+        elif choice == "karma_channels":
+            await interaction.response.send_message(
+                "Pick which channels count for heart-reaction karma:",
+                view=KarmaChannelSelectView(),
+                ephemeral=True,
+            )
 
 
 ###############################################
@@ -673,6 +768,16 @@ class DuckCog(commands.Cog):
         self.check_expired_limited.start()
         self.update_egg_counter_channels.start()
 
+        # Prime the invite-use snapshot BEFORE any joins happen — without
+        # this, the first join after every restart would look like it used
+        # every invite at once (old count defaults to 0).
+        for guild in self.bot.guilds:
+            try:
+                invites = await guild.invites()
+                invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+            except Exception as e:
+                print(f"[duck_system] initial invite cache failed for {guild.name}: {e}")
+
     async def cog_unload(self):
         self.check_expired_limited.cancel()
         self.update_egg_counter_channels.cancel()
@@ -689,19 +794,60 @@ class DuckCog(commands.Cog):
                     "Something went wrong running that command.", ephemeral=True
                 )
 
-    # ---------- passive chat drop ----------
+    # ---------- daily egg, GM karma, welcome karma, invite karma, passive drop ----------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
 
+        discord_id = str(message.author.id)
         guild_id = str(message.guild.id)
+        content = message.content or ""
+        rec = get_user_record(discord_id)
+        today_str = time.strftime("%Y-%m-%d", time.gmtime())
+        state_changed = False
+
+        # --- Daily egg: silent, first message after the 00:00 UTC reset ---
+        if rec.get("last_daily_egg_date") != today_str:
+            rec["last_daily_egg_date"] = today_str
+            rec["inventory"] += 1
+            state_changed = True
+
+        # --- GM karma: once per day, "GM"/"good morning" anywhere in the message ---
+        if rec.get("last_gm_date") != today_str and GM_PATTERN.search(content):
+            rec["last_gm_date"] = today_str
+            award_karma(discord_id, 1)
+            state_changed = True
+
+        # --- Welcome karma: @mentioning a recent joiner + the word 'welcome', within 30 min of their join ---
+        if message.mentions and WELCOME_PATTERN.search(content):
+            now = time.time()
+            for mentioned in message.mentions:
+                if mentioned.id == message.author.id:
+                    continue
+                info = recent_joins.get(mentioned.id)
+                if not info or info["welcomed"]:
+                    continue
+                if now - info["joined_at"] > WELCOME_WINDOW_SECONDS:
+                    continue
+                info["welcomed"] = True
+                award_karma(discord_id, 1)
+                state_changed = True
+                break  # only one welcome credited per message
+
+        # --- Invite karma: this is the new member's first message since joining ---
+        pending_inviter = pending_invite_karma.pop(discord_id, None)
+        if pending_inviter:
+            award_karma(pending_inviter, 1)
+            state_changed = True
+
+        if state_changed:
+            await save_duck_state()
+
+        # --- Passive egg drop (separate toggle: /editor → Toggle Egg Drops) ---
         if not duck_config.get(guild_id, {}).get("hatching_enabled", True):
             return
-
-        discord_id = str(message.author.id)
-        rec = duck_users.setdefault(discord_id, default_user_record())
 
         now = time.time()
         if now - rec.get("last_roll_check_ts", 0) < DROP_COOLDOWN_SECONDS:
@@ -724,6 +870,85 @@ class DuckCog(commands.Cog):
             await save_duck_state()
         except Exception as e:
             print(f"[duck_system] failed to post egg drop: {e}")
+
+    # ---------- welcome/invite tracking: new member joins ----------
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        if member.bot:
+            return
+
+        recent_joins[member.id] = {"joined_at": time.time(), "welcomed": False}
+
+        guild = member.guild
+        try:
+            new_invites = await guild.invites()
+        except Exception as e:
+            print(f"[duck_system] couldn't fetch invites for {guild.name} (needs Manage Server): {e}")
+            return
+
+        old_counts = invite_cache.get(guild.id, {})
+        inviter_id = None
+        for inv in new_invites:
+            if inv.uses > old_counts.get(inv.code, 0):
+                inviter_id = inv.inviter.id if inv.inviter else None
+                break
+        invite_cache[guild.id] = {inv.code: inv.uses for inv in new_invites}
+
+        if inviter_id and inviter_id != member.id:
+            pending_invite_karma[str(member.id)] = str(inviter_id)
+            await save_duck_state()
+
+    # ---------- heart-reaction karma ----------
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.guild_id is None:
+            return
+        if payload.member is not None and payload.member.bot:
+            return
+        if payload.emoji.id != HEART_EMOJI_ID:
+            return
+
+        allowed_channels = duck_config.get(str(payload.guild_id), {}).get("karma_reaction_channel_ids")
+        if allowed_channels and payload.channel_id not in allowed_channels:
+            return
+
+        message_key = str(payload.message_id)
+        already_credited = reaction_karma_granted.setdefault(message_key, set())
+        if payload.user_id in already_credited:
+            return  # this specific person already earned their point here — no farming via remove/re-add
+
+        posted_at = discord.utils.snowflake_time(payload.message_id)
+        if (discord.utils.utcnow() - posted_at).total_seconds() > REACTION_KARMA_WINDOW_SECONDS:
+            return
+
+        try:
+            channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+            message = await channel.fetch_message(payload.message_id)
+        except Exception:
+            return
+
+        if message.author.id == payload.user_id:
+            return  # no self-karma for reacting to your own post
+
+        already_credited.add(payload.user_id)
+        award_karma(str(payload.user_id), 1)  # the REACTOR earns the point
+        await save_duck_state()
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if payload.emoji.id != HEART_EMOJI_ID:
+            return
+
+        message_key = str(payload.message_id)
+        credited = reaction_karma_granted.get(message_key)
+        if not credited or payload.user_id not in credited:
+            return  # this person never earned a point here
+
+        credited.discard(payload.user_id)
+        remove_karma(str(payload.user_id), 1)  # take the point back from the reactor who un-reacted
+        await save_duck_state()
 
     # ---------- staff: single consolidated config/management command ----------
 
@@ -749,6 +974,21 @@ class DuckCog(commands.Cog):
                 changed = True
         if changed:
             await save_duck_state()
+
+        # Housekeeping: drop join records once their welcome window has passed.
+        stale_joins = [mid for mid, info in recent_joins.items() if now - info["joined_at"] > WELCOME_WINDOW_SECONDS]
+        for mid in stale_joins:
+            recent_joins.pop(mid, None)
+
+        # Housekeeping: drop reaction-tracking for messages past the karma window
+        # (derived from the message's own snowflake timestamp — no extra API calls).
+        now_dt = discord.utils.utcnow()
+        stale_reactions = [
+            mkey for mkey in reaction_karma_granted
+            if (now_dt - discord.utils.snowflake_time(int(mkey))).total_seconds() > REACTION_KARMA_WINDOW_SECONDS
+        ]
+        for mkey in stale_reactions:
+            reaction_karma_granted.pop(mkey, None)
 
     @check_expired_limited.before_loop
     async def before_check_expired_limited(self):
@@ -819,8 +1059,12 @@ class DuckCog(commands.Cog):
     @app_commands.command(name="duckinventory", description="Check how many eggs you have in storage.")
     async def duckinventory_cmd(self, interaction: discord.Interaction):
         discord_id = str(interaction.user.id)
-        rec = duck_users.get(discord_id, default_user_record())
-        await interaction.response.send_message(f"🥚 You have **{rec['inventory']}** egg(s) stored.", ephemeral=True)
+        rec = get_user_record(discord_id)
+        await interaction.response.send_message(
+            f"🥚 You have **{rec['inventory']}** egg(s) stored.\n"
+            f"😇 Karma {rec.get('karma', 0)}/{KARMA_PER_EGG}",
+            ephemeral=True,
+        )
 
     # ---------- open eggs from inventory ----------
 
