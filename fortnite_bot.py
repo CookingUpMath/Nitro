@@ -31,6 +31,8 @@ FORTNITE_API_KEY = os.getenv("FORTNITE_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 intents = discord.Intents.default()
+intents.message_content = True  # needed for GM/welcome keyword detection (karma system)
+intents.members = True          # needed for on_member_join to fire at all (welcome/invite karma)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory caches, backed by Postgres. Shape of each value:
