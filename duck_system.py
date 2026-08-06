@@ -57,8 +57,8 @@ RARITY_DISPLAY = {
     "ghost": "Ghost",
 }
 
-DROP_CHANCE = 0.05           # 5% per eligible message
-DUPLICATE_BONUS_CHANCE = 0.01  # 1% extra egg on a duplicate hatch
+DROP_CHANCE = 0.06           # 6% per eligible message
+DUPLICATE_BONUS_CHANCE = 0.05  # 5% extra egg on a duplicate hatch
 DROP_COOLDOWN_SECONDS = 120   # 2 minutes between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600   # 10 minutes to claim a spawned egg
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
