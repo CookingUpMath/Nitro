@@ -1056,7 +1056,7 @@ class DuckCog(commands.Cog):
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="duckinventory", description="Check how many eggs you have in storage.")
+    @app_commands.command(name="inventory", description="Check how many eggs you have in storage.")
     async def duckinventory_cmd(self, interaction: discord.Interaction):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
