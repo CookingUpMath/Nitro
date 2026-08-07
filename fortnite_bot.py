@@ -352,8 +352,14 @@ async def on_ready():
         print("[startup] duck system loaded")
         _startup_done = True
     print("[startup] syncing slash commands...")
-    synced = await bot.tree.sync()
-    print(f"[startup] synced {len(synced)} command(s)")
+    try:
+        synced = await bot.tree.sync()
+        print(f"[startup] synced {len(synced)} command(s)")
+    except discord.HTTPException as e:
+        # A transient Discord-side outage (e.g. 503) shouldn't prevent the
+        # rest of startup — commands stay registered from the last
+        # successful sync, and we'll just try again next reconnect.
+        print(f"[startup] slash command sync failed (will retry on next reconnect): {e}")
     print(f"Bot is online as {bot.user}")
     print(f"[startup] Application ID: {bot.application_id}")
     if not check_wins.is_running():
