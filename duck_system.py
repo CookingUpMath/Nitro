@@ -147,7 +147,7 @@ pending_invite_karma = {}
 # distinct reactor earn their own point, while still stopping any single
 # person from farming it by removing/re-adding their own reaction.
 reaction_karma_granted = {}
-# recent_joins[member_id] = {"joined_at": float, "welcomed": bool}
+# recent_joins[member_id] = {"joined_at": float, "welcomed_by": set()}
 recent_joins = {}
 # invite_cache[guild_id] = {invite_code: uses} — snapshot used to detect
 # which invite incremented on a new join.
@@ -245,6 +245,30 @@ async def save_duck_state() -> bool:
 
 def slugify(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+
+
+def rename_duck(old_id: str, new_title: str) -> str:
+    """Rename a duck, moving its index entry to a new key if the slug
+    changes, and migrating every owner's collection reference so nobody's
+    existing collection silently breaks. Raises ValueError if the new
+    title collides with a different existing duck.
+    """
+    new_id = slugify(new_title)
+    if new_id == old_id:
+        duck_index[old_id]["title"] = new_title
+        return old_id
+    if new_id in duck_index:
+        raise ValueError(f"A duck titled '{new_title}' already exists.")
+
+    duck_index[new_id] = duck_index.pop(old_id)
+    duck_index[new_id]["title"] = new_title
+
+    for rec in duck_users.values():
+        collection = rec.get("collection", [])
+        if old_id in collection:
+            rec["collection"] = [new_id if d == old_id else d for d in collection]
+
+    return new_id
 
 
 def get_active_ducks_by_rarity():
@@ -494,9 +518,65 @@ class DuckAddModal(discord.ui.Modal, title="Add a New Duck"):
         )
 
 
-class DuckEditModal(discord.ui.Modal, title="Edit Duck Emoji"):
-    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
-    new_emoji = discord.ui.TextInput(label="New Emoji", max_length=100)
+class RarityEditSelectView(discord.ui.View):
+    """Final step of editing a duck — rarity change is optional, so this
+    includes a 'keep current' choice alongside the six tiers.
+    """
+
+    def __init__(self, duck_id: str, pending_title: str | None, pending_emoji: str | None):
+        super().__init__(timeout=180)
+        self.duck_id = duck_id
+        self.pending_title = pending_title
+        self.pending_emoji = pending_emoji
+
+        options = [discord.SelectOption(label="Keep Current Rarity", value="_keep", emoji="↩️")]
+        options += [discord.SelectOption(label=rarity_header(r), value=r) for r in RARITY_ORDER]
+        select = discord.ui.Select(placeholder="Change rarity? (optional)", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        duck = duck_index.get(self.duck_id)
+        if not duck:
+            return await interaction.response.edit_message(content="That duck no longer exists.", view=None)
+
+        rarity_choice = interaction.data["values"][0]
+        summary = []
+        current_id = self.duck_id
+
+        if self.pending_title and self.pending_title != duck["title"]:
+            try:
+                current_id = rename_duck(current_id, self.pending_title)
+            except ValueError as e:
+                return await interaction.response.edit_message(content=str(e), view=None)
+            duck = duck_index[current_id]
+            summary.append(f"title → **{duck['title']}**")
+
+        if self.pending_emoji and self.pending_emoji != duck["emoji"]:
+            old_emoji = duck["emoji"]
+            duck["emoji"] = self.pending_emoji
+            summary.append(f"emoji {old_emoji} → {duck['emoji']}")
+
+        if rarity_choice != "_keep" and rarity_choice != duck["rarity"]:
+            duck["rarity"] = rarity_choice
+            summary.append(f"rarity → {rarity_header(rarity_choice)}")
+
+        await save_duck_state()
+
+        if not summary:
+            content = f"No changes made to **{duck['title']}**."
+        else:
+            content = (
+                f"Updated **{duck['title']}**: " + ", ".join(summary) +
+                "\nThis applies everywhere instantly, including everyone's existing collections."
+            )
+        await interaction.response.edit_message(content=content, view=None)
+
+
+class DuckEditModal(discord.ui.Modal, title="Edit Duck"):
+    duck_title = discord.ui.TextInput(label="Duck Title (exact, to find it)", max_length=100)
+    new_title = discord.ui.TextInput(label="New Title (optional)", required=False, max_length=100)
+    new_emoji = discord.ui.TextInput(label="New Emoji (optional)", required=False, max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction):
         duck_id = slugify(str(self.duck_title))
@@ -505,12 +585,14 @@ class DuckEditModal(discord.ui.Modal, title="Edit Duck Emoji"):
             return await interaction.response.send_message(
                 f"No duck found matching **{self.duck_title}**.", ephemeral=True
             )
-        old_emoji = duck["emoji"]
-        duck["emoji"] = str(self.new_emoji)
-        await save_duck_state()
+
+        pending_title = str(self.new_title).strip() or None
+        pending_emoji = str(self.new_emoji).strip() or None
+
+        view = RarityEditSelectView(duck_id, pending_title, pending_emoji)
         await interaction.response.send_message(
-            f"Updated **{duck['title']}**: {old_emoji} → {duck['emoji']}\n"
-            f"This applies everywhere instantly, including everyone's existing collections.",
+            f"Optionally change the rarity for **{duck['title']}** (currently {rarity_header(duck['rarity'])}):",
+            view=view,
             ephemeral=True,
         )
 
@@ -569,25 +651,70 @@ class DuckRemoveModal(discord.ui.Modal, title="Remove a Duck"):
         )
 
 
+class ConfirmClearPoolView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="Confirm Clear Pool", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        count = 0
+        for duck in duck_index.values():
+            if duck.get("active"):
+                duck["active"] = False
+                duck["limited_until"] = None
+                count += 1
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=f"🧹 Pool cleared — {count} duck(s) deactivated (still in the index, nothing deleted).",
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=None)
+
+
 class DuckActivateModal(discord.ui.Modal):
-    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+    duck_titles = discord.ui.TextInput(
+        label="Duck Title(s)",
+        style=discord.TextStyle.paragraph,
+        placeholder="One per line, or comma-separated, e.g.\nGolden Duck\nIce Duck, Fire Duck",
+        max_length=2000,
+    )
 
     def __init__(self, activate: bool):
-        super().__init__(title="Activate Duck" if activate else "Deactivate Duck")
+        super().__init__(title="Activate Ducks" if activate else "Deactivate Ducks")
         self.activate = activate
 
     async def on_submit(self, interaction: discord.Interaction):
-        duck_id = slugify(str(self.duck_title))
-        duck = duck_index.get(duck_id)
-        if not duck:
-            return await interaction.response.send_message(
-                f"No duck found matching **{self.duck_title}**.", ephemeral=True
-            )
-        duck["active"] = self.activate
-        duck["limited_until"] = None
-        await save_duck_state()
+        raw = str(self.duck_titles)
+        titles = [t.strip() for line in raw.split("\n") for t in line.split(",")]
+        titles = [t for t in titles if t]
+
+        found, missing = [], []
+        for title in titles:
+            duck = duck_index.get(slugify(title))
+            if not duck:
+                missing.append(title)
+                continue
+            duck["active"] = self.activate
+            duck["limited_until"] = None
+            found.append(duck["title"])
+
+        if found:
+            await save_duck_state()
+
         state = "earnable" if self.activate else "no longer earnable"
-        await interaction.response.send_message(f"{duck['emoji']} **{duck['title']}** is now {state}.", ephemeral=True)
+        lines = []
+        if found:
+            lines.append(f"✅ Now {state}: " + ", ".join(found))
+        if missing:
+            lines.append("⚠️ Not found in the index: " + ", ".join(missing))
+        await interaction.response.send_message("\n".join(lines) or "Nothing to do.", ephemeral=True)
 
 
 class DuckLimitedModal(discord.ui.Modal, title="Limited-Time Duck"):
@@ -695,6 +822,35 @@ class KarmaChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(content=content, view=None)
 
 
+class IndexView(discord.ui.View):
+    """Lets anyone pick Currently Earnable vs Not Currently Active instead
+    of cramming both into one big embed.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        options = [
+            discord.SelectOption(label="Currently Earnable", value="active", emoji="✅"),
+            discord.SelectOption(label="Not Currently Active", value="inactive", emoji="⛔"),
+        ]
+        select = discord.ui.Select(placeholder="Choose a category to view", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        if choice == "active":
+            ids = [d for d, v in duck_index.items() if v["active"]]
+            title = "📖 Duck Index — Currently Earnable"
+        else:
+            ids = [d for d, v in duck_index.items() if not v["active"]]
+            title = "📖 Duck Index — Not Currently Active"
+
+        content = format_grouped_row(group_by_rarity(ids)) or "Nothing in this category."
+        embed = discord.Embed(title=title, description=content, color=discord.Color.blurple())
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -704,6 +860,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Remove Duck", value="remove", emoji="🗑️"),
             discord.SelectOption(label="Activate Duck", value="on", emoji="✅"),
             discord.SelectOption(label="Deactivate Duck", value="off", emoji="⛔"),
+            discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
             discord.SelectOption(label="Limited-Time Duck", value="limited", emoji="⏳"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
@@ -733,6 +890,12 @@ class EditorView(discord.ui.View):
             await interaction.response.send_modal(DuckActivateModal(activate=True))
         elif choice == "off":
             await interaction.response.send_modal(DuckActivateModal(activate=False))
+        elif choice == "clear_pool":
+            await interaction.response.send_message(
+                "Deactivate every currently active duck? They stay in the index, just leave the earnable pool.",
+                view=ConfirmClearPoolView(interaction.user.id),
+                ephemeral=True,
+            )
         elif choice == "limited":
             await interaction.response.send_modal(DuckLimitedModal())
         elif choice == "toggle":
@@ -821,14 +984,16 @@ class DuckCog(commands.Cog):
             state_changed = True
 
         # --- Welcome karma: saying 'welcome' anywhere, within 30 min of a pending join ---
-        # No @mention required — just the word. If several joins are still
-        # pending, the oldest one (FIFO) gets credited. A brand-new member
-        # can't farm karma by "welcoming" their own join.
+        # No @mention required — just the word. Every distinct person who
+        # says it gets their own point (capped per-person-per-join, so the
+        # same person can't farm it by repeating "welcome"). If several
+        # joins are pending, the oldest one this author hasn't already
+        # welcomed gets credited.
         if WELCOME_PATTERN.search(content):
             now = time.time()
             candidate_id = None
             for member_id, info in recent_joins.items():
-                if info["welcomed"]:
+                if message.author.id in info["welcomed_by"]:
                     continue
                 if member_id == message.author.id:
                     continue
@@ -837,7 +1002,7 @@ class DuckCog(commands.Cog):
                 if candidate_id is None or info["joined_at"] < recent_joins[candidate_id]["joined_at"]:
                     candidate_id = member_id
             if candidate_id is not None:
-                recent_joins[candidate_id]["welcomed"] = True
+                recent_joins[candidate_id]["welcomed_by"].add(message.author.id)
                 award_karma(discord_id, 1)
                 state_changed = True
 
@@ -883,7 +1048,7 @@ class DuckCog(commands.Cog):
         if member.bot:
             return
 
-        recent_joins[member.id] = {"joined_at": time.time(), "welcomed": False}
+        recent_joins[member.id] = {"joined_at": time.time(), "welcomed_by": set()}
 
         guild = member.guild
         try:
