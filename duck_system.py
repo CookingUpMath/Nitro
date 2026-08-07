@@ -1196,22 +1196,16 @@ class DuckCog(commands.Cog):
 
     @app_commands.command(name="index", description="View every duck that has ever been added.")
     async def index_cmd(self, interaction: discord.Interaction):
-        active_ids = [d for d, v in duck_index.items() if v["active"]]
-        inactive_ids = [d for d, v in duck_index.items() if not v["active"]]
-
-        embed = discord.Embed(title="📖 Duck Index", color=discord.Color.blurple())
-
         if not duck_index:
-            embed.description = "No ducks have been added yet."
-        else:
-            sections = []
-            if active_ids:
-                sections.append("### Currently Earnable\n" + format_grouped_row(group_by_rarity(active_ids)))
-            if inactive_ids:
-                sections.append("### Not Currently Active\n" + format_grouped_row(group_by_rarity(inactive_ids)))
-            embed.description = "\n\n".join(sections)
+            embed = discord.Embed(
+                title="📖 Duck Index", description="No ducks have been added yet.", color=discord.Color.blurple()
+            )
+            return await interaction.response.send_message(embed=embed)
 
-        await interaction.response.send_message(embed=embed)
+        embed = discord.Embed(
+            title="📖 Duck Index", description="Choose a category below to view.", color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed, view=IndexView())
 
     @app_commands.command(name="collection", description="View your (or someone else's) duck collection.")
     @app_commands.describe(member="Whose collection to view")
