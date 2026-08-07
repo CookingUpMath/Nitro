@@ -820,21 +820,26 @@ class DuckCog(commands.Cog):
             award_karma(discord_id, 1)
             state_changed = True
 
-        # --- Welcome karma: @mentioning a recent joiner + the word 'welcome', within 30 min of their join ---
-        if message.mentions and WELCOME_PATTERN.search(content):
+        # --- Welcome karma: saying 'welcome' anywhere, within 30 min of a pending join ---
+        # No @mention required — just the word. If several joins are still
+        # pending, the oldest one (FIFO) gets credited. A brand-new member
+        # can't farm karma by "welcoming" their own join.
+        if WELCOME_PATTERN.search(content):
             now = time.time()
-            for mentioned in message.mentions:
-                if mentioned.id == message.author.id:
+            candidate_id = None
+            for member_id, info in recent_joins.items():
+                if info["welcomed"]:
                     continue
-                info = recent_joins.get(mentioned.id)
-                if not info or info["welcomed"]:
+                if member_id == message.author.id:
                     continue
                 if now - info["joined_at"] > WELCOME_WINDOW_SECONDS:
                     continue
-                info["welcomed"] = True
+                if candidate_id is None or info["joined_at"] < recent_joins[candidate_id]["joined_at"]:
+                    candidate_id = member_id
+            if candidate_id is not None:
+                recent_joins[candidate_id]["welcomed"] = True
                 award_karma(discord_id, 1)
                 state_changed = True
-                break  # only one welcome credited per message
 
         # --- Invite karma: this is the new member's first message since joining ---
         pending_inviter = pending_invite_karma.pop(discord_id, None)
