@@ -147,6 +147,12 @@ duck_stats = {"total_dropped": 0}
 # lose the credit.
 pending_invite_karma = {}
 
+# redeem_codes[code] = {
+#   "eggs": int, "duck_ids": [duck_id, ...],
+#   "expires_at": float | None, "redeemed_by": [discord_id, ...]
+# }
+redeem_codes = {}
+
 # --- In-memory only (short-lived windows, fine to lose on restart) ---
 # reaction_karma_granted[str(message_id)] = set of user_ids who have
 # already earned a point for reacting to that message — lets every
@@ -204,14 +210,14 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes
     if _pool is None:
         return
     try:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN "
-                "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites')"
+                "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites','duck_redeem_codes')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -219,6 +225,7 @@ async def load_duck_state():
             duck_config = data.get("duck_config", {})
             duck_stats = data.get("duck_stats", {"total_dropped": 0})
             pending_invite_karma = data.get("duck_pending_invites", {})
+            redeem_codes = data.get("duck_redeem_codes", {})
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -252,6 +259,7 @@ async def save_duck_state() -> bool:
                     ("duck_config", json.dumps(duck_config)),
                     ("duck_stats", json.dumps(duck_stats)),
                     ("duck_pending_invites", json.dumps(pending_invite_karma)),
+                    ("duck_redeem_codes", json.dumps(redeem_codes)),
                 ],
             )
         return True
@@ -897,6 +905,159 @@ class IndexView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
+class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
+    code_input = discord.ui.TextInput(label="Redeem Code", max_length=50)
+    expiration_input = discord.ui.TextInput(
+        label="Expires In (hours, optional)",
+        required=False,
+        max_length=10,
+        placeholder="Leave blank for no expiration",
+    )
+    eggs_input = discord.ui.TextInput(
+        label="Egg Amount (optional)", required=False, max_length=10
+    )
+    ducks_input = discord.ui.TextInput(
+        label="Duck Title(s) (optional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        placeholder="One per line, or comma-separated",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        code_key = str(self.code_input).strip().upper()
+        if not code_key:
+            return await interaction.response.send_message("❌ Code cannot be empty.", ephemeral=True)
+
+        eggs_raw = str(self.eggs_input).strip()
+        eggs_amount = 0
+        if eggs_raw:
+            try:
+                eggs_amount = int(eggs_raw)
+                if eggs_amount < 1:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Egg amount must be a whole number of at least 1.", ephemeral=True
+                )
+
+        ducks_raw = str(self.ducks_input).strip()
+        duck_ids = []
+        if ducks_raw:
+            titles = [t.strip() for line in ducks_raw.split("\n") for t in line.split(",")]
+            titles = [t for t in titles if t]
+            missing = []
+            for title in titles:
+                duck_id = slugify(title)
+                if duck_id not in duck_index:
+                    missing.append(title)
+                elif duck_id not in duck_ids:
+                    duck_ids.append(duck_id)
+            if missing:
+                return await interaction.response.send_message(
+                    "❌ These duck titles weren't found in the index: " + ", ".join(missing),
+                    ephemeral=True,
+                )
+
+        if eggs_amount < 1 and not duck_ids:
+            return await interaction.response.send_message(
+                "❌ You must set at least an egg amount or one duck as the reward.", ephemeral=True
+            )
+
+        expires_raw = str(self.expiration_input).strip()
+        expires_at = None
+        if expires_raw:
+            try:
+                hours = float(expires_raw)
+                if hours <= 0:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Expiration must be a positive number of hours.", ephemeral=True
+                )
+            expires_at = time.time() + hours * 3600
+
+        redeem_codes[code_key] = {
+            "eggs": eggs_amount,
+            "duck_ids": duck_ids,
+            "expires_at": expires_at,
+            "redeemed_by": [],
+        }
+        await save_duck_state()
+
+        reward_parts = []
+        if eggs_amount:
+            reward_parts.append(f"🥚 {eggs_amount} egg(s)")
+        if duck_ids:
+            names = ", ".join(duck_index[d]["title"] for d in duck_ids)
+            reward_parts.append(f"🦆 {names}")
+
+        expiry_text = f"in {expires_raw} hour(s)" if expires_at else "never"
+        await interaction.response.send_message(
+            f"✅ Code **{code_key}** created — grants {' + '.join(reward_parts)}. Expires: {expiry_text}\n"
+            f"-# Creating a code with the same text again overwrites it, including its redemption history.",
+            ephemeral=True,
+        )
+
+
+class RedeemModal(discord.ui.Modal, title="Redeem a Code"):
+    code_input = discord.ui.TextInput(label="Enter your code", max_length=50)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        code_key = str(self.code_input).strip().upper()
+        entry = redeem_codes.get(code_key)
+
+        if not entry:
+            return await interaction.response.send_message("❌ That code isn't valid.", ephemeral=True)
+
+        if entry["expires_at"] and time.time() > entry["expires_at"]:
+            return await interaction.response.send_message("❌ That code has expired.", ephemeral=True)
+
+        discord_id = str(interaction.user.id)
+        if discord_id in entry["redeemed_by"]:
+            return await interaction.response.send_message(
+                "❌ You've already redeemed this code.", ephemeral=True
+            )
+
+        rec = get_user_record(discord_id)
+        gained = []
+
+        if entry["eggs"]:
+            rec["inventory"] += entry["eggs"]
+            gained.append(f"🥚 {entry['eggs']} egg(s)")
+
+        new_ducks = []
+        already_owned = []
+        for duck_id in entry["duck_ids"]:
+            duck = duck_index.get(duck_id)
+            if not duck:
+                continue  # duck was removed from the system since the code was made
+            if duck_id in rec["collection"]:
+                already_owned.append(duck["title"])
+            else:
+                rec["collection"].append(duck_id)
+                new_ducks.append(f"{duck['emoji']} {duck['title']}")
+
+        if new_ducks:
+            gained.append("🦆 " + ", ".join(new_ducks))
+
+        entry["redeemed_by"].append(discord_id)
+        await save_duck_state()
+
+        if not gained and not already_owned:
+            return await interaction.response.send_message(
+                "⚠️ This code's reward is no longer available (the duck(s) may have been removed).",
+                ephemeral=True,
+            )
+
+        lines = ["✅ Code redeemed!"]
+        if gained:
+            lines.append("You received: " + " + ".join(gained))
+        if already_owned:
+            lines.append("(Already owned, skipped: " + ", ".join(already_owned) + ")")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -912,6 +1073,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
             discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
             discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
+            discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
         ]
         select = discord.ui.Select(placeholder="Choose an action", options=options)
         select.callback = self.on_select
@@ -967,6 +1129,8 @@ class EditorView(discord.ui.View):
                 view=IntroChannelSelectView(),
                 ephemeral=True,
             )
+        elif choice == "redeem_code":
+            await interaction.response.send_modal(RedeemCodeModal())
 
 
 ###############################################
@@ -1238,6 +1402,12 @@ class DuckCog(commands.Cog):
             view=EditorView(),
             ephemeral=True,
         )
+
+    # ---------- public: redeem a code ----------
+
+    @app_commands.command(name="redeem", description="Redeem a code for eggs or ducks.")
+    async def redeem_cmd(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(RedeemModal())
 
     # ---------- background: expire limited-time ducks ----------
 
