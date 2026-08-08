@@ -33,39 +33,45 @@ from discord.ext import commands, tasks
 #                CONSTANTS                   #
 ###############################################
 
-RARITY_ORDER = ["common", "rare", "legendary", "mythic", "secret", "ghost"]
+RARITY_ORDER = ["common", "rare", "legendary", "divine", "secret", "quackpot"]
 
 RARITY_WEIGHTS = {
     "common": 75.0,
     "rare": 18.0,
     "legendary": 5.0,
-    "mythic": 1.5,
+    "divine": 1.5,
     "secret": 0.45,
-    "ghost": 0.05,
+    "quackpot": 0.05,
 }
 
 RARITY_DISPLAY = {
     "common": "Common",
     "rare": "Rare",
     "legendary": "Legendary",
-    "mythic": "Mythic",
+    "divine": "Divine",
     "secret": "Secret",
-    "ghost": "Ghost",
+    "quackpot": "Quackpot",
 }
 
-DROP_CHANCE = 0.07             # 7% per eligible message
+DROP_CHANCE = 0.06             # 6% per eligible message
 DUPLICATE_BONUS_CHANCE = 0.05  # 5% extra egg on a duplicate hatch
-DROP_COOLDOWN_SECONDS = 60    # 1 minute between roll attempts, per user
+DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
 
 # --- Karma ---
 HEART_EMOJI_ID = 1295255068483784786  # <:D_ZLove:...>
+WAVE_EMOJI = "👋"  # unicode, not a custom emoji — matched by name, not ID
 KARMA_PER_EGG = 10
-REACTION_KARMA_WINDOW_SECONDS = 60 * 60   # heart reaction must land within 1 hour of the post
+REACTION_KARMA_WINDOW_SECONDS = 60 * 60   # heart/wave reactions must land within 1 hour of the post
 WELCOME_WINDOW_SECONDS = 30 * 60          # welcome must happen within 30 min of the join
 GM_PATTERN = re.compile(r"\b(gm|good\s?morning)\b", re.IGNORECASE)
 WELCOME_PATTERN = re.compile(r"\bwelcome\b", re.IGNORECASE)
+
+# Old internal rarity keys, kept only so load_duck_state() can migrate any
+# ducks saved before this rename. Nothing else in the file should ever
+# reference these two strings again.
+LEGACY_RARITY_RENAMES = {"mythic": "divine", "ghost": "quackpot"}
 
 
 def format_rarity_percent(r: str) -> str:
@@ -78,8 +84,8 @@ def rarity_header(r: str) -> str:
 
 
 # How much of a "win" a hatch announcement should feel like, scaled to how
-# hard the rarity actually is to get. Common barely registers; Ghost gets
-# the full fanfare treatment.
+# hard the rarity actually is to get. Common barely registers; Quackpot
+# gets the full fanfare treatment.
 HYPE_STYLE = {
     "common": {
         "color": discord.Color.light_grey(),
@@ -93,7 +99,7 @@ HYPE_STYLE = {
         "color": discord.Color.gold(),
         "banner": "🌟 **{emoji} {mention} hatched a {title}!** 🌟",
     },
-    "mythic": {
+    "divine": {
         "color": discord.Color.purple(),
         "banner": "💥 **{emoji} {mention} HATCHED A {title}!!** 💥",
     },
@@ -101,11 +107,11 @@ HYPE_STYLE = {
         "color": discord.Color.red(),
         "banner": "🎇🎇 **{emoji} {mention} UNCOVERED THE SECRET {title}!!** 🎇🎇",
     },
-    "ghost": {
+    "quackpot": {
         "color": discord.Color.dark_purple(),
         "banner": (
             "👻═══════════👻\n"
-            "**{emoji} {mention} HATCHED THE GHOST DUCK — {title}!!!**\n"
+            "**{emoji} {mention} HATCHED THE QUACKPOT DUCK — {title}!!!**\n"
             "👻═══════════👻"
         ),
     },
@@ -147,6 +153,9 @@ pending_invite_karma = {}
 # distinct reactor earn their own point, while still stopping any single
 # person from farming it by removing/re-adding their own reaction.
 reaction_karma_granted = {}
+# wave_karma_granted — same shape as reaction_karma_granted, but tracked
+# separately since it's a different trigger (👋 in the intro channel).
+wave_karma_granted = {}
 # recent_joins[member_id] = {"joined_at": float, "welcomed_by": set()}
 recent_joins = {}
 # invite_cache[guild_id] = {invite_code: uses} — snapshot used to detect
@@ -211,6 +220,18 @@ async def load_duck_state():
             duck_stats = data.get("duck_stats", {"total_dropped": 0})
             pending_invite_karma = data.get("duck_pending_invites", {})
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
+
+        # One-time migration: fix any ducks saved under the old rarity
+        # keys ('mythic'/'ghost') before this rename.
+        migrated = 0
+        for duck in duck_index.values():
+            old_rarity = duck.get("rarity")
+            if old_rarity in LEGACY_RARITY_RENAMES:
+                duck["rarity"] = LEGACY_RARITY_RENAMES[old_rarity]
+                migrated += 1
+        if migrated:
+            print(f"[duck_db] migrated {migrated} duck(s) off legacy rarity names")
+            await save_duck_state()
     except Exception as e:
         print(f"[duck_db] load failed: {e}")
 
@@ -822,6 +843,31 @@ class KarmaChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(content=content, view=None)
 
 
+class IntroChannelSelectView(discord.ui.View):
+    """Pick the single channel where 👋 reactions grant karma."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.ChannelSelect(
+            placeholder="Choose the introduction channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        channel = self.select.values[0]
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["intro_channel_id"] = channel.id
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=f"Introduction channel set to {channel.mention}. 👋 reactions there now grant karma.",
+            view=None,
+        )
+
+
 class IndexView(discord.ui.View):
     """Lets anyone pick Currently Earnable vs Not Currently Active instead
     of cramming both into one big embed.
@@ -865,6 +911,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
             discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
+            discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
         ]
         select = discord.ui.Select(placeholder="Choose an action", options=options)
         select.callback = self.on_select
@@ -912,6 +959,12 @@ class EditorView(discord.ui.View):
             await interaction.response.send_message(
                 "Pick which channels count for heart-reaction karma:",
                 view=KarmaChannelSelectView(),
+                ephemeral=True,
+            )
+        elif choice == "intro_channel":
+            await interaction.response.send_message(
+                "Pick the introduction channel for 👋 karma:",
+                view=IntroChannelSelectView(),
                 ephemeral=True,
             )
 
@@ -1120,6 +1173,61 @@ class DuckCog(commands.Cog):
         remove_karma(str(payload.user_id), 1)  # take the point back from the reactor who un-reacted
         await save_duck_state()
 
+    # ---------- wave-reaction karma (introduction channel) ----------
+    # Same rules as heart-reaction karma — 1 hour window, one point per
+    # distinct reactor per message, no self-karma — just a different
+    # trigger emoji and scoped to a single configured channel instead of
+    # an optional allow-list.
+
+    @commands.Cog.listener(name="on_raw_reaction_add")
+    async def on_wave_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.guild_id is None:
+            return
+        if payload.member is not None and payload.member.bot:
+            return
+        if payload.emoji.name != WAVE_EMOJI:
+            return
+
+        intro_channel_id = duck_config.get(str(payload.guild_id), {}).get("intro_channel_id")
+        if not intro_channel_id or payload.channel_id != intro_channel_id:
+            return
+
+        message_key = str(payload.message_id)
+        already_credited = wave_karma_granted.setdefault(message_key, set())
+        if payload.user_id in already_credited:
+            return
+
+        posted_at = discord.utils.snowflake_time(payload.message_id)
+        if (discord.utils.utcnow() - posted_at).total_seconds() > REACTION_KARMA_WINDOW_SECONDS:
+            return
+
+        try:
+            channel = self.bot.get_channel(payload.channel_id) or await self.bot.fetch_channel(payload.channel_id)
+            message = await channel.fetch_message(payload.message_id)
+        except Exception:
+            return
+
+        if message.author.id == payload.user_id:
+            return  # no self-karma for waving at your own intro
+
+        already_credited.add(payload.user_id)
+        award_karma(str(payload.user_id), 1)
+        await save_duck_state()
+
+    @commands.Cog.listener(name="on_raw_reaction_remove")
+    async def on_wave_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if payload.emoji.name != WAVE_EMOJI:
+            return
+
+        message_key = str(payload.message_id)
+        credited = wave_karma_granted.get(message_key)
+        if not credited or payload.user_id not in credited:
+            return
+
+        credited.discard(payload.user_id)
+        remove_karma(str(payload.user_id), 1)
+        await save_duck_state()
+
     # ---------- staff: single consolidated config/management command ----------
 
     @app_commands.command(name="editor", description="Staff: manage ducks, activation, and settings from one menu.")
@@ -1159,6 +1267,13 @@ class DuckCog(commands.Cog):
         ]
         for mkey in stale_reactions:
             reaction_karma_granted.pop(mkey, None)
+
+        stale_wave_reactions = [
+            mkey for mkey in wave_karma_granted
+            if (now_dt - discord.utils.snowflake_time(int(mkey))).total_seconds() > REACTION_KARMA_WINDOW_SECONDS
+        ]
+        for mkey in stale_wave_reactions:
+            wave_karma_granted.pop(mkey, None)
 
     @check_expired_limited.before_loop
     async def before_check_expired_limited(self):
