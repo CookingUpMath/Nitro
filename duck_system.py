@@ -1529,6 +1529,8 @@ class DuckCog(commands.Cog):
                 f"You only have **{rec['inventory']}** egg(s) — you can't open {amount}."
             )
 
+        pre_existing = set(rec["collection"])  # ownership snapshot BEFORE this batch
+
         results = []
         for _ in range(amount):
             result = resolve_hatch(discord_id)
@@ -1542,11 +1544,23 @@ class DuckCog(commands.Cog):
         if not results:
             return await interaction.followup.send("The pool is currently empty — nothing could be hatched.")
 
-        lines = [f"🥚 Opened {len(results)} egg(s):"]
+        # Aggregate identical ducks into one line each, in first-seen order,
+        # so a big batch doesn't turn into dozens of near-identical rows.
+        grouped = {}
         for r in results:
-            tag = " (duplicate)" if r["duplicate"] else " (**NEW**)"
-            bonus = " 🍀+1 bonus egg" if r["bonus_egg"] else ""
-            lines.append(f"{r['emoji']} **{r['title']}**{tag}{bonus}")
+            g = grouped.setdefault(r["duck_id"], {
+                "emoji": r["emoji"], "title": r["title"], "count": 0, "bonus_eggs": 0,
+            })
+            g["count"] += 1
+            if r["bonus_egg"]:
+                g["bonus_eggs"] += 1
+
+        lines = [f"🥚 Opened {len(results)} egg(s):"]
+        for duck_id, g in grouped.items():
+            count_tag = f" (x{g['count']})" if g["count"] > 1 else ""
+            status_tag = " (duplicate)" if duck_id in pre_existing else " (**NEW**)"
+            bonus = f" 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
+            lines.append(f"{g['emoji']} **{g['title']}**{count_tag}{status_tag}{bonus}")
 
         await interaction.followup.send("\n".join(lines))
 
