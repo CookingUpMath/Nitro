@@ -36,12 +36,12 @@ from discord.ext import commands, tasks
 RARITY_ORDER = ["common", "rare", "legendary", "divine", "secret", "quackpot"]
 
 RARITY_WEIGHTS = {
-    "common": 75.0,
-    "rare": 18.0,
-    "legendary": 5.0,
-    "divine": 1.5,
-    "secret": 0.45,
-    "quackpot": 0.05,
+    "common": 60.0,
+    "rare": 25.0,
+    "legendary": 10.0,
+    "divine": 3.0,
+    "secret": 1.5,
+    "quackpot": 0.5,
 }
 
 RARITY_DISPLAY = {
