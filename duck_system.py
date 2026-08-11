@@ -1517,7 +1517,7 @@ class DuckCog(commands.Cog):
 
     # ---------- open eggs from inventory ----------
 
-    @app_commands.command(name="open", description="Open eggs from your inventory.")
+    @app_commands.command(name="hatch", description="Open eggs from your inventory.")
     @app_commands.describe(amount="How many eggs to open")
     async def open_eggs(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000]):
         await interaction.response.defer()
