@@ -968,6 +968,37 @@ class KarmaChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(content=content, view=None)
 
 
+class EggBlockedChannelSelectView(discord.ui.View):
+    """Pick channels where the passive egg drop can never trigger — a
+    block-list, not an allow-list. Stored under a separate config key from
+    karma_reaction_channel_ids, so blocking a channel here has zero effect
+    on heart/wave-reaction karma in that same channel.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.ChannelSelect(
+            placeholder="Channels where eggs can NEVER drop (none = allowed everywhere)",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        channels = self.select.values
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["egg_blocked_channel_ids"] = [c.id for c in channels]
+        await save_duck_state()
+
+        if channels:
+            content = "Egg drops are now blocked in: " + ", ".join(c.mention for c in channels)
+        else:
+            content = "No channels are blocked — eggs can drop anywhere."
+        await interaction.response.edit_message(content=content, view=None)
+
+
 class IntroChannelSelectView(discord.ui.View):
     """Pick the single channel where 👋 reactions grant karma."""
 
@@ -1189,6 +1220,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
             discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
+            discord.SelectOption(label="Block Egg-Drop Channels", value="egg_blocked_channels", emoji="🚫"),
             discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
             discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
             discord.SelectOption(label="Set Nest Channel", value="nest_channel", emoji="🪺"),
@@ -1240,6 +1272,12 @@ class EditorView(discord.ui.View):
             await interaction.response.send_message(
                 "Pick which channels count for heart-reaction karma:",
                 view=KarmaChannelSelectView(),
+                ephemeral=True,
+            )
+        elif choice == "egg_blocked_channels":
+            await interaction.response.send_message(
+                "Pick channels where eggs can never drop (this doesn't affect karma reactions there):",
+                view=EggBlockedChannelSelectView(),
                 ephemeral=True,
             )
         elif choice == "intro_channel":
