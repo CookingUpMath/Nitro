@@ -1206,6 +1206,52 @@ class RedeemModal(discord.ui.Modal, title="Redeem a Code"):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+class CollectionFilterView(discord.ui.View):
+    """Attached to /collection — lets anyone viewing it filter the embed
+    down to one rarity, with 'View All' as the default. Purely a display
+    toggle, so it's open to anyone, not just the person who ran the command.
+    """
+
+    def __init__(self, target_id: int, target_display_name: str, color: discord.Color):
+        super().__init__(timeout=300)
+        self.target_id = target_id
+        self.target_display_name = target_display_name
+        self.color = color
+
+        options = [discord.SelectOption(label="View All", value="_all", emoji="🦆", default=True)]
+        options += [discord.SelectOption(label=rarity_header(r), value=r) for r in RARITY_ORDER]
+        select = discord.ui.Select(placeholder="Filter by rarity", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        discord_id = str(self.target_id)
+        rec = duck_users.get(discord_id, default_user_record())
+        owned = rec["collection"]
+
+        if choice == "_all":
+            ids = owned
+        else:
+            ids = [d for d in owned if duck_index.get(d, {}).get("rarity") == choice]
+
+        content = format_flat_row(ids) or "No ducks in this view yet."
+        embed = discord.Embed(
+            title=f"🦆 {self.target_display_name}'s Collection",
+            description=content,
+            color=self.color,
+        )
+        embed.set_footer(text=f"{len(owned)}/{len(duck_index)} collected")
+
+        # Reflect the current choice as the visibly-selected option next time.
+        for item in self.children:
+            if isinstance(item, discord.ui.Select):
+                for opt in item.options:
+                    opt.default = (opt.value == choice)
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -1402,6 +1448,10 @@ class DuckCog(commands.Cog):
         # --- Passive egg drop (separate toggle: /editor → Toggle Egg Drops) ---
         if not duck_config.get(guild_id, {}).get("hatching_enabled", True):
             return
+
+        blocked_channels = duck_config.get(guild_id, {}).get("egg_blocked_channel_ids", [])
+        if message.channel.id in blocked_channels:
+            return  # karma (reactions, GM, welcome, invite) still works here — only the drop itself is blocked
 
         now = time.time()
         if now - rec.get("last_roll_check_ts", 0) < DROP_COOLDOWN_SECONDS:
