@@ -54,8 +54,8 @@ RARITY_DISPLAY = {
     "quackpot": "Quackpot",
 }
 
-DROP_CHANCE = 0.06             # 6% per eligible message
-DUPLICATE_BONUS_CHANCE = 0.05  # 5% extra egg on a duplicate hatch
+DROP_CHANCE = 0.08             # 8% per eligible message
+DUPLICATE_BONUS_CHANCE = 0.10  # 10% extra egg on a duplicate hatch
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
