@@ -1851,7 +1851,9 @@ class DuckCog(commands.Cog):
         role_color = target.color if target.color.value != 0 else discord.Color.teal()
         embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=role_color)
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
-        await interaction.response.send_message(embed=embed)
+
+        view = CollectionFilterView(target.id, target.display_name, role_color)
+        await interaction.response.send_message(embed=embed, view=view)
 
     @app_commands.command(name="inventory", description="Check how many eggs you have in storage.")
     async def duckinventory_cmd(self, interaction: discord.Interaction):
