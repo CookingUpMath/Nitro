@@ -124,7 +124,12 @@ HYPE_STYLE = {
 ###############################################
 # duck_index[duck_id] = {
 #   "title": str, "emoji": str, "rarity": str,
-#   "active": bool, "limited_until": float | None (unix timestamp)
+#   "active": bool, "limited_until": float | None (unix timestamp),
+#   "is_error": bool  — ERROR:404 flag. Keeps its normal "rarity" for
+#   display purposes (so /collection groups it exactly where it'd
+#   otherwise belong), but rolls against a separate hidden pool instead
+#   of its assigned tier's odds, and is excluded from /hatchpool and
+#   /index entirely. Never settable at creation — only via /error.
 # }
 duck_index = {}
 
@@ -325,27 +330,48 @@ def rename_duck(old_id: str, new_title: str) -> str:
     return new_id
 
 
+ERROR_WEIGHT = 0.05  # ERROR:404's odds — a hidden 7th pool, shared across however many error ducks are active
+
+
 def get_active_ducks_by_rarity():
+    """Active, non-error ducks only, grouped by their display rarity."""
     by_rarity = {r: [] for r in RARITY_ORDER}
     for duck_id, duck in duck_index.items():
-        if duck.get("active"):
+        if duck.get("active") and not duck.get("is_error"):
             by_rarity[duck["rarity"]].append(duck_id)
     return by_rarity
+
+
+def get_active_error_ducks():
+    """Active ERROR:404 ducks, regardless of their (hidden) display rarity."""
+    return [d for d, duck in duck_index.items() if duck.get("active") and duck.get("is_error")]
 
 
 def roll_duck_id():
     """Pick one active duck, weighted by rarity. Rarity tiers with zero
     currently-active ducks are excluded and the remaining weights are used
-    as-is (random.choices renormalizes automatically). Returns None if the
-    pool is completely empty.
+    as-is (random.choices renormalizes automatically). ERROR:404 ducks are
+    rolled against a separate hidden pool at ERROR_WEIGHT, layered on top
+    of the normal tiers rather than replacing any of them. Returns None if
+    the pool is completely empty.
     """
     by_rarity = get_active_ducks_by_rarity()
+    error_ducks = get_active_error_ducks()
+
     available_tiers = [r for r in RARITY_ORDER if by_rarity[r]]
+    weights = [RARITY_WEIGHTS[r] for r in available_tiers]
+
+    if error_ducks:
+        available_tiers = available_tiers + ["_error"]
+        weights = weights + [ERROR_WEIGHT]
+
     if not available_tiers:
         return None
-    weights = [RARITY_WEIGHTS[r] for r in available_tiers]
-    chosen_tier = random.choices(available_tiers, weights=weights, k=1)[0]
-    return random.choice(by_rarity[chosen_tier])
+
+    chosen = random.choices(available_tiers, weights=weights, k=1)[0]
+    if chosen == "_error":
+        return random.choice(error_ducks)
+    return random.choice(by_rarity[chosen])
 
 
 def resolve_hatch(discord_id: str):
@@ -555,6 +581,7 @@ class DuckAddModal(discord.ui.Modal, title="Add a New Duck"):
                 "rarity": rarity,
                 "active": False,
                 "limited_until": None,
+                "is_error": False,
             }
             await save_duck_state()
             await inner_interaction.response.edit_message(
@@ -797,6 +824,46 @@ class DuckLimitedModal(discord.ui.Modal, title="Limited-Time Duck"):
             f"{duck['emoji']} **{duck['title']}** is earnable for the next **{hours_val} hour(s)**.",
             ephemeral=True,
         )
+
+
+class ErrorToggleModal(discord.ui.Modal, title="Toggle ERROR:404 Status"):
+    """Converts an existing duck to/from ERROR:404. Not creatable directly
+    at /duckadd — this is the only place is_error ever gets set.
+    """
+    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        duck_id = slugify(str(self.duck_title))
+        duck = duck_index.get(duck_id)
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck found matching **{self.duck_title}**.", ephemeral=True
+            )
+
+        duck["is_error"] = not duck.get("is_error", False)
+        await save_duck_state()
+
+        state_text = "marked as" if duck["is_error"] else "removed from"
+        await interaction.response.send_message(
+            f"{duck['emoji']} **{duck['title']}** ({RARITY_DISPLAY[duck['rarity']]}) has been "
+            f"{state_text} ERROR:404.",
+            ephemeral=True,
+        )
+
+
+class ErrorAdminView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Nothing to see here.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Toggle Error Status", style=discord.ButtonStyle.danger, emoji="🚫")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ErrorToggleModal())
 
 
 class HatchToggleView(discord.ui.View):
@@ -1042,10 +1109,10 @@ class IndexView(discord.ui.View):
     async def on_select(self, interaction: discord.Interaction):
         choice = interaction.data["values"][0]
         if choice == "active":
-            ids = [d for d, v in duck_index.items() if v["active"]]
+            ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
             title = "📖 Duck Index — Currently Earnable"
         else:
-            ids = [d for d, v in duck_index.items() if not v["active"]]
+            ids = [d for d, v in duck_index.items() if not v["active"] and not v.get("is_error")]
             title = "📖 Duck Index — Not Currently Active"
 
         content = format_grouped_row(group_by_rarity(ids)) or "Nothing in this category."
@@ -1620,6 +1687,27 @@ class DuckCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ---------- staff only, hidden from everyone else: ERROR:404 ----------
+    # default_permissions restricts this command's visibility in the slash
+    # command picker itself — non-admins won't even see /error exists,
+    # unless a server admin manually overrides that in Integration settings.
+    # The one thing that can't be hidden: Discord always shows "X used
+    # /error" as a channel system message, even for ephemeral responses.
+
+    @app_commands.command(name="error", description="Staff only.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def error_cmd(self, interaction: discord.Interaction):
+        error_ducks = [(d, duck) for d, duck in duck_index.items() if duck.get("is_error")]
+        lines = [
+            f"{duck['emoji']} **{duck['title']}** — {RARITY_DISPLAY[duck['rarity']]} (Error)"
+            for _, duck in error_ducks
+        ]
+        content = "\n".join(lines) or "No ERROR:404 ducks exist yet."
+
+        embed = discord.Embed(title="🚫 ERROR:404", description=content, color=discord.Color.dark_red())
+        await interaction.response.send_message(embed=embed, view=ErrorAdminView(), ephemeral=True)
+
     # ---------- public: redeem a code ----------
 
     @app_commands.command(name="redeem", description="Redeem a code for eggs or ducks.")
@@ -1822,7 +1910,7 @@ class DuckCog(commands.Cog):
 
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
     async def hatchpool(self, interaction: discord.Interaction):
-        active_ids = [d for d, v in duck_index.items() if v["active"]]
+        active_ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
         content = format_grouped_plain(group_by_rarity(active_ids)) or "The pool is currently empty."
         embed = discord.Embed(title="🥚 Current Hatch Pool", description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed)
