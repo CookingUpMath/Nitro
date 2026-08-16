@@ -2085,21 +2085,26 @@ class DuckCog(commands.Cog):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
-        lines = [
-            f"🥚 You have **{rec['inventory']}** egg(s) stored.",
-            f"😇 Karma {rec.get('karma', 0)}/{KARMA_PER_EGG}",
-        ]
+        description = (
+            f"## 🥚 You have **{rec['inventory']}** egg(s) stored\n"
+            f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
+        )
 
         if interaction.guild:
             guild_id = str(interaction.guild.id)
             nest = get_nest_state(guild_id)
-            lines.append(f"🪺 Nest: {nest['pool_total']}")
+            description += f"> -# 🪺 Nest: {nest['pool_total']}\n"
 
             my_entries = nest["entries"].get(discord_id, 0)
             if my_entries > 0:
-                lines.append(f"🎟️ Entries: {my_entries} - 🗓️: {format_nest_countdown()}")
+                description += f"> -# 🎟️ Entries: {my_entries}\n"
+                description += f"> -# 🗓️ Deadline: {format_nest_countdown()}\n"
 
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        user = interaction.user
+        role_color = user.color if isinstance(user, discord.Member) and user.color.value != 0 else discord.Color.blurple()
+        embed = discord.Embed(description=description.strip(), color=role_color)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---------- open eggs from inventory ----------
 
