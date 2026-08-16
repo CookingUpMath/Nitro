@@ -195,10 +195,21 @@ def format_nest_channel_name(pool_total: int) -> str:
     return f"🪺: {pool_total}"
 
 
-# environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42}
-# Global, not per-guild — one "weather" for the whole bot, re-rolled once
-# per UTC day the first time anything checks it that day.
-environment_state = {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE}
+# environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1}
+# Global, not per-guild — one "weather" for the whole bot. Both values are
+# re-rolled together, once per UTC day, the first time anything checks
+# that day (a message, or someone running /weather).
+environment_state = {
+    "date": None,
+    "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
+    "egg_count": 1,
+}
+
+
+def _roll_egg_count() -> int:
+    counts = [c for c, _ in EGG_COUNT_WEIGHTS]
+    weights = [w for _, w in EGG_COUNT_WEIGHTS]
+    return random.choices(counts, weights=weights, k=1)[0]
 
 
 async def ensure_environment_for_today() -> dict:
@@ -209,19 +220,9 @@ async def ensure_environment_for_today() -> dict:
         )
         environment_state["date"] = today_str
         environment_state["drop_chance_percent"] = chance
+        environment_state["egg_count"] = _roll_egg_count()
         await save_duck_state()
     return environment_state
-
-
-def roll_egg_count() -> int:
-    counts = [c for c, _ in EGG_COUNT_WEIGHTS]
-    weights = [w for _, w in EGG_COUNT_WEIGHTS]
-    return random.choices(counts, weights=weights, k=1)[0]
-
-
-def format_egg_count_percent(count: int) -> str:
-    w = dict(EGG_COUNT_WEIGHTS)[count]
-    return f"{int(w)}%" if w == int(w) else f"{w}%"
 
 
 # --- In-memory only (short-lived windows, fine to lose on restart) ---
@@ -1618,7 +1619,7 @@ class DuckCog(commands.Cog):
         if roll_duck_id() is None:
             return  # pool is empty, nothing to give right now
 
-        egg_count = roll_egg_count()
+        egg_count = env["egg_count"]
         view = EggDropView(message.author.id, egg_count)
         egg_word = "egg" if egg_count == 1 else "eggs"
         try:
@@ -1998,10 +1999,11 @@ class DuckCog(commands.Cog):
 
     # ---------- public: view pool / index / collection ----------
 
-    @app_commands.command(name="weather", description="Check today's egg-drop odds and possible egg counts.")
+    @app_commands.command(name="weather", description="Check today's egg-drop odds and eggs per drop.")
     async def weather_cmd(self, interaction: discord.Interaction):
         env = await ensure_environment_for_today()
         chance = env["drop_chance_percent"]
+        egg_count = env["egg_count"]
 
         if chance <= 8:
             label = "🌦️ Calm"
@@ -2012,16 +2014,12 @@ class DuckCog(commands.Cog):
         else:
             label = "🌩️ Frenzy"
 
+        egg_word = "egg" if egg_count == 1 else "eggs"
         lines = [
             f"# {label}",
             f"🥚 Drop Chance: **{chance}%** per check",
-            "",
-            "**Eggs per Drop**",
+            f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
         ]
-        for count, _ in EGG_COUNT_WEIGHTS:
-            pct = format_egg_count_percent(count)
-            egg_word = "egg" if count == 1 else "eggs"
-            lines.append(f"-# {count} {egg_word}: {pct}")
 
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.blue())
         await interaction.response.send_message(embed=embed)
