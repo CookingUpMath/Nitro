@@ -300,7 +300,11 @@ async def load_duck_state():
             pending_invite_karma = data.get("duck_pending_invites", {})
             redeem_codes = data.get("duck_redeem_codes", {})
             nest_state = data.get("duck_nest_state", {})
-            environment_state = data.get("duck_environment", {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE})
+            environment_state = data.get(
+                "duck_environment",
+                {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE, "egg_count": 1},
+            )
+            environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -1619,7 +1623,7 @@ class DuckCog(commands.Cog):
         if roll_duck_id() is None:
             return  # pool is empty, nothing to give right now
 
-        egg_count = env["egg_count"]
+        egg_count = env.get("egg_count", 1)
         view = EggDropView(message.author.id, egg_count)
         egg_word = "egg" if egg_count == 1 else "eggs"
         try:
@@ -2003,7 +2007,7 @@ class DuckCog(commands.Cog):
     async def weather_cmd(self, interaction: discord.Interaction):
         env = await ensure_environment_for_today()
         chance = env["drop_chance_percent"]
-        egg_count = env["egg_count"]
+        egg_count = env.get("egg_count", 1)
 
         if chance <= 8:
             label = "🌦️ Calm"
