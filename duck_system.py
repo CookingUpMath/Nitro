@@ -54,11 +54,26 @@ RARITY_DISPLAY = {
     "quackpot": "Quackpot",
 }
 
-DROP_CHANCE = 0.08             # 8% per eligible message
-DUPLICATE_BONUS_CHANCE = 0.10  # 10% extra egg on a duplicate hatch
+DUPLICATE_BONUS_CHANCE = 0.05  # 5% extra egg on a duplicate hatch
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
+
+# --- Environment: today's drop odds fluctuate, picked once per day ---
+ENVIRONMENT_MIN_CHANCE = 6.0
+ENVIRONMENT_MAX_CHANCE = 15.0
+# Triangular distribution peaked at the low end — most days land near 6%,
+# 15% is a genuinely rare high.
+
+# --- Eggs per drop: 1-5, weighted using the same odds as rarity tiers,
+# with common+rare combined into one bucket to make exactly 5 groups. ---
+EGG_COUNT_WEIGHTS = [
+    (1, RARITY_WEIGHTS["common"] + RARITY_WEIGHTS["rare"]),  # 85 — typical
+    (2, RARITY_WEIGHTS["legendary"]),                          # 10
+    (3, RARITY_WEIGHTS["divine"]),                             # 3
+    (4, RARITY_WEIGHTS["secret"]),                             # 1.5
+    (5, RARITY_WEIGHTS["quackpot"]),                           # 0.5 — matches "rare 5-egg" chance
+]
 
 # --- Karma ---
 HEART_EMOJI_ID = 1295255068483784786  # <:D_ZLove:...>
@@ -180,6 +195,35 @@ def format_nest_channel_name(pool_total: int) -> str:
     return f"🪺: {pool_total}"
 
 
+# environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42}
+# Global, not per-guild — one "weather" for the whole bot, re-rolled once
+# per UTC day the first time anything checks it that day.
+environment_state = {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE}
+
+
+async def ensure_environment_for_today() -> dict:
+    today_str = time.strftime("%Y-%m-%d", time.gmtime())
+    if environment_state.get("date") != today_str:
+        chance = round(
+            random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+        )
+        environment_state["date"] = today_str
+        environment_state["drop_chance_percent"] = chance
+        await save_duck_state()
+    return environment_state
+
+
+def roll_egg_count() -> int:
+    counts = [c for c, _ in EGG_COUNT_WEIGHTS]
+    weights = [w for _, w in EGG_COUNT_WEIGHTS]
+    return random.choices(counts, weights=weights, k=1)[0]
+
+
+def format_egg_count_percent(count: int) -> str:
+    w = dict(EGG_COUNT_WEIGHTS)[count]
+    return f"{int(w)}%" if w == int(w) else f"{w}%"
+
+
 # --- In-memory only (short-lived windows, fine to lose on restart) ---
 # reaction_karma_granted[str(message_id)] = set of user_ids who have
 # already earned a point for reacting to that message — lets every
@@ -237,7 +281,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state
     if _pool is None:
         return
     try:
@@ -245,7 +289,7 @@ async def load_duck_state():
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
-                "'duck_redeem_codes','duck_nest_state')"
+                "'duck_redeem_codes','duck_nest_state','duck_environment')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -255,6 +299,7 @@ async def load_duck_state():
             pending_invite_karma = data.get("duck_pending_invites", {})
             redeem_codes = data.get("duck_redeem_codes", {})
             nest_state = data.get("duck_nest_state", {})
+            environment_state = data.get("duck_environment", {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE})
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -290,6 +335,7 @@ async def save_duck_state() -> bool:
                     ("duck_pending_invites", json.dumps(pending_invite_karma)),
                     ("duck_redeem_codes", json.dumps(redeem_codes)),
                     ("duck_nest_state", json.dumps(nest_state)),
+                    ("duck_environment", json.dumps(environment_state)),
                 ],
             )
         return True
@@ -472,9 +518,10 @@ class EggDropView(discord.ui.View):
     the original public message in place with the outcome.
     """
 
-    def __init__(self, owner_id: int):
+    def __init__(self, owner_id: int, egg_count: int = 1):
         super().__init__(timeout=CLAIM_TIMEOUT_SECONDS)
         self.owner_id = owner_id
+        self.egg_count = egg_count
         self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -486,43 +533,83 @@ class EggDropView(discord.ui.View):
     @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
     async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
         discord_id = str(interaction.user.id)
-        result = resolve_hatch(discord_id)
 
-        if result is None:
+        if self.egg_count == 1:
+            result = resolve_hatch(discord_id)
+
+            if result is None:
+                await save_duck_state()
+                return await interaction.response.edit_message(
+                    content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
+                    embed=None,
+                    view=None,
+                )
+
             await save_duck_state()
-            return await interaction.response.edit_message(
-                content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
-                embed=None,
-                view=None,
-            )
+            self.stop()
+
+            if result["duplicate"]:
+                text = f"{result['emoji']} {interaction.user.mention} hatched **{result['title']}** — already owned, duplicate!"
+                if result["bonus_egg"]:
+                    inv = duck_users[discord_id]["inventory"]
+                    text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
+                await interaction.response.edit_message(content=text, embed=None, view=None)
+            else:
+                style = HYPE_STYLE[result["rarity"]]
+                banner = style["banner"].format(
+                    emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
+                )
+                embed = discord.Embed(description=banner, color=style["color"])
+                embed.set_footer(text=rarity_header(result["rarity"]))
+                await interaction.response.edit_message(content=None, embed=embed, view=None)
+            return
+
+        # Multiple eggs at once — grouped bulk-style list, same as /hatch.
+        pre_existing = set(get_user_record(discord_id)["collection"])
+        results = []
+        for _ in range(self.egg_count):
+            r = resolve_hatch(discord_id)
+            if r is None:
+                break
+            results.append(r)
 
         await save_duck_state()
         self.stop()
 
-        if result["duplicate"]:
-            text = f"{result['emoji']} {interaction.user.mention} hatched **{result['title']}** — already owned, duplicate!"
-            if result["bonus_egg"]:
-                inv = duck_users[discord_id]["inventory"]
-                text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
-            await interaction.response.edit_message(content=text, embed=None, view=None)
-        else:
-            style = HYPE_STYLE[result["rarity"]]
-            banner = style["banner"].format(
-                emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
+        if not results:
+            return await interaction.response.edit_message(
+                content="The pool is empty right now — nothing to hatch. Sorry, eggs gone!",
+                embed=None,
+                view=None,
             )
-            embed = discord.Embed(description=banner, color=style["color"])
-            embed.set_footer(text=rarity_header(result["rarity"]))
-            await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+        grouped = {}
+        for r in results:
+            g = grouped.setdefault(r["duck_id"], {
+                "emoji": r["emoji"], "title": r["title"], "rarity": r["rarity"], "count": 0,
+            })
+            g["count"] += 1
+
+        lines = [f"🥚 {interaction.user.mention} hatched {len(results)} egg(s):"]
+        for duck_id, g in grouped.items():
+            status_tag = " (duplicate)" if duck_id in pre_existing else " (**NEW**)"
+            lines.append(
+                f"{g['emoji']} **{g['title']}** (x{g['count']}) - "
+                f"{RARITY_DISPLAY[g['rarity']]}{status_tag}"
+            )
+
+        await interaction.response.edit_message(content="\n".join(lines), embed=None, view=None)
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
     async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
         discord_id = str(interaction.user.id)
         rec = duck_users.setdefault(discord_id, default_user_record())
-        rec["inventory"] += 1
+        rec["inventory"] += self.egg_count
         await save_duck_state()
         self.stop()
+        egg_word = "egg" if self.egg_count == 1 else "eggs"
         await interaction.response.edit_message(
-            content=f"🎒 {interaction.user.mention} stored the egg! Inventory: **{rec['inventory']}**",
+            content=f"🎒 {interaction.user.mention} stored {self.egg_count} {egg_word}! Inventory: **{rec['inventory']}**",
             embed=None,
             view=None,
         )
@@ -1525,19 +1612,22 @@ class DuckCog(commands.Cog):
             return
         rec["last_roll_check_ts"] = now  # kept in-memory only — not worth a DB write on every message
 
-        if random.random() >= DROP_CHANCE:
+        env = await ensure_environment_for_today()
+        if random.random() >= (env["drop_chance_percent"] / 100):
             return
         if roll_duck_id() is None:
             return  # pool is empty, nothing to give right now
 
-        view = EggDropView(message.author.id)
+        egg_count = roll_egg_count()
+        view = EggDropView(message.author.id, egg_count)
+        egg_word = "egg" if egg_count == 1 else "eggs"
         try:
             sent = await message.channel.send(
-                content=f"🥚 {message.author.mention} found an egg on the ground!",
+                content=f"🥚 {message.author.mention} found {egg_count} {egg_word} on the ground!",
                 view=view,
             )
             view.message = sent
-            duck_stats["total_dropped"] = duck_stats.get("total_dropped", 0) + 1
+            duck_stats["total_dropped"] = duck_stats.get("total_dropped", 0) + egg_count
             await save_duck_state()
         except Exception as e:
             print(f"[duck_system] failed to post egg drop: {e}")
@@ -1907,6 +1997,34 @@ class DuckCog(commands.Cog):
         )
 
     # ---------- public: view pool / index / collection ----------
+
+    @app_commands.command(name="weather", description="Check today's egg-drop odds and possible egg counts.")
+    async def weather_cmd(self, interaction: discord.Interaction):
+        env = await ensure_environment_for_today()
+        chance = env["drop_chance_percent"]
+
+        if chance <= 8:
+            label = "🌦️ Calm"
+        elif chance <= 11:
+            label = "🌤️ Active"
+        elif chance <= 13:
+            label = "⚡ Energetic"
+        else:
+            label = "🌩️ Frenzy"
+
+        lines = [
+            f"# {label}",
+            f"🥚 Drop Chance: **{chance}%** per check",
+            "",
+            "**Eggs per Drop**",
+        ]
+        for count, _ in EGG_COUNT_WEIGHTS:
+            pct = format_egg_count_percent(count)
+            egg_word = "egg" if count == 1 else "eggs"
+            lines.append(f"-# {count} {egg_word}: {pct}")
+
+        embed = discord.Embed(description="\n".join(lines), color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
     async def hatchpool(self, interaction: discord.Interaction):
