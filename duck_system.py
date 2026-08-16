@@ -23,7 +23,7 @@ import re
 import json
 import time
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
@@ -193,6 +193,23 @@ def get_nest_state(guild_id: str) -> dict:
 
 def format_nest_channel_name(pool_total: int) -> str:
     return f"🪺: {pool_total}"
+
+
+def format_nest_countdown() -> str:
+    """Short-form time remaining until the next nest draw (Saturday 00:00 UTC)."""
+    now = datetime.now(timezone.utc)
+    days_until_sat = (5 - now.weekday()) % 7  # Saturday = weekday 5
+    next_reset = (now + timedelta(days=days_until_sat)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if next_reset <= now:
+        next_reset += timedelta(days=7)
+
+    delta = next_reset - now
+    days = delta.days
+    hours = delta.seconds // 3600
+
+    if days > 0:
+        return f"{days} day{'s' if days != 1 else ''}, {hours} hour{'s' if hours != 1 else ''}"
+    return f"{hours} hour{'s' if hours != 1 else ''}"
 
 
 # environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1}
@@ -2067,11 +2084,22 @@ class DuckCog(commands.Cog):
     async def duckinventory_cmd(self, interaction: discord.Interaction):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
-        await interaction.response.send_message(
-            f"🥚 You have **{rec['inventory']}** egg(s) stored.\n"
+
+        lines = [
+            f"🥚 You have **{rec['inventory']}** egg(s) stored.",
             f"😇 Karma {rec.get('karma', 0)}/{KARMA_PER_EGG}",
-            ephemeral=True,
-        )
+        ]
+
+        if interaction.guild:
+            guild_id = str(interaction.guild.id)
+            nest = get_nest_state(guild_id)
+            lines.append(f"🪺 Nest: {nest['pool_total']}")
+
+            my_entries = nest["entries"].get(discord_id, 0)
+            if my_entries > 0:
+                lines.append(f"🎟️ Entries: {my_entries} - 🗓️: {format_nest_countdown()}")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ---------- open eggs from inventory ----------
 
