@@ -266,6 +266,7 @@ def default_user_record():
         "last_daily_egg_date": None,
         "last_gm_date": None,
         "karma": 0,
+        "favorites": [],
     }
 
 
@@ -277,6 +278,7 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("last_daily_egg_date", None)
     rec.setdefault("last_gm_date", None)
     rec.setdefault("karma", 0)
+    rec.setdefault("favorites", [])
     return rec
 
 
@@ -372,6 +374,25 @@ async def save_duck_state() -> bool:
 
 def slugify(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+
+
+async def fav_duck_autocomplete(interaction: discord.Interaction, current: str):
+    """Suggests only ducks the requester actually owns, matched against
+    what they've typed so far — avoids typos entirely and scales past
+    Discord's 25-option select limit since it's computed per-keystroke.
+    """
+    discord_id = str(interaction.user.id)
+    rec = duck_users.get(discord_id, default_user_record())
+    owned_ids = rec.get("collection", [])
+
+    current_lower = current.lower()
+    matches = []
+    for duck_id in owned_ids:
+        duck = duck_index.get(duck_id)
+        if duck and current_lower in duck["title"].lower():
+            matches.append(duck["title"])
+
+    return [app_commands.Choice(name=title, value=title) for title in matches[:25]]
 
 
 def rename_duck(old_id: str, new_title: str) -> str:
@@ -491,6 +512,32 @@ def format_flat_row(duck_ids) -> str:
     if not ducks:
         return ""
     return "# " + " ".join(duck["emoji"] for duck in ducks)
+
+
+def build_collection_body(owned, favorites, choice: str = "_all") -> str:
+    """Splits the current filtered view into a Favorites section (if any)
+    and the rest, so a favorited duck never shows twice.
+    """
+    if choice == "_all":
+        ids = owned
+        section_label = "Collection"
+    else:
+        ids = [d for d in owned if duck_index.get(d, {}).get("rarity") == choice]
+        section_label = RARITY_DISPLAY.get(choice, choice)
+
+    if not ids:
+        return "No ducks in this view yet."
+
+    fav_ids = [d for d in favorites if d in ids]
+    rest_ids = [d for d in ids if d not in fav_ids]
+
+    parts = []
+    if fav_ids:
+        parts.append("### Favorites\n" + format_flat_row(fav_ids))
+    if rest_ids:
+        parts.append(f"### {section_label}\n" + format_flat_row(rest_ids))
+
+    return "\n\n".join(parts)
 
 
 def format_grouped_row(grouped) -> str:
@@ -1403,15 +1450,10 @@ class CollectionFilterView(discord.ui.View):
     async def on_select(self, interaction: discord.Interaction):
         choice = interaction.data["values"][0]
         discord_id = str(self.target_id)
-        rec = duck_users.get(discord_id, default_user_record())
+        rec = get_user_record(discord_id)
         owned = rec["collection"]
 
-        if choice == "_all":
-            ids = owned
-        else:
-            ids = [d for d in owned if duck_index.get(d, {}).get("rarity") == choice]
-
-        content = format_flat_row(ids) or "No ducks in this view yet."
+        content = build_collection_body(owned, rec.get("favorites", []), choice)
         embed = discord.Embed(
             title=f"🦆 {self.target_display_name}'s Collection",
             description=content,
@@ -2070,15 +2112,47 @@ class DuckCog(commands.Cog):
     async def collection_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
         discord_id = str(target.id)
-        rec = duck_users.get(discord_id, default_user_record())
+        rec = get_user_record(discord_id)
 
-        content = format_flat_row(rec["collection"]) or "No ducks collected yet."
+        content = build_collection_body(rec["collection"], rec.get("favorites", []))
         role_color = target.color if target.color.value != 0 else discord.Color.teal()
         embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=role_color)
         embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
 
         view = CollectionFilterView(target.id, target.display_name, role_color)
         await interaction.response.send_message(embed=embed, view=view)
+
+    @app_commands.command(name="fav", description="Favorite or unfavorite a duck from your collection.")
+    @app_commands.describe(duck="Start typing — only ducks you own will show up")
+    @app_commands.autocomplete(duck=fav_duck_autocomplete)
+    async def fav_cmd(self, interaction: discord.Interaction, duck: str):
+        discord_id = str(interaction.user.id)
+        rec = get_user_record(discord_id)
+
+        duck_id = slugify(duck)
+        if duck_id not in rec.get("collection", []):
+            return await interaction.response.send_message(
+                f"You don't own a duck matching **{duck}** — pick one of the suggestions as you type.",
+                ephemeral=True,
+            )
+
+        duck_info = duck_index.get(duck_id)
+        duck_title = duck_info["title"] if duck_info else duck
+        duck_emoji = duck_info["emoji"] if duck_info else "🦆"
+
+        favorites = rec.setdefault("favorites", [])
+        if duck_id in favorites:
+            favorites.remove(duck_id)
+            await save_duck_state()
+            return await interaction.response.send_message(
+                f"💔 Removed {duck_emoji} **{duck_title}** from your favorites.", ephemeral=True
+            )
+
+        favorites.append(duck_id)
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"⭐ Added {duck_emoji} **{duck_title}** to your favorites.", ephemeral=True
+        )
 
     @app_commands.command(name="inventory", description="Check how many eggs you have in storage.")
     async def duckinventory_cmd(self, interaction: discord.Interaction):
