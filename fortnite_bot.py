@@ -968,6 +968,11 @@ async def check_wins_for_user(discord_id, info):
     win_count = current_wins - last_wins
     win_ts = int(time.time())
 
+    # Every Fortnite win grants a karma point on the duck side — win_count
+    # in case more than one win landed between poll cycles.
+    duck_system.award_karma(discord_id, win_count)
+    await duck_system.save_duck_state()
+
     # Figure out which playlist the win came from by seeing whose bucket grew the most.
     increased = [
         (mode, wins - last_mode_wins.get(mode, wins))
@@ -1086,17 +1091,29 @@ async def run_weekly_reset():
         role_id = config.get("fortboard_role_id")
         guild = bot.get_guild(int(guild_id))
 
-        if guild and role_id:
+        if not guild:
+            continue
+
+        wins_ranked = sorted(members, key=lambda kv: weekly_wins_for(kv[1]), reverse=True)
+        kills_ranked = sorted(members, key=lambda kv: weekly_kills_for(kv[1]), reverse=True)
+
+        top_wins_id = wins_ranked[0][0] if wins_ranked and weekly_wins_for(wins_ranked[0][1]) > 0 else None
+        top_kills_id = kills_ranked[0][0] if kills_ranked and weekly_kills_for(kills_ranked[0][1]) > 0 else None
+
+        # 10 eggs per category on the duck side — 20 total if the same
+        # person tops both wins and kills. Independent of whether a
+        # champion role is even configured for this guild.
+        if top_wins_id:
+            duck_system.add_eggs(top_wins_id, 10)
+        if top_kills_id:
+            duck_system.add_eggs(top_kills_id, 10)
+        if top_wins_id or top_kills_id:
+            await duck_system.save_duck_state()
+
+        if role_id:
             role = guild.get_role(role_id)
             if role:
-                wins_ranked = sorted(members, key=lambda kv: weekly_wins_for(kv[1]), reverse=True)
-                kills_ranked = sorted(members, key=lambda kv: weekly_kills_for(kv[1]), reverse=True)
-
-                winners = set()
-                if wins_ranked and weekly_wins_for(wins_ranked[0][1]) > 0:
-                    winners.add(wins_ranked[0][0])
-                if kills_ranked and weekly_kills_for(kills_ranked[0][1]) > 0:
-                    winners.add(kills_ranked[0][0])
+                winners = {i for i in (top_wins_id, top_kills_id) if i}
 
                 previous_holders = config.get("fortboard_role_holders", [])
                 for old_id in previous_holders:
