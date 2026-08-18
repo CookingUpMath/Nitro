@@ -191,10 +191,6 @@ def get_nest_state(guild_id: str) -> dict:
     return state
 
 
-def format_nest_channel_name(pool_total: int) -> str:
-    return f"🪺: {pool_total}"
-
-
 def format_nest_countdown() -> str:
     """Short-form time remaining until the next nest draw (Saturday 00:00 UTC)."""
     now = datetime.now(timezone.utc)
@@ -293,6 +289,15 @@ def award_karma(discord_id: str, points: int = 1):
 def remove_karma(discord_id: str, points: int = 1):
     rec = get_user_record(discord_id)
     rec["karma"] = max(rec.get("karma", 0) - points, 0)
+
+
+def add_eggs(discord_id: str, amount: int):
+    """For external callers (e.g. the Fortnite side rewarding weekly
+    leaderboard winners) — doesn't save on its own, caller should
+    await save_duck_state() once after making all its changes.
+    """
+    rec = get_user_record(discord_id)
+    rec["inventory"] += amount
 
 
 # Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
@@ -1070,36 +1075,6 @@ class EggChannelSelectView(discord.ui.View):
         )
 
 
-class NestChannelSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.select = discord.ui.ChannelSelect(
-            placeholder="Choose a voice channel for the nest counter",
-            channel_types=[discord.ChannelType.voice],
-            min_values=1,
-            max_values=1,
-        )
-        self.select.callback = self.on_select
-        self.add_item(self.select)
-
-    async def on_select(self, interaction: discord.Interaction):
-        channel = self.select.values[0]
-        guild_id = str(interaction.guild.id)
-        duck_config.setdefault(guild_id, {})["nest_channel_id"] = channel.id
-        state = get_nest_state(guild_id)
-        await save_duck_state()
-        try:
-            resolved = await channel.fetch()
-            await resolved.edit(name=format_nest_channel_name(state["pool_total"]))
-        except Exception as e:
-            print(f"[duck_system] initial nest channel rename failed: {e}")
-        await interaction.response.edit_message(
-            content=f"Nest channel set to {channel.mention}. It refreshes every "
-                    f"{EGG_COUNTER_UPDATE_MINUTES} minutes.",
-            view=None,
-        )
-
-
 class NestPrizeDuckModal(discord.ui.Modal, title="Set Nest Prize Duck"):
     duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
 
@@ -1454,12 +1429,8 @@ class CollectionFilterView(discord.ui.View):
         owned = rec["collection"]
 
         content = build_collection_body(owned, rec.get("favorites", []), choice)
-        embed = discord.Embed(
-            title=f"🦆 {self.target_display_name}'s Collection",
-            description=content,
-            color=self.color,
-        )
-        embed.set_footer(text=f"{len(owned)}/{len(duck_index)} collected")
+        embed = discord.Embed(description=content, color=self.color)
+        embed.set_footer(text=f"🎒 {self.target_display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed")
 
         # Reflect the current choice as the visibly-selected option next time.
         for item in self.children:
@@ -1487,7 +1458,6 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Block Egg-Drop Channels", value="egg_blocked_channels", emoji="🚫"),
             discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
             discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
-            discord.SelectOption(label="Set Nest Channel", value="nest_channel", emoji="🪺"),
             discord.SelectOption(label="Set Nest Prize Duck", value="nest_prize_duck", emoji="🎁"),
         ]
         select = discord.ui.Select(placeholder="Choose an action", options=options)
@@ -1552,12 +1522,6 @@ class EditorView(discord.ui.View):
             )
         elif choice == "redeem_code":
             await interaction.response.send_modal(RedeemCodeModal())
-        elif choice == "nest_channel":
-            await interaction.response.send_message(
-                "Pick the voice channel to use as the live nest counter:",
-                view=NestChannelSelectView(),
-                ephemeral=True,
-            )
         elif choice == "nest_prize_duck":
             await interaction.response.send_modal(NestPrizeDuckModal())
 
@@ -1923,17 +1887,6 @@ class DuckCog(commands.Cog):
                     except Exception as e:
                         print(f"[duck_system] failed to rename egg counter channel: {e}")
 
-            nest_channel_id = config.get("nest_channel_id")
-            if nest_channel_id:
-                pool_total = get_nest_state(guild_id)["pool_total"]
-                desired_nest_name = format_nest_channel_name(pool_total)
-                nest_channel = self.bot.get_channel(nest_channel_id)
-                if nest_channel and nest_channel.name != desired_nest_name:
-                    try:
-                        await nest_channel.edit(name=desired_nest_name)
-                    except Exception as e:
-                        print(f"[duck_system] failed to rename nest channel: {e}")
-
     @update_egg_counter_channels.before_loop
     async def before_update_egg_counter_channels(self):
         await self.bot.wait_until_ready()
@@ -1952,16 +1905,11 @@ class DuckCog(commands.Cog):
             return
         week_id = now.strftime("%G-W%V")
 
-        for guild_id_str, config in list(duck_config.items()):
-            if not config.get("nest_channel_id"):
-                continue  # nest isn't set up for this guild
+        for guild in list(self.bot.guilds):
+            guild_id_str = str(guild.id)
             try:
                 state = get_nest_state(guild_id_str)
                 if state.get("last_reset_week") == week_id:
-                    continue
-
-                guild = self.bot.get_guild(int(guild_id_str))
-                if not guild:
                     continue
 
                 await self.run_nest_reset(guild, guild_id_str, state)
@@ -2031,15 +1979,6 @@ class DuckCog(commands.Cog):
         # Reset for the next cycle regardless of whether anyone entered.
         state["pool_total"] = NEST_BASELINE
         state["entries"] = {}
-
-        channel_id = duck_config.get(guild_id_str, {}).get("nest_channel_id")
-        if channel_id:
-            channel = self.bot.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.edit(name=format_nest_channel_name(NEST_BASELINE))
-                except Exception:
-                    pass
 
     # ---------- public: donate to the nest ----------
 
@@ -2116,8 +2055,8 @@ class DuckCog(commands.Cog):
 
         content = build_collection_body(rec["collection"], rec.get("favorites", []))
         role_color = target.color if target.color.value != 0 else discord.Color.teal()
-        embed = discord.Embed(title=f"🦆 {target.display_name}'s Collection", description=content, color=role_color)
-        embed.set_footer(text=f"{len(rec['collection'])}/{len(duck_index)} collected")
+        embed = discord.Embed(description=content, color=role_color)
+        embed.set_footer(text=f"🎒 {target.display_name}'s Collection - {len(rec['collection'])}/{len(duck_index)} indexed")
 
         view = CollectionFilterView(target.id, target.display_name, role_color)
         await interaction.response.send_message(embed=embed, view=view)
