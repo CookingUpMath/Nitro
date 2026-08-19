@@ -920,71 +920,72 @@ class ConfirmClearPoolView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=None)
 
 
-class DuckActivateModal(discord.ui.Modal):
+class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
+    """One combined toggle, like /fav — each listed duck flips based on
+    ITS OWN current state independently, not a single batch direction.
+    Type 3 titles where 1 is already active and 2 aren't: the active one
+    deactivates, the two inactive ones activate, all in the same submit.
+    The optional Hours field only applies to ducks that go inactive→active
+    in this action; deactivating always clears any limited-time expiry.
+    """
     duck_titles = discord.ui.TextInput(
         label="Duck Title(s)",
         style=discord.TextStyle.paragraph,
         placeholder="One per line, or comma-separated, e.g.\nGolden Duck\nIce Duck, Fire Duck",
         max_length=2000,
     )
-
-    def __init__(self, activate: bool):
-        super().__init__(title="Activate Ducks" if activate else "Deactivate Ducks")
-        self.activate = activate
+    hours = discord.ui.TextInput(
+        label="Limited Hours (optional)",
+        required=False,
+        max_length=10,
+        placeholder="Leave blank for a normal, non-expiring activation",
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.duck_titles)
         titles = [t.strip() for line in raw.split("\n") for t in line.split(",")]
         titles = [t for t in titles if t]
 
-        found, missing = [], []
+        hours_raw = str(self.hours).strip()
+        hours_val = None
+        if hours_raw:
+            try:
+                hours_val = float(hours_raw)
+                if hours_val <= 0:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Hours must be a positive number.", ephemeral=True
+                )
+
+        activated, deactivated, missing = [], [], []
         for title in titles:
             duck = duck_index.get(slugify(title))
             if not duck:
                 missing.append(title)
                 continue
-            duck["active"] = self.activate
-            duck["limited_until"] = None
-            found.append(duck["title"])
 
-        if found:
+            if duck["active"]:
+                duck["active"] = False
+                duck["limited_until"] = None
+                deactivated.append(duck["title"])
+            else:
+                duck["active"] = True
+                duck["limited_until"] = time.time() + hours_val * 3600 if hours_val else None
+                activated.append(duck["title"])
+
+        if activated or deactivated:
             await save_duck_state()
 
-        state = "earnable" if self.activate else "no longer earnable"
         lines = []
-        if found:
-            lines.append(f"✅ Now {state}: " + ", ".join(found))
+        if activated:
+            suffix = f" (limited, {hours_val}h)" if hours_val else ""
+            lines.append(f"✅ Activated{suffix}: " + ", ".join(activated))
+        if deactivated:
+            lines.append("⛔ Deactivated: " + ", ".join(deactivated))
         if missing:
             lines.append("⚠️ Not found in the index: " + ", ".join(missing))
         await interaction.response.send_message("\n".join(lines) or "Nothing to do.", ephemeral=True)
-
-
-class DuckLimitedModal(discord.ui.Modal, title="Limited-Time Duck"):
-    duck_title = discord.ui.TextInput(label="Duck Title (exact)", max_length=100)
-    hours = discord.ui.TextInput(label="Hours Active", placeholder="e.g. 48", max_length=10)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        duck_id = slugify(str(self.duck_title))
-        duck = duck_index.get(duck_id)
-        if not duck:
-            return await interaction.response.send_message(
-                f"No duck found matching **{self.duck_title}**.", ephemeral=True
-            )
-        try:
-            hours_val = int(str(self.hours))
-            if hours_val < 1:
-                raise ValueError
-        except ValueError:
-            return await interaction.response.send_message(
-                "Hours must be a whole number of at least 1.", ephemeral=True
-            )
-        duck["active"] = True
-        duck["limited_until"] = time.time() + hours_val * 3600
-        await save_duck_state()
-        await interaction.response.send_message(
-            f"{duck['emoji']} **{duck['title']}** is earnable for the next **{hours_val} hour(s)**.",
-            ephemeral=True,
-        )
 
 
 class ErrorToggleModal(discord.ui.Modal, title="Toggle ERROR:404 Status"):
@@ -1448,10 +1449,8 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Add Duck", value="add", emoji="➕"),
             discord.SelectOption(label="Edit Duck Emoji", value="edit", emoji="✏️"),
             discord.SelectOption(label="Remove Duck", value="remove", emoji="🗑️"),
-            discord.SelectOption(label="Activate Duck", value="on", emoji="✅"),
-            discord.SelectOption(label="Deactivate Duck", value="off", emoji="⛔"),
+            discord.SelectOption(label="Toggle Duck Activation", value="toggle_active", emoji="🔁"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
-            discord.SelectOption(label="Limited-Time Duck", value="limited", emoji="⏳"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
             discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
@@ -1480,18 +1479,14 @@ class EditorView(discord.ui.View):
             await interaction.response.send_modal(DuckEditModal())
         elif choice == "remove":
             await interaction.response.send_modal(DuckRemoveModal())
-        elif choice == "on":
-            await interaction.response.send_modal(DuckActivateModal(activate=True))
-        elif choice == "off":
-            await interaction.response.send_modal(DuckActivateModal(activate=False))
+        elif choice == "toggle_active":
+            await interaction.response.send_modal(DuckToggleActiveModal())
         elif choice == "clear_pool":
             await interaction.response.send_message(
                 "Deactivate every currently active duck? They stay in the index, just leave the earnable pool.",
                 view=ConfirmClearPoolView(interaction.user.id),
                 ephemeral=True,
             )
-        elif choice == "limited":
-            await interaction.response.send_modal(DuckLimitedModal())
         elif choice == "toggle":
             await interaction.response.send_message(
                 "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
