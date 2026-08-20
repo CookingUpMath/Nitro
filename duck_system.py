@@ -253,10 +253,12 @@ async def ensure_environment_for_today() -> dict:
 
 
 # --- In-memory only (short-lived windows, fine to lose on restart) ---
-# reaction_karma_granted[str(message_id)] = set of user_ids who have
-# already earned a point for reacting to that message — lets every
-# distinct reactor earn their own point, while still stopping any single
-# person from farming it by removing/re-adding their own reaction.
+# reaction_karma_granted[str(message_id)] = {
+#   "author_id": int,          # message author (receiver of the heart)
+#   "reactors": set[user_id],  # who already earned credit for reacting
+# }
+# Each distinct reactor grants 1 karma to themselves and 1 to the author.
+# Re-adding the same reaction after removal does not farm extra points.
 reaction_karma_granted = {}
 # wave_karma_granted — same shape as reaction_karma_granted, but tracked
 # separately since it's a different trigger (👋 in the intro channel).
@@ -1730,8 +1732,8 @@ class DuckCog(commands.Cog):
             return
 
         message_key = str(payload.message_id)
-        already_credited = reaction_karma_granted.setdefault(message_key, set())
-        if payload.user_id in already_credited:
+        entry = reaction_karma_granted.setdefault(message_key, {"author_id": None, "reactors": set()})
+        if payload.user_id in entry["reactors"]:
             return  # this specific person already earned their point here — no farming via remove/re-add
 
         posted_at = discord.utils.snowflake_time(payload.message_id)
@@ -1747,8 +1749,12 @@ class DuckCog(commands.Cog):
         if message.author.id == payload.user_id:
             return  # no self-karma for reacting to your own post
 
-        already_credited.add(payload.user_id)
-        award_karma(str(payload.user_id), 1)  # the REACTOR earns the point
+        entry["author_id"] = message.author.id
+        entry["reactors"].add(payload.user_id)
+
+        award_karma(str(payload.user_id), 1)  # the REACTOR earns a point
+        if not message.author.bot:
+            award_karma(str(message.author.id), 1)  # the RECEIVER earns a point too
         await save_duck_state()
 
     @commands.Cog.listener()
@@ -1757,12 +1763,15 @@ class DuckCog(commands.Cog):
             return
 
         message_key = str(payload.message_id)
-        credited = reaction_karma_granted.get(message_key)
-        if not credited or payload.user_id not in credited:
+        entry = reaction_karma_granted.get(message_key)
+        if not entry or payload.user_id not in entry.get("reactors", ()):
             return  # this person never earned a point here
 
-        credited.discard(payload.user_id)
-        remove_karma(str(payload.user_id), 1)  # take the point back from the reactor who un-reacted
+        entry["reactors"].discard(payload.user_id)
+        remove_karma(str(payload.user_id), 1)  # take the point back from the reactor
+        author_id = entry.get("author_id")
+        if author_id and author_id != payload.user_id:
+            remove_karma(str(author_id), 1)  # take the point back from the receiver
         await save_duck_state()
 
     # ---------- wave-reaction karma (introduction channel) ----------
