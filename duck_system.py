@@ -208,6 +208,20 @@ def format_nest_countdown() -> str:
     return f"{hours} hour{'s' if hours != 1 else ''}"
 
 
+def format_limited_remaining(limited_until: float | None) -> str:
+    """Simple remaining time for a limited duck, e.g. '(2 days, 5 hours)'."""
+    if not limited_until:
+        return ""
+    remaining = limited_until - time.time()
+    if remaining <= 0:
+        return " (expired)"
+    days = int(remaining // 86400)
+    hours = int((remaining % 86400) // 3600)
+    if days > 0:
+        return f" ({days} day{'s' if days != 1 else ''}, {hours} hour{'s' if hours != 1 else ''})"
+    return f" ({hours} hour{'s' if hours != 1 else ''})"
+
+
 # environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1}
 # Global, not per-guild — one "weather" for the whole bot. Both values are
 # re-rolled together, once per UTC day, the first time anything checks
@@ -562,8 +576,8 @@ def format_grouped_row(grouped) -> str:
 
 
 def format_grouped_plain(grouped) -> str:
-    """Regular-sized style: bold 'Rarity (x%)' label, normal-size
-    'emoji title' lines underneath. Used by /hatchpool.
+    """Single-column style for /hatchpool: bold rarity header, one
+    'emoji title' line per duck. Limited ducks append a short remaining-time tag.
     """
     lines = []
     for r in RARITY_ORDER:
@@ -572,7 +586,9 @@ def format_grouped_plain(grouped) -> str:
             continue
         lines.append(f"**{rarity_header(r)}**")
         for duck in ducks:
-            lines.append(f"{duck['emoji']} {duck['title']}")
+            entry = f"{duck['emoji']} {duck['title']}"
+            entry += format_limited_remaining(duck.get("limited_until"))
+            lines.append(entry)
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -2026,7 +2042,7 @@ class DuckCog(commands.Cog):
         active_ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
         content = format_grouped_plain(group_by_rarity(active_ids)) or "The pool is currently empty."
         embed = discord.Embed(title="🥚 Current Hatch Pool", description=content, color=discord.Color.gold())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="index", description="View every duck that has ever been added.")
     async def index_cmd(self, interaction: discord.Interaction):
