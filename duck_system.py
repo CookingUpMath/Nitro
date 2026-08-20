@@ -575,20 +575,35 @@ def format_grouped_row(grouped) -> str:
     return "\n".join(lines).strip()
 
 
-def format_grouped_plain(grouped) -> str:
+def format_grouped_plain(active_ids, owned_ids: set | None = None) -> str:
     """Single-column style for /hatchpool: bold rarity header, one
     'emoji title' line per duck. Limited ducks append a short remaining-time tag.
+
+    Owned ducks are shown as small text (-#); missing ducks are bolded.
     """
+    if owned_ids is None:
+        owned_ids = set()
+
+    grouped_ids = {r: [] for r in RARITY_ORDER}
+    for duck_id in active_ids:
+        duck = duck_index.get(duck_id)
+        if duck:
+            grouped_ids[duck["rarity"]].append(duck_id)
+
     lines = []
     for r in RARITY_ORDER:
-        ducks = grouped.get(r, [])
-        if not ducks:
+        ids = grouped_ids[r]
+        if not ids:
             continue
         lines.append(f"**{rarity_header(r)}**")
-        for duck in ducks:
+        for duck_id in ids:
+            duck = duck_index[duck_id]
             entry = f"{duck['emoji']} {duck['title']}"
             entry += format_limited_remaining(duck.get("limited_until"))
-            lines.append(entry)
+            if duck_id in owned_ids:
+                lines.append(f"-# {entry}")
+            else:
+                lines.append(f"**{entry}**")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -2040,7 +2055,8 @@ class DuckCog(commands.Cog):
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
     async def hatchpool(self, interaction: discord.Interaction):
         active_ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
-        content = format_grouped_plain(group_by_rarity(active_ids)) or "The pool is currently empty."
+        owned_ids = set(get_user_record(str(interaction.user.id)).get("collection", []))
+        content = format_grouped_plain(active_ids, owned_ids) or "The pool is currently empty."
         embed = discord.Embed(title="🥚 Current Hatch Pool", description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
