@@ -23,6 +23,7 @@ import re
 import json
 import time
 import random
+import uuid
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -167,6 +168,16 @@ duck_stats = {"total_dropped": 0}
 # message. Persisted so a restart between join and first message doesn't
 # lose the credit.
 pending_invite_karma = {}
+
+# pending_gifts[gift_id] = {
+#   "giver_id": str, "target_id": str, "amount": int,
+#   "created_at": float, "giver_color": int | None
+# }
+# Eggs are removed from the giver immediately and held here until the
+# target accepts (loss rolled on accept), declines (full refund), or the
+# offer expires after GIFT_EXPIRY_SECONDS (full refund).
+GIFT_EXPIRY_SECONDS = 48 * 60 * 60
+pending_gifts = {}
 
 # redeem_codes[code] = {
 #   "eggs": int, "duck_ids": [duck_id, ...],
@@ -322,7 +333,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts
     if _pool is None:
         return
     try:
@@ -330,7 +341,7 @@ async def load_duck_state():
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
-                "'duck_redeem_codes','duck_nest_state','duck_environment')"
+                "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -340,12 +351,13 @@ async def load_duck_state():
             pending_invite_karma = data.get("duck_pending_invites", {})
             redeem_codes = data.get("duck_redeem_codes", {})
             nest_state = data.get("duck_nest_state", {})
+            pending_gifts = data.get("duck_pending_gifts", {})
             environment_state = data.get(
                 "duck_environment",
                 {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE, "egg_count": 1},
             )
             environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
-            print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s)")
+            print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s), {len(pending_gifts)} pending gift(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
         # keys ('mythic'/'ghost') before this rename.
@@ -381,6 +393,7 @@ async def save_duck_state() -> bool:
                     ("duck_redeem_codes", json.dumps(redeem_codes)),
                     ("duck_nest_state", json.dumps(nest_state)),
                     ("duck_environment", json.dumps(environment_state)),
+                    ("duck_pending_gifts", json.dumps(pending_gifts)),
                 ],
             )
         return True
@@ -1224,8 +1237,138 @@ def format_gift_loss_flavor(lost: int) -> str:
     return template.format(lost=lost)
 
 
+async def return_pending_gift(bot: commands.Bot, gift_id: str, reason: str = "declined") -> bool:
+    """Refund a pending gift in full to the giver. reason: 'declined' | 'expired'."""
+    gift = pending_gifts.pop(gift_id, None)
+    if not gift:
+        return False
+
+    giver_id = gift["giver_id"]
+    amount = gift["amount"]
+    get_user_record(giver_id)["inventory"] += amount
+    await save_duck_state()
+
+    try:
+        giver = await bot.fetch_user(int(giver_id))
+    except Exception:
+        return True
+
+    egg_word = "egg" if amount == 1 else "eggs"
+    if reason == "expired":
+        text = (
+            f"🎁 Your gift of **{amount}** {egg_word} to <@{gift['target_id']}> expired "
+            f"after 48 hours with no response. Your eggs have been returned."
+        )
+    else:
+        text = (
+            f"🎁 <@{gift['target_id']}> declined to receive your gift. "
+            f"Your **{amount}** {egg_word} have been returned."
+        )
+    try:
+        await giver.send(text)
+    except Exception:
+        pass
+    return True
+
+
+class GiftOfferView(discord.ui.View):
+    """Target accepts or declines a pending gift. Persistent across restarts."""
+
+    def __init__(self, gift_id: str):
+        super().__init__(timeout=None)
+        self.gift_id = gift_id
+
+        accept_btn = discord.ui.Button(
+            label="✅ Accept",
+            style=discord.ButtonStyle.success,
+            custom_id=f"gift_accept:{gift_id}",
+        )
+        decline_btn = discord.ui.Button(
+            label="❌ Decline",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"gift_decline:{gift_id}",
+        )
+        accept_btn.callback = self.accept
+        decline_btn.callback = self.decline
+        self.add_item(accept_btn)
+        self.add_item(decline_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        gift = pending_gifts.get(self.gift_id)
+        if not gift:
+            await interaction.response.edit_message(
+                content="This gift is no longer available.", embed=None, view=None
+            )
+            return False
+        if interaction.user.id != int(gift["target_id"]):
+            await interaction.response.send_message("This gift isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    async def accept(self, interaction: discord.Interaction):
+        gift = pending_gifts.pop(self.gift_id, None)
+        if not gift:
+            return await interaction.response.edit_message(
+                content="This gift is no longer available.", embed=None, view=None
+            )
+
+        amount = gift["amount"]
+        lost = roll_gift_loss(amount)
+        received = amount - lost
+        if received > 0:
+            get_user_record(gift["target_id"])["inventory"] += received
+        await save_duck_state()
+
+        flavor = format_gift_loss_flavor(lost)
+        egg_word = "egg" if received == 1 else "eggs"
+        color = discord.Color(gift["giver_color"]) if gift.get("giver_color") else discord.Color.blurple()
+
+        if received > 0:
+            body = f"<@{gift['giver_id']}> sent you **{received}** {egg_word}!\n\n{flavor}"
+            embed = discord.Embed(title="🎁 You received a gift", description=body, color=color)
+            embed.set_footer(text="❤️ Good luck on the hatches!")
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        else:
+            body = f"<@{gift['giver_id']}> sent a gift, but none of the eggs made it through.\n\n{flavor}"
+            embed = discord.Embed(title="🎁 Gift opened", description=body, color=color)
+            embed.set_footer(text="❤️ Better luck next time!")
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+        # Notify giver (best-effort)
+        try:
+            giver = await interaction.client.fetch_user(int(gift["giver_id"]))
+            sent_word = "egg" if amount == 1 else "eggs"
+            if received == amount:
+                note = f"🎁 <@{gift['target_id']}> accepted your gift of **{amount}** {sent_word}."
+            elif received == 0:
+                note = (
+                    f"🎁 <@{gift['target_id']}> accepted your gift of **{amount}** {sent_word}, "
+                    f"but none survived the handoff."
+                )
+            else:
+                note = (
+                    f"🎁 <@{gift['target_id']}> accepted your gift — "
+                    f"they received **{received}** of **{amount}** {sent_word}."
+                )
+            await giver.send(note)
+        except Exception:
+            pass
+
+    async def decline(self, interaction: discord.Interaction):
+        ok = await return_pending_gift(interaction.client, self.gift_id, reason="declined")
+        if not ok:
+            return await interaction.response.edit_message(
+                content="This gift is no longer available.", embed=None, view=None
+            )
+        await interaction.response.edit_message(
+            content="You declined the gift. The eggs have been returned to the sender.",
+            embed=None,
+            view=None,
+        )
+
+
 class GiftConfirmView(discord.ui.View):
-    """Giver confirms sending eggs to another member. Some may be dropped in transit."""
+    """Giver confirms creating a pending gift offer."""
 
     def __init__(self, owner_id: int, target_id: int, amount: int):
         super().__init__(timeout=60)
@@ -1248,62 +1391,65 @@ class GiftConfirmView(discord.ui.View):
                 view=None,
             )
 
-        lost = roll_gift_loss(self.amount)
-        received = self.amount - lost
-
+        # Hold eggs in pending until accept / decline / expiry
         giver_rec["inventory"] -= self.amount
-        if received > 0:
-            target_rec = get_user_record(target_id)
-            target_rec["inventory"] += received
+        gift_id = uuid.uuid4().hex
+        giver_color = None
+        if isinstance(interaction.user, discord.Member) and interaction.user.color.value != 0:
+            giver_color = interaction.user.color.value
 
+        pending_gifts[gift_id] = {
+            "giver_id": giver_id,
+            "target_id": target_id,
+            "amount": self.amount,
+            "created_at": time.time(),
+            "giver_color": giver_color,
+        }
         await save_duck_state()
 
-        flavor = format_gift_loss_flavor(lost)
-        egg_word = "egg" if received == 1 else "eggs"
         sent_word = "egg" if self.amount == 1 else "eggs"
+        await interaction.response.edit_message(
+            content=(
+                f"🎁 Gift of **{self.amount}** {sent_word} offered to <@{self.target_id}>.\n"
+                f"-# Waiting for them to accept. If they decline or don't respond within 48 hours, "
+                f"your eggs come back in full."
+            ),
+            view=None,
+        )
 
-        if lost == 0:
-            result = (
-                f"🎁 You sent **{self.amount}** {sent_word} to <@{self.target_id}>.\n"
-                f"{flavor}"
-            )
-        elif received == 0:
-            result = (
-                f"🎁 You tried to send **{self.amount}** {sent_word} to <@{self.target_id}>, "
-                f"but none made it through.\n{flavor}"
-            )
-        else:
-            result = (
-                f"🎁 You sent **{self.amount}** {sent_word} to <@{self.target_id}> — "
-                f"they received **{received}** {egg_word}.\n{flavor}"
-            )
+        # DM the target with Accept / Decline
+        target = interaction.guild.get_member(self.target_id) if interaction.guild else None
+        if target is None:
+            try:
+                target = await interaction.client.fetch_user(self.target_id)
+            except Exception:
+                target = None
 
-        await interaction.response.edit_message(content=result, view=None)
+        if target is None:
+            return
 
-        # DM the target (best-effort)
-        if received > 0:
-            target = interaction.guild.get_member(self.target_id) if interaction.guild else None
-            if target is None:
-                try:
-                    target = await interaction.client.fetch_user(self.target_id)
-                except Exception:
-                    target = None
-
-            if target is not None:
-                color = discord.Color.blurple()
-                if isinstance(interaction.user, discord.Member) and interaction.user.color.value != 0:
-                    color = interaction.user.color
-
-                dm_body = (
-                    f"# 🎁 ||{interaction.user.mention} just gifted you **{received}** {egg_word}||\n"
-                    f"||{flavor}||"
+        color = discord.Color(giver_color) if giver_color else discord.Color.blurple()
+        embed = discord.Embed(
+            description=f"## 🎁 A gift has arrived!\nFrom {interaction.user.mention}",
+            color=color,
+        )
+        embed.set_footer(text="Accept to open · Decline to return · Expires in 48 hours")
+        view = GiftOfferView(gift_id)
+        interaction.client.add_view(view)
+        try:
+            await target.send(embed=embed, view=view)
+        except Exception:
+            # Can't DM target — refund immediately so eggs aren't stuck
+            pending_gifts.pop(gift_id, None)
+            giver_rec["inventory"] += self.amount
+            await save_duck_state()
+            try:
+                await interaction.user.send(
+                    f"🎁 Couldn't DM <@{self.target_id}> (they may have DMs closed). "
+                    f"Your **{self.amount}** {sent_word} have been returned."
                 )
-                embed = discord.Embed(description=dm_body, color=color)
-                embed.set_footer(text="❤️ Good luck on the hatches!")
-                try:
-                    await target.send(embed=embed)
-                except Exception:
-                    pass  # DMs closed — gift still delivered to inventory
+            except Exception:
+                pass
 
     @discord.ui.button(label="❌ Change Mind", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1708,6 +1854,11 @@ class DuckCog(commands.Cog):
         self.check_expired_limited.start()
         self.update_egg_counter_channels.start()
         self.nest_reset_loop.start()
+        self.expire_pending_gifts_loop.start()
+
+        # Re-register persistent gift offer buttons after restart
+        for gift_id in list(pending_gifts.keys()):
+            self.bot.add_view(GiftOfferView(gift_id))
 
         # Prime the invite-use snapshot BEFORE any joins happen — without
         # this, the first join after every restart would look like it used
@@ -1723,6 +1874,7 @@ class DuckCog(commands.Cog):
         self.check_expired_limited.cancel()
         self.update_egg_counter_channels.cancel()
         self.nest_reset_loop.cancel()
+        self.expire_pending_gifts_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
@@ -2103,6 +2255,25 @@ class DuckCog(commands.Cog):
         if not self.nest_reset_loop.is_running():
             self.nest_reset_loop.start()
 
+    # ---------- background: expire unaccepted gifts after 48h ----------
+
+    @tasks.loop(minutes=5)
+    async def expire_pending_gifts_loop(self):
+        now = time.time()
+        expired_ids = [
+            gid for gid, g in list(pending_gifts.items())
+            if now - g.get("created_at", 0) >= GIFT_EXPIRY_SECONDS
+        ]
+        for gift_id in expired_ids:
+            try:
+                await return_pending_gift(self.bot, gift_id, reason="expired")
+            except Exception as e:
+                print(f"[gift] expire failed for {gift_id}: {e}")
+
+    @expire_pending_gifts_loop.before_loop
+    async def before_expire_pending_gifts_loop(self):
+        await self.bot.wait_until_ready()
+
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
         entries = state.get("entries", {})
         pool_total = state.get("pool_total", NEST_BASELINE)
@@ -2173,7 +2344,7 @@ class DuckCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="gift", description="Send eggs from your inventory to another member. Some may get dropped along the way.")
+    @app_commands.command(name="gift", description="Offer eggs to another member. They must accept; some may be dropped when opened.")
     @app_commands.describe(member="Who should receive the eggs", amount="How many eggs to send")
     async def gift_cmd(
         self,
@@ -2199,8 +2370,9 @@ class DuckCog(commands.Cog):
 
         egg_word = "egg" if amount == 1 else "eggs"
         await interaction.response.send_message(
-            f"Send **{amount}** {egg_word} to {member.mention}?\n"
-            f"-# Some may get dropped along the way (up to about 30%). Nothing moves until you confirm.",
+            f"Offer **{amount}** {egg_word} to {member.mention}?\n"
+            f"-# They'll get a DM to Accept or Decline. Drop chance applies only if they accept "
+            f"(up to ~30%). Decline or 48h timeout returns your eggs in full.",
             view=GiftConfirmView(interaction.user.id, member.id, amount),
             ephemeral=True,
         )
