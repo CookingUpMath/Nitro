@@ -1171,6 +1171,145 @@ class NestConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — no eggs were donated.", view=None)
 
 
+# --- Gift eggs: transit loss flavor ---
+# Loss fraction is triangular on [0, 0.30] with the peak away from 0,
+# so a clean 0% delivery is possible but less common than a small spill.
+
+GIFT_LOSS_SENDER_FLAVOR = [
+    "You got startled and dropped **{lost}** egg(s).",
+    "A few slipped out of your hands — **{lost}** egg(s) lost.",
+    "You tripped and **{lost}** egg(s) hit the ground too hard.",
+    "You lost your grip; **{lost}** egg(s) didn’t make it.",
+    "You sneezed mid-handoff and **{lost}** egg(s) went flying.",
+    "You stacked them poorly and **{lost}** egg(s) fell off.",
+    "You got distracted and **{lost}** egg(s) slipped away.",
+    "Your bag tore open — **{lost}** egg(s) gone.",
+]
+
+GIFT_LOSS_RECEIVER_FLAVOR = [
+    "They flinched and dropped **{lost}** egg(s).",
+    "They couldn’t hold them all — **{lost}** egg(s) slipped through.",
+    "They got startled and lost **{lost}** egg(s).",
+    "They fumbled the catch; **{lost}** egg(s) didn’t survive.",
+    "They were careless and **{lost}** egg(s) broke.",
+    "They tripped while carrying them and lost **{lost}** egg(s).",
+    "Their hands were full and **{lost}** egg(s) fell.",
+    "They miscounted and **{lost}** egg(s) never got secured.",
+]
+
+GIFT_SAFE_FLAVOR = [
+    "Everything arrived in one piece.",
+    "Clean handoff — nothing lost.",
+    "Full amount delivered safely.",
+    "No drops, no breaks. All good.",
+]
+
+
+def roll_gift_loss(amount: int) -> int:
+    """Return how many eggs break/sink in transit (0 .. amount)."""
+    if amount <= 0:
+        return 0
+    # Mode at 0.15 so pure 0% is possible but not the typical result.
+    frac = random.triangular(0.0, 0.30, 0.15)
+    lost = int(amount * frac)
+    return min(max(lost, 0), amount)
+
+
+def format_gift_loss_flavor(lost: int) -> str:
+    if lost <= 0:
+        return random.choice(GIFT_SAFE_FLAVOR)
+    template = random.choice(
+        GIFT_LOSS_SENDER_FLAVOR if random.random() < 0.5 else GIFT_LOSS_RECEIVER_FLAVOR
+    )
+    return template.format(lost=lost)
+
+
+class GiftConfirmView(discord.ui.View):
+    """Giver confirms sending eggs to another member. Some may be dropped in transit."""
+
+    def __init__(self, owner_id: int, target_id: int, amount: int):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+        self.target_id = target_id
+        self.amount = amount
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="✅ Send", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giver_id = str(interaction.user.id)
+        target_id = str(self.target_id)
+        giver_rec = get_user_record(giver_id)
+
+        if giver_rec["inventory"] < self.amount:
+            return await interaction.response.edit_message(
+                content=f"You only have **{giver_rec['inventory']}** egg(s) now — gift cancelled.",
+                view=None,
+            )
+
+        lost = roll_gift_loss(self.amount)
+        received = self.amount - lost
+
+        giver_rec["inventory"] -= self.amount
+        if received > 0:
+            target_rec = get_user_record(target_id)
+            target_rec["inventory"] += received
+
+        await save_duck_state()
+
+        flavor = format_gift_loss_flavor(lost)
+        egg_word = "egg" if received == 1 else "eggs"
+        sent_word = "egg" if self.amount == 1 else "eggs"
+
+        if lost == 0:
+            result = (
+                f"🎁 You sent **{self.amount}** {sent_word} to <@{self.target_id}>.\n"
+                f"{flavor}"
+            )
+        elif received == 0:
+            result = (
+                f"🎁 You tried to send **{self.amount}** {sent_word} to <@{self.target_id}>, "
+                f"but none made it through.\n{flavor}"
+            )
+        else:
+            result = (
+                f"🎁 You sent **{self.amount}** {sent_word} to <@{self.target_id}> — "
+                f"they received **{received}** {egg_word}.\n{flavor}"
+            )
+
+        await interaction.response.edit_message(content=result, view=None)
+
+        # DM the target (best-effort)
+        if received > 0:
+            target = interaction.guild.get_member(self.target_id) if interaction.guild else None
+            if target is None:
+                try:
+                    target = await interaction.client.fetch_user(self.target_id)
+                except Exception:
+                    target = None
+
+            if target is not None:
+                color = discord.Color.blurple()
+                if isinstance(interaction.user, discord.Member) and interaction.user.color.value != 0:
+                    color = interaction.user.color
+
+                dm_body = (
+                    f"# 🎁 ||{interaction.user.mention} just gifted you **{received}** {egg_word}||\n"
+                    f"||{flavor}||"
+                )
+                embed = discord.Embed(description=dm_body, color=color)
+                embed.set_footer(text="❤️ Good luck on the hatches!")
+                try:
+                    await target.send(embed=embed)
+                except Exception:
+                    pass  # DMs closed — gift still delivered to inventory
+
+    @discord.ui.button(label="❌ Change Mind", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — no eggs were sent.", view=None)
+
+
 class KarmaChannelSelectView(discord.ui.View):
     """Pick which text channels count for heart-reaction karma. Selecting
     zero channels means 'allow everywhere' (the default).
@@ -2031,6 +2170,38 @@ class DuckCog(commands.Cog):
         await interaction.response.send_message(
             f"Are you sure you wish to put **{amount}** eggs into the nest? You might lose these for good.",
             view=NestConfirmView(interaction.user.id, amount),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="gift", description="Send eggs from your inventory to another member. Some may get dropped along the way.")
+    @app_commands.describe(member="Who should receive the eggs", amount="How many eggs to send")
+    async def gift_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: app_commands.Range[int, 1, 10000],
+    ):
+        if member.bot:
+            return await interaction.response.send_message(
+                "Bots can't receive eggs.", ephemeral=True
+            )
+        if member.id == interaction.user.id:
+            return await interaction.response.send_message(
+                "You can't send eggs to yourself.", ephemeral=True
+            )
+
+        discord_id = str(interaction.user.id)
+        rec = get_user_record(discord_id)
+        if rec["inventory"] < amount:
+            return await interaction.response.send_message(
+                f"You only have **{rec['inventory']}** egg(s) — you can't send {amount}.", ephemeral=True
+            )
+
+        egg_word = "egg" if amount == 1 else "eggs"
+        await interaction.response.send_message(
+            f"Send **{amount}** {egg_word} to {member.mention}?\n"
+            f"-# Some may get dropped along the way (up to about 30%). Nothing moves until you confirm.",
+            view=GiftConfirmView(interaction.user.id, member.id, amount),
             ephemeral=True,
         )
 
