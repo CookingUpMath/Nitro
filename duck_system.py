@@ -497,18 +497,48 @@ def roll_duck_id():
     return random.choice(by_rarity[chosen])
 
 
+def try_spend_eggs(discord_id: str, amount: int) -> bool:
+    """Atomically deduct eggs if the user has enough. Safe against concurrent
+    spends in the same event loop (check + subtract with no await in between).
+    """
+    rec = get_user_record(discord_id)
+    inv = rec.get("inventory", 0)
+    if inv < amount:
+        return False
+    rec["inventory"] = inv - amount
+    return True
+
+
 def resolve_hatch(discord_id: str):
     """Roll and apply one hatch for a user. Returns a result dict, or None
     if the pool is currently empty. Does NOT touch inventory count — the
     caller decides whether an egg was 'spent' (batch open) or never stored
     (immediate hatch from a fresh drop).
+
+    ERROR:404 ducks never intentionally duplicate while the user is still
+    missing one: if the rolled error duck is already owned, another unowned
+    active error duck is chosen instead. Only when every active error duck
+    is already owned does a normal duplicate (and bonus-egg chance) apply.
     """
     duck_id = roll_duck_id()
     if duck_id is None:
         return None
 
-    rec = duck_users.setdefault(discord_id, default_user_record())
+    rec = get_user_record(discord_id)
     duck = duck_index[duck_id]
+
+    # ERROR:404 — prefer an unowned error duck when possible
+    if duck.get("is_error"):
+        error_ids = get_active_error_ducks()
+        unowned = [eid for eid in error_ids if eid not in rec["collection"]]
+        if unowned:
+            duck_id = random.choice(unowned)
+            duck = duck_index[duck_id]
+        else:
+            # Own the full error pool — pick any active error, allow duplicate
+            duck_id = random.choice(error_ids) if error_ids else duck_id
+            duck = duck_index[duck_id]
+
     is_duplicate = duck_id in rec["collection"]
     bonus_egg = False
 
@@ -1156,13 +1186,12 @@ class NestConfirmView(discord.ui.View):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
-        if rec["inventory"] < self.amount:
+        if not try_spend_eggs(discord_id, self.amount):
             return await interaction.response.edit_message(
                 content=f"You only have **{rec['inventory']}** egg(s) now — donation cancelled.",
                 view=None,
             )
 
-        rec["inventory"] -= self.amount
         guild_id = str(interaction.guild.id)
         state = get_nest_state(guild_id)
         state["pool_total"] += self.amount * 2
@@ -1385,14 +1414,13 @@ class GiftConfirmView(discord.ui.View):
         target_id = str(self.target_id)
         giver_rec = get_user_record(giver_id)
 
-        if giver_rec["inventory"] < self.amount:
+        # Hold eggs in pending until accept / decline / expiry
+        if not try_spend_eggs(giver_id, self.amount):
             return await interaction.response.edit_message(
                 content=f"You only have **{giver_rec['inventory']}** egg(s) now — gift cancelled.",
                 view=None,
             )
 
-        # Hold eggs in pending until accept / decline / expiry
-        giver_rec["inventory"] -= self.amount
         gift_id = uuid.uuid4().hex
         giver_color = None
         if isinstance(interaction.user, discord.Member) and interaction.user.color.value != 0:
@@ -2505,7 +2533,7 @@ class DuckCog(commands.Cog):
     async def open_eggs(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000]):
         await interaction.response.defer()
         discord_id = str(interaction.user.id)
-        rec = duck_users.setdefault(discord_id, default_user_record())
+        rec = get_user_record(discord_id)
 
         if rec["inventory"] < amount:
             return await interaction.followup.send(
@@ -2516,10 +2544,14 @@ class DuckCog(commands.Cog):
 
         results = []
         for _ in range(amount):
+            # Spend one egg only when we still have it (guards double-spend races)
+            if not try_spend_eggs(discord_id, 1):
+                break
             result = resolve_hatch(discord_id)
             if result is None:
-                break  # pool went empty mid-batch
-            rec["inventory"] -= 1
+                # Pool empty — refund this egg
+                rec["inventory"] += 1
+                break
             results.append(result)
 
         await save_duck_state()
