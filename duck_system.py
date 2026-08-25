@@ -1090,14 +1090,50 @@ class ErrorToggleModal(discord.ui.Modal, title="Toggle ERROR:404 Status"):
 
 
 class ErrorAdminView(discord.ui.View):
+    """Staff ERROR:404 browser — same active/inactive split as /index, plus toggle."""
+
     def __init__(self):
         super().__init__(timeout=180)
+        options = [
+            discord.SelectOption(label="Currently Earnable", value="active", emoji="✅"),
+            discord.SelectOption(label="Not Currently Active", value="inactive", emoji="⛔"),
+        ]
+        select = discord.ui.Select(placeholder="Choose a category to view", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("Nothing to see here.", ephemeral=True)
             return False
         return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        if choice == "active":
+            ducks = [
+                duck for duck in duck_index.values()
+                if duck.get("is_error") and duck.get("active")
+            ]
+            title = "🚫 ERROR:404 — Currently Earnable"
+        else:
+            ducks = [
+                duck for duck in duck_index.values()
+                if duck.get("is_error") and not duck.get("active")
+            ]
+            title = "🚫 ERROR:404 — Not Currently Active"
+
+        if ducks:
+            lines = [
+                f"{duck['emoji']} **{duck['title']}** — {RARITY_DISPLAY[duck['rarity']]} (Error)"
+                for duck in ducks
+            ]
+            content = "\n".join(lines)
+        else:
+            content = "Nothing in this category."
+
+        embed = discord.Embed(title=title, description=content, color=discord.Color.dark_red())
+        await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Toggle Error Status", style=discord.ButtonStyle.danger, emoji="🚫")
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2170,14 +2206,17 @@ class DuckCog(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def error_cmd(self, interaction: discord.Interaction):
-        error_ducks = [(d, duck) for d, duck in duck_index.items() if duck.get("is_error")]
-        lines = [
-            f"{duck['emoji']} **{duck['title']}** — {RARITY_DISPLAY[duck['rarity']]} (Error)"
-            for _, duck in error_ducks
-        ]
-        content = "\n".join(lines) or "No ERROR:404 ducks exist yet."
-
-        embed = discord.Embed(title="🚫 ERROR:404", description=content, color=discord.Color.dark_red())
+        any_error = any(d.get("is_error") for d in duck_index.values())
+        description = (
+            "Choose a category below to view."
+            if any_error
+            else "No ERROR:404 ducks exist yet."
+        )
+        embed = discord.Embed(
+            title="🚫 ERROR:404",
+            description=description,
+            color=discord.Color.dark_red(),
+        )
         await interaction.response.send_message(embed=embed, view=ErrorAdminView(), ephemeral=True)
 
     # ---------- public: redeem a code ----------
