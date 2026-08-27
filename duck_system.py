@@ -1844,6 +1844,63 @@ def format_role_reward_line(guild: discord.Guild | None, role_id: str, reward: d
     return f"{role_bit} — " + (" + ".join(parts) if parts else "*(empty)*")
 
 
+def parse_level_from_role_name(name: str) -> int | None:
+    """First integer in a role name (e.g. 'Level 12' → 12). Used for cumulative backfill."""
+    if not name:
+        return None
+    m = re.search(r"\d+", name)
+    return int(m.group()) if m else None
+
+
+def grant_role_reward_to_user(discord_id: str, role_id_str: str, reward: dict) -> list[str]:
+    """Apply one role reward if not already claimed. Returns human-readable grant lines."""
+    rec = get_user_record(discord_id)
+    claimed = rec.setdefault("role_rewards_claimed", [])
+    if role_id_str in claimed:
+        return []
+
+    got = []
+    eggs = int(reward.get("eggs") or 0)
+    duck_id = reward.get("duck_id")
+
+    if eggs > 0:
+        rec["inventory"] += eggs
+        got.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
+
+    if duck_id and duck_id in duck_index:
+        duck = duck_index[duck_id]
+        if duck_id not in rec["collection"]:
+            rec["collection"].append(duck_id)
+            got.append(f"{duck['emoji']} **{duck['title']}**")
+        else:
+            got.append(f"{duck['emoji']} **{duck['title']}** (already owned)")
+
+    claimed.append(role_id_str)
+    return got
+
+
+def member_qualifies_for_role_reward(
+    member: discord.Member,
+    role_id_str: str,
+    reward_role: discord.Role | None,
+) -> bool:
+    """True if they currently have the role, OR their highest numbered role
+    is >= this reward role's number (covers level bots that only keep the top tier).
+    """
+    if any(str(r.id) == role_id_str for r in member.roles):
+        return True
+
+    tier = parse_level_from_role_name(reward_role.name) if reward_role else None
+    if tier is None:
+        return False
+
+    member_levels = [parse_level_from_role_name(r.name) for r in member.roles]
+    member_levels = [n for n in member_levels if n is not None]
+    if not member_levels:
+        return False
+    return max(member_levels) >= tier
+
+
 def build_role_rewards_embed(guild: discord.Guild | None) -> discord.Embed:
     guild_id = str(guild.id) if guild else ""
     rewards = duck_config.get(guild_id, {}).get("role_rewards", {})
@@ -1978,6 +2035,69 @@ class RoleRewardRemoveView(discord.ui.View):
         )
 
 
+class RoleRewardBackfillConfirmView(discord.ui.View):
+    """One-shot scan: grant any configured role rewards members already qualify for."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="Run Backfill", style=discord.ButtonStyle.danger, emoji="📦")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.followup.send("No guild.", ephemeral=True)
+
+        guild_id = str(guild.id)
+        rewards_map = duck_config.get(guild_id, {}).get("role_rewards", {})
+        if not rewards_map:
+            return await interaction.followup.send("No role rewards configured.", ephemeral=True)
+
+        # Prefer an accurate member list when the guild is available
+        try:
+            if not guild.chunked:
+                await guild.chunk()
+        except Exception:
+            pass
+
+        members_hit = 0
+        grants = 0
+        for member in guild.members:
+            if member.bot:
+                continue
+            member_grants = 0
+            for role_id_str, reward in rewards_map.items():
+                reward_role = guild.get_role(int(role_id_str))
+                if not member_qualifies_for_role_reward(member, role_id_str, reward_role):
+                    continue
+                got = grant_role_reward_to_user(str(member.id), role_id_str, reward)
+                if got:
+                    member_grants += 1
+                    grants += 1
+            if member_grants:
+                members_hit += 1
+
+        if grants:
+            await save_duck_state()
+
+        await interaction.followup.send(
+            f"📦 Backfill complete.\n"
+            f"• **{members_hit}** member(s) received something\n"
+            f"• **{grants}** individual role reward(s) granted\n"
+            f"-# Uses current roles **or** highest level number in their roles vs each reward tier. "
+            f"Already-claimed rewards are skipped.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Backfill cancelled.", view=None)
+
+
 class RoleRewardsAdminView(discord.ui.View):
     """Staff menu for role → eggs/duck rewards (mirrors /error style)."""
 
@@ -2008,6 +2128,18 @@ class RoleRewardsAdminView(discord.ui.View):
         await interaction.response.send_message(
             "Pick a role reward to remove:",
             view=RoleRewardRemoveView(interaction.guild),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Backfill Missing", style=discord.ButtonStyle.primary, emoji="📦")
+    async def backfill(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "**Backfill role rewards** for everyone who already qualifies.\n\n"
+            "A member qualifies if they **have the role**, or if the **highest number** "
+            "in any of their role names is ≥ that reward role’s number "
+            "(so level bots that only keep the top role still get lower tiers).\n\n"
+            "Already claimed rewards are never given twice. This can take a moment on large servers.",
+            view=RoleRewardBackfillConfirmView(interaction.user.id),
             ephemeral=True,
         )
 
@@ -2288,52 +2420,27 @@ class DuckCog(commands.Cog):
         if not rewards_map:
             return
 
-        rec = get_user_record(str(after.id))
-        claimed = rec.setdefault("role_rewards_claimed", [])
-        granted_any = False
         summary_parts = []
-
         for role_id in added:
             key = str(role_id)
             reward = rewards_map.get(key)
-            if not reward or key in claimed:
+            if not reward:
                 continue
-
-            eggs = int(reward.get("eggs") or 0)
-            duck_id = reward.get("duck_id")
-            got = []
-
-            if eggs > 0:
-                rec["inventory"] += eggs
-                got.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
-
-            if duck_id and duck_id in duck_index:
-                duck = duck_index[duck_id]
-                if duck_id not in rec["collection"]:
-                    rec["collection"].append(duck_id)
-                    got.append(f"{duck['emoji']} **{duck['title']}**")
-                else:
-                    got.append(f"{duck['emoji']} **{duck['title']}** (already owned)")
-
-            claimed.append(key)
-            granted_any = True
+            got = grant_role_reward_to_user(str(after.id), key, reward)
             if got:
                 role = after.guild.get_role(role_id)
                 role_label = role.name if role else key
                 summary_parts.append(f"**{role_label}** → " + " + ".join(got))
 
-        if not granted_any:
+        if not summary_parts:
             return
 
         await save_duck_state()
 
-        if summary_parts:
-            try:
-                await after.send(
-                    "🎖️ Role reward unlocked!\n" + "\n".join(summary_parts)
-                )
-            except Exception:
-                pass
+        try:
+            await after.send("🎖️ Role reward unlocked!\n" + "\n".join(summary_parts))
+        except Exception:
+            pass
 
     # ---------- heart-reaction karma ----------
 
