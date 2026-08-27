@@ -290,6 +290,8 @@ def default_user_record():
         "last_gm_date": None,
         "karma": 0,
         "favorites": [],
+        # role_id strings already granted — kept even if the role is removed
+        "role_rewards_claimed": [],
     }
 
 
@@ -302,6 +304,7 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("last_gm_date", None)
     rec.setdefault("karma", 0)
     rec.setdefault("favorites", [])
+    rec.setdefault("role_rewards_claimed", [])
     return rec
 
 
@@ -1824,6 +1827,196 @@ class CollectionFilterView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
+def format_role_reward_line(guild: discord.Guild | None, role_id: str, reward: dict) -> str:
+    """One embed line: role mention + eggs and/or duck."""
+    role = guild.get_role(int(role_id)) if guild else None
+    role_bit = role.mention if role else f"`role {role_id}`"
+    parts = []
+    eggs = int(reward.get("eggs") or 0)
+    duck_id = reward.get("duck_id")
+    if eggs > 0:
+        parts.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
+    if duck_id and duck_id in duck_index:
+        d = duck_index[duck_id]
+        parts.append(f"{d['emoji']} **{d['title']}**")
+    elif duck_id:
+        parts.append(f"🦆 `{duck_id}` (missing from index)")
+    return f"{role_bit} — " + (" + ".join(parts) if parts else "*(empty)*")
+
+
+def build_role_rewards_embed(guild: discord.Guild | None) -> discord.Embed:
+    guild_id = str(guild.id) if guild else ""
+    rewards = duck_config.get(guild_id, {}).get("role_rewards", {})
+    if not rewards:
+        desc = "No role rewards configured yet.\nUse **Add Reward** to link a role to eggs and/or a duck."
+    else:
+        lines = [format_role_reward_line(guild, rid, rew) for rid, rew in rewards.items()]
+        desc = "\n".join(lines)
+    embed = discord.Embed(
+        title="🎖️ Role Rewards",
+        description=desc,
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Granted once when the role is added · kept if the role is later removed")
+    return embed
+
+
+class RoleRewardDetailsModal(discord.ui.Modal, title="Role Reward Details"):
+    """Eggs and/or duck title — at least one required. Role already chosen."""
+
+    def __init__(self, role_id: int, role_name: str):
+        super().__init__()
+        self.role_id = role_id
+        self.role_name = role_name
+        self.eggs_input = discord.ui.TextInput(
+            label="Egg amount (optional)",
+            required=False,
+            max_length=10,
+            placeholder="e.g. 5 — leave blank for none",
+        )
+        self.duck_input = discord.ui.TextInput(
+            label="Duck title (optional)",
+            required=False,
+            max_length=100,
+            placeholder="Exact title from the index",
+        )
+        self.add_item(self.eggs_input)
+        self.add_item(self.duck_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        eggs = 0
+        eggs_raw = str(self.eggs_input).strip()
+        if eggs_raw:
+            try:
+                eggs = int(eggs_raw)
+                if eggs < 1:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Egg amount must be a whole number of at least 1, or blank.",
+                    ephemeral=True,
+                )
+
+        duck_id = None
+        duck_raw = str(self.duck_input).strip()
+        if duck_raw:
+            duck_id = slugify(duck_raw)
+            if duck_id not in duck_index:
+                return await interaction.response.send_message(
+                    f"❌ No duck found matching **{duck_raw}**.",
+                    ephemeral=True,
+                )
+
+        if eggs < 1 and not duck_id:
+            return await interaction.response.send_message(
+                "❌ Set at least an egg amount or a duck title.",
+                ephemeral=True,
+            )
+
+        guild_id = str(interaction.guild.id)
+        cfg = duck_config.setdefault(guild_id, {})
+        rewards = cfg.setdefault("role_rewards", {})
+        rewards[str(self.role_id)] = {"eggs": eggs, "duck_id": duck_id}
+        await save_duck_state()
+
+        embed = build_role_rewards_embed(interaction.guild)
+        await interaction.response.send_message(
+            content=f"✅ Reward saved for **{self.role_name}**.",
+            embed=embed,
+            view=RoleRewardsAdminView(),
+            ephemeral=True,
+        )
+
+
+class RoleRewardAddRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.RoleSelect(
+            placeholder="Choose a role to reward",
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        role = self.select.values[0]
+        await interaction.response.send_modal(RoleRewardDetailsModal(role.id, role.name))
+
+
+class RoleRewardRemoveView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=180)
+        rewards = duck_config.get(str(guild.id), {}).get("role_rewards", {})
+        options = []
+        for role_id in list(rewards.keys())[:25]:
+            role = guild.get_role(int(role_id))
+            label = role.name if role else f"Unknown ({role_id})"
+            options.append(discord.SelectOption(label=label[:100], value=role_id))
+        if not options:
+            options.append(discord.SelectOption(label="(none configured)", value="_none"))
+        select = discord.ui.Select(placeholder="Role reward to remove", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        if choice == "_none":
+            return await interaction.response.edit_message(
+                content="Nothing to remove.", embed=None, view=None
+            )
+        guild_id = str(interaction.guild.id)
+        rewards = duck_config.get(guild_id, {}).get("role_rewards", {})
+        removed = rewards.pop(choice, None)
+        if removed is not None:
+            await save_duck_state()
+        embed = build_role_rewards_embed(interaction.guild)
+        await interaction.response.edit_message(
+            content="🗑️ Role reward removed." if removed else "That reward was already gone.",
+            embed=embed,
+            view=RoleRewardsAdminView(),
+        )
+
+
+class RoleRewardsAdminView(discord.ui.View):
+    """Staff menu for role → eggs/duck rewards (mirrors /error style)."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Nothing to see here.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Add Reward", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Pick the role that should grant a reward when someone receives it:",
+            view=RoleRewardAddRoleView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Remove Reward", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def remove_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rewards = duck_config.get(str(interaction.guild.id), {}).get("role_rewards", {})
+        if not rewards:
+            return await interaction.response.send_message(
+                "No role rewards to remove.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            "Pick a role reward to remove:",
+            view=RoleRewardRemoveView(interaction.guild),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Refresh List", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = build_role_rewards_embed(interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -1840,6 +2033,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
             discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
             discord.SelectOption(label="Set Nest Prize Duck", value="nest_prize_duck", emoji="🎁"),
+            discord.SelectOption(label="Role Rewards", value="role_rewards", emoji="🎖️"),
         ]
         select = discord.ui.Select(placeholder="Choose an action", options=options)
         select.callback = self.on_select
@@ -1901,6 +2095,11 @@ class EditorView(discord.ui.View):
             await interaction.response.send_modal(RedeemCodeModal())
         elif choice == "nest_prize_duck":
             await interaction.response.send_modal(NestPrizeDuckModal())
+        elif choice == "role_rewards":
+            embed = build_role_rewards_embed(interaction.guild)
+            await interaction.response.send_message(
+                embed=embed, view=RoleRewardsAdminView(), ephemeral=True
+            )
 
 
 ###############################################
@@ -2070,6 +2269,71 @@ class DuckCog(commands.Cog):
         if inviter_id and inviter_id != member.id:
             pending_invite_karma[str(member.id)] = str(inviter_id)
             await save_duck_state()
+
+    # ---------- role rewards: grant once when a configured role is added ----------
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if after.bot:
+            return
+        if before.roles == after.roles:
+            return
+
+        added = {r.id for r in after.roles} - {r.id for r in before.roles}
+        if not added:
+            return
+
+        guild_id = str(after.guild.id)
+        rewards_map = duck_config.get(guild_id, {}).get("role_rewards", {})
+        if not rewards_map:
+            return
+
+        rec = get_user_record(str(after.id))
+        claimed = rec.setdefault("role_rewards_claimed", [])
+        granted_any = False
+        summary_parts = []
+
+        for role_id in added:
+            key = str(role_id)
+            reward = rewards_map.get(key)
+            if not reward or key in claimed:
+                continue
+
+            eggs = int(reward.get("eggs") or 0)
+            duck_id = reward.get("duck_id")
+            got = []
+
+            if eggs > 0:
+                rec["inventory"] += eggs
+                got.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
+
+            if duck_id and duck_id in duck_index:
+                duck = duck_index[duck_id]
+                if duck_id not in rec["collection"]:
+                    rec["collection"].append(duck_id)
+                    got.append(f"{duck['emoji']} **{duck['title']}**")
+                else:
+                    got.append(f"{duck['emoji']} **{duck['title']}** (already owned)")
+
+            claimed.append(key)
+            granted_any = True
+            if got:
+                role = after.guild.get_role(role_id)
+                role_label = role.name if role else key
+                summary_parts.append(f"**{role_label}** → " + " + ".join(got))
+
+        if not granted_any:
+            return
+
+        await save_duck_state()
+
+        if summary_parts:
+            try:
+                await after.send(
+                    "🎖️ Role reward unlocked!\n" + "\n".join(summary_parts)
+                )
+            except Exception:
+                pass
 
     # ---------- heart-reaction karma ----------
 
