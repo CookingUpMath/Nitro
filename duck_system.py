@@ -284,6 +284,9 @@ invite_cache = {}
 def default_user_record():
     return {
         "inventory": 0,
+        # Eggs won from the nest — still hatchable/giftable, but cannot be
+        # donated back into the nest (stops win → re-donate loops).
+        "nest_locked": 0,
         "collection": [],
         "last_roll_check_ts": 0,
         "last_daily_egg_date": None,
@@ -305,7 +308,17 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("karma", 0)
     rec.setdefault("favorites", [])
     rec.setdefault("role_rewards_claimed", [])
+    rec.setdefault("nest_locked", 0)
+    # Cap locked to inventory in case of old bad state
+    if rec["nest_locked"] > rec.get("inventory", 0):
+        rec["nest_locked"] = rec.get("inventory", 0)
     return rec
+
+
+def donatable_egg_count(discord_id: str) -> int:
+    """Eggs that may be put into the nest (inventory minus nest-locked winnings)."""
+    rec = get_user_record(discord_id)
+    return max(0, rec.get("inventory", 0) - rec.get("nest_locked", 0))
 
 
 def award_karma(discord_id: str, points: int = 1):
@@ -500,15 +513,32 @@ def roll_duck_id():
     return random.choice(by_rarity[chosen])
 
 
-def try_spend_eggs(discord_id: str, amount: int) -> bool:
+def try_spend_eggs(discord_id: str, amount: int, *, for_nest: bool = False) -> bool:
     """Atomically deduct eggs if the user has enough. Safe against concurrent
     spends in the same event loop (check + subtract with no await in between).
+
+    for_nest=True: only donatable (non-locked) eggs may be spent.
+    Otherwise any inventory eggs may be spent; nest_locked shrinks first so
+    nest winnings are used up by hatching/gifting instead of re-entering the nest.
     """
     rec = get_user_record(discord_id)
     inv = rec.get("inventory", 0)
+    locked = rec.get("nest_locked", 0)
+    if locked > inv:
+        locked = inv
+        rec["nest_locked"] = locked
+
+    if for_nest:
+        if inv - locked < amount:
+            return False
+        rec["inventory"] = inv - amount
+        return True
+
     if inv < amount:
         return False
     rec["inventory"] = inv - amount
+    # Spend locked eggs first when hatching/gifting
+    rec["nest_locked"] = max(0, locked - amount)
     return True
 
 
@@ -1225,11 +1255,13 @@ class NestConfirmView(discord.ui.View):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
-        if not try_spend_eggs(discord_id, self.amount):
-            return await interaction.response.edit_message(
-                content=f"You only have **{rec['inventory']}** egg(s) now — donation cancelled.",
-                view=None,
-            )
+        if not try_spend_eggs(discord_id, self.amount, for_nest=True):
+            free = donatable_egg_count(discord_id)
+            locked = rec.get("nest_locked", 0)
+            msg = f"You only have **{free}** egg(s) available to donate now — donation cancelled."
+            if locked > 0:
+                msg += f"\n-# **{locked}** egg(s) from nest wins can't go back into the nest (hatch or gift them instead)."
+            return await interaction.response.edit_message(content=msg, view=None)
 
         guild_id = str(interaction.guild.id)
         state = get_nest_state(guild_id)
@@ -2730,6 +2762,8 @@ class DuckCog(commands.Cog):
         if winner_id:
             winner_rec = get_user_record(winner_id)
             winner_rec["inventory"] += pool_total
+            # Nest prize eggs cannot be donated back into the nest
+            winner_rec["nest_locked"] = winner_rec.get("nest_locked", 0) + pool_total
 
             duck_text = ""
             if prize_duck_id and prize_duck_id in duck_index:
@@ -2744,7 +2778,8 @@ class DuckCog(commands.Cog):
             if winner_member:
                 try:
                     await winner_member.send(
-                        f"🪺 You won the Nest! You received **{pool_total}** egg(s)!{duck_text}"
+                        f"🪺 You won the Nest! You received **{pool_total}** egg(s)!{duck_text}\n"
+                        f"-# Nest-win eggs can be hatched or gifted, but can't be donated back into the nest."
                     )
                 except Exception:
                     pass
@@ -2770,14 +2805,23 @@ class DuckCog(commands.Cog):
     async def nest_cmd(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000]):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
+        free = donatable_egg_count(discord_id)
+        locked = rec.get("nest_locked", 0)
 
-        if rec["inventory"] < amount:
-            return await interaction.response.send_message(
-                f"You only have **{rec['inventory']}** egg(s) — you can't donate {amount}.", ephemeral=True
-            )
+        if free < amount:
+            msg = f"You only have **{free}** egg(s) available to donate — you can't donate {amount}."
+            if locked > 0:
+                msg += (
+                    f"\n-# You have **{locked}** nest-win egg(s) that can't go back into the nest "
+                    f"(hatch or gift them instead). Total inventory: **{rec['inventory']}**."
+                )
+            return await interaction.response.send_message(msg, ephemeral=True)
 
+        note = ""
+        if locked > 0:
+            note = f"\n-# **{locked}** nest-win egg(s) stay out of this donation."
         await interaction.response.send_message(
-            f"Are you sure you wish to put **{amount}** eggs into the nest? You might lose these for good.",
+            f"Are you sure you wish to put **{amount}** eggs into the nest? You might lose these for good.{note}",
             view=NestConfirmView(interaction.user.id, amount),
             ephemeral=True,
         )
@@ -2915,10 +2959,17 @@ class DuckCog(commands.Cog):
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
+        locked = rec.get("nest_locked", 0)
+        free = donatable_egg_count(discord_id)
         description = (
             f"## 🥚 You have **{rec['inventory']}** egg(s) stored\n"
             f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
         )
+        if locked > 0:
+            description += (
+                f"> -# 🔒 **{locked}** from nest wins (hatch/gift only · "
+                f"**{free}** free to donate)\n"
+            )
 
         if interaction.guild:
             guild_id = str(interaction.guild.id)
