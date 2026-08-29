@@ -2784,13 +2784,21 @@ class DuckCog(commands.Cog):
                 except Exception:
                     pass
 
+            winner_label = (
+                winner_member.mention
+                if winner_member
+                else f"<@{winner_id}>"
+            )
             for discord_id in entries:
                 if discord_id == winner_id:
                     continue
                 loser_member = guild.get_member(int(discord_id))
                 if loser_member:
                     try:
-                        await loser_member.send("You lost the nest, try again next time!")
+                        await loser_member.send(
+                            f"🪺 The nest has been claimed by {winner_label} "
+                            f"(**{pool_total}** eggs). Better luck next week!"
+                        )
                     except Exception:
                         pass
 
