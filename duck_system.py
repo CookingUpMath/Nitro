@@ -779,12 +779,11 @@ class EggDropView(discord.ui.View):
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
                 f"{RARITY_DISPLAY[g['rarity']]}"
             )
-            # Owned before this batch → small text; new to this batch → bold
-            # (multiples of a new duck in the same batch stay bold)
+            # Owned before this batch → small text; new → bold + (NEW)
             if duck_id in pre_existing:
                 lines.append(f"-# {entry}")
             else:
-                lines.append(f"**{entry}**")
+                lines.append(f"**{entry} (NEW)**")
 
         await interaction.response.edit_message(content="\n".join(lines), embed=None, view=None)
 
@@ -3052,12 +3051,11 @@ class DuckCog(commands.Cog):
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
                 f"{RARITY_DISPLAY[g['rarity']]}{bonus}"
             )
-            # Snapshot is before this batch: already owned → -#; new → bold.
-            # Getting the same new duck multiple times in one /hatch stays bold.
+            # Already owned → -#; new to this batch → bold + (NEW)
             if duck_id in pre_existing:
                 lines.append(f"-# {entry}")
             else:
-                lines.append(f"**{entry}**")
+                lines.append(f"**{entry} (NEW)**")
 
         await interaction.followup.send("\n".join(lines))
 
