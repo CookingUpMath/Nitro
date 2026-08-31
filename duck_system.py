@@ -775,11 +775,16 @@ class EggDropView(discord.ui.View):
 
         lines = [f"🥚 {interaction.user.mention} hatched {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
-            status_tag = " (duplicate)" if duck_id in pre_existing else " (**NEW**)"
-            lines.append(
-                f"{g['emoji']} **{g['title']}** (x{g['count']}) - "
-                f"{RARITY_DISPLAY[g['rarity']]}{status_tag}"
+            entry = (
+                f"{g['emoji']} {g['title']} (x{g['count']}) — "
+                f"{RARITY_DISPLAY[g['rarity']]}"
             )
+            # Owned before this batch → small text; new to this batch → bold
+            # (multiples of a new duck in the same batch stay bold)
+            if duck_id in pre_existing:
+                lines.append(f"-# {entry}")
+            else:
+                lines.append(f"**{entry}**")
 
         await interaction.response.edit_message(content="\n".join(lines), embed=None, view=None)
 
@@ -3042,12 +3047,17 @@ class DuckCog(commands.Cog):
 
         lines = [f"🥚 Opened {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
-            status_tag = " (duplicate)" if duck_id in pre_existing else " (**NEW**)"
-            bonus = f" 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
-            lines.append(
-                f"{g['emoji']} **{g['title']}** (x{g['count']}) - "
-                f"{RARITY_DISPLAY[g['rarity']]}{status_tag}{bonus}"
+            bonus = f" · 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
+            entry = (
+                f"{g['emoji']} {g['title']} (x{g['count']}) — "
+                f"{RARITY_DISPLAY[g['rarity']]}{bonus}"
             )
+            # Snapshot is before this batch: already owned → -#; new → bold.
+            # Getting the same new duck multiple times in one /hatch stays bold.
+            if duck_id in pre_existing:
+                lines.append(f"-# {entry}")
+            else:
+                lines.append(f"**{entry}**")
 
         await interaction.followup.send("\n".join(lines))
 
