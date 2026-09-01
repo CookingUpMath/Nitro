@@ -646,10 +646,16 @@ def format_flat_row(duck_ids) -> str:
 def build_collection_body(owned, favorites, choice: str = "_all") -> str:
     """Splits the current filtered view into a Favorites section (if any)
     and the rest, so a favorited duck never shows twice.
+
+    choice "error" lists ERROR ducks only. Normal rarity filters still include
+    error ducks that share that rarity (they also appear under Error).
     """
     if choice == "_all":
         ids = owned
         section_label = "Collection"
+    elif choice == "error":
+        ids = [d for d in owned if duck_index.get(d, {}).get("is_error")]
+        section_label = "ERROR"
     else:
         ids = [d for d in owned if duck_index.get(d, {}).get("rarity") == choice]
         section_label = RARITY_DISPLAY.get(choice, choice)
@@ -807,9 +813,10 @@ class EggDropView(discord.ui.View):
 
         lines = [f"🥚 {interaction.user.mention} hatched {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
+            err_mark = " ✨" if duck_index.get(duck_id, {}).get("is_error") else ""
             entry = (
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
-                f"{RARITY_DISPLAY[g['rarity']]}"
+                f"{RARITY_DISPLAY[g['rarity']]}{err_mark}"
             )
             # Owned before this batch → small text; new → bold + (NEW)
             if duck_id in pre_existing:
@@ -1937,6 +1944,12 @@ class CollectionFilterView(discord.ui.View):
 
         options = [discord.SelectOption(label="View All", value="_all", emoji="🦆", default=True)]
         options += [discord.SelectOption(label=rarity_header(r), value=r) for r in RARITY_ORDER]
+        # Error filter only if this collection owns at least one ERROR:404 duck
+        owned = get_user_record(str(target_id)).get("collection", [])
+        if any(duck_index.get(d, {}).get("is_error") for d in owned):
+            options.append(
+                discord.SelectOption(label="ERROR", value="error", emoji="🚫")
+            )
         select = discord.ui.Select(placeholder="Filter by rarity", options=options)
         select.callback = self.on_select
         self.add_item(select)
@@ -3229,21 +3242,35 @@ class DuckCog(commands.Cog):
     # ---------- open eggs from inventory ----------
 
     @app_commands.command(name="hatch", description="Open eggs from your inventory.")
-    @app_commands.describe(amount="How many eggs to open")
-    async def open_eggs(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000]):
+    @app_commands.describe(amount='How many eggs to open, or type "all" to hatch everything')
+    async def open_eggs(self, interaction: discord.Interaction, amount: str):
         await interaction.response.defer()
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
-        if rec["inventory"] < amount:
-            return await interaction.followup.send(
-                f"You only have **{rec['inventory']}** egg(s) — you can't open {amount}."
-            )
+        raw = amount.strip().lower()
+        if raw == "all":
+            hatch_count = rec["inventory"]
+            if hatch_count < 1:
+                return await interaction.followup.send("You don't have any eggs to hatch.")
+        else:
+            try:
+                hatch_count = int(raw)
+                if hatch_count < 1:
+                    raise ValueError
+            except ValueError:
+                return await interaction.followup.send(
+                    'Amount must be a whole number of at least 1, or **all**.'
+                )
+            if rec["inventory"] < hatch_count:
+                return await interaction.followup.send(
+                    f"You only have **{rec['inventory']}** egg(s) — you can't open {hatch_count}."
+                )
 
         pre_existing = set(rec["collection"])  # ownership snapshot BEFORE this batch
 
         results = []
-        for _ in range(amount):
+        for _ in range(hatch_count):
             # Spend one egg only when we still have it (guards double-spend races)
             if not try_spend_eggs(discord_id, 1):
                 break
@@ -3274,9 +3301,10 @@ class DuckCog(commands.Cog):
         lines = [f"🥚 Opened {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
             bonus = f" · 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
+            err_mark = " ✨" if duck_index.get(duck_id, {}).get("is_error") else ""
             entry = (
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
-                f"{RARITY_DISPLAY[g['rarity']]}{bonus}"
+                f"{RARITY_DISPLAY[g['rarity']]}{err_mark}{bonus}"
             )
             # Already owned → -#; new to this batch → bold + (NEW)
             if duck_id in pre_existing:
