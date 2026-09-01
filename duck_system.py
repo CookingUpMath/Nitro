@@ -233,14 +233,18 @@ def format_limited_remaining(limited_until: float | None) -> str:
     return f" ({hours} hour{'s' if hours != 1 else ''})"
 
 
-# environment_state = {"date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1}
+# environment_state = {
+#   "date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1,
+#   "error_mode": False  — staff Error Mode locks weather at max + boosts ERROR weight
+# }
 # Global, not per-guild — one "weather" for the whole bot. Both values are
 # re-rolled together, once per UTC day, the first time anything checks
-# that day (a message, or someone running /weather).
+# that day (a message, or someone running /weather) — unless error_mode is on.
 environment_state = {
     "date": None,
     "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
     "egg_count": 1,
+    "error_mode": False,
 }
 
 
@@ -250,7 +254,23 @@ def _roll_egg_count() -> int:
     return random.choices(counts, weights=weights, k=1)[0]
 
 
+def is_error_mode() -> bool:
+    return bool(environment_state.get("error_mode"))
+
+
+def effective_error_weight() -> float:
+    return ERROR_WEIGHT_EVENT if is_error_mode() else ERROR_WEIGHT
+
+
 async def ensure_environment_for_today() -> dict:
+    environment_state.setdefault("error_mode", False)
+
+    # Error Mode: lock at maximum drop stats; skip daily re-roll
+    if environment_state.get("error_mode"):
+        environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+        environment_state["egg_count"] = 5
+        return environment_state
+
     today_str = time.strftime("%Y-%m-%d", time.gmtime())
     if environment_state.get("date") != today_str:
         chance = round(
@@ -370,9 +390,15 @@ async def load_duck_state():
             pending_gifts = data.get("duck_pending_gifts", {})
             environment_state = data.get(
                 "duck_environment",
-                {"date": None, "drop_chance_percent": ENVIRONMENT_MIN_CHANCE, "egg_count": 1},
+                {
+                    "date": None,
+                    "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
+                    "egg_count": 1,
+                    "error_mode": False,
+                },
             )
             environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
+            environment_state.setdefault("error_mode", False)
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s), {len(pending_gifts)} pending gift(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -470,6 +496,7 @@ def rename_duck(old_id: str, new_title: str) -> str:
 
 
 ERROR_WEIGHT = 0.05  # ERROR:404's odds — a hidden 7th pool, shared across however many error ducks are active
+ERROR_WEIGHT_EVENT = 0.5  # while Error Mode is on (Quackpot-tier)
 
 
 def get_active_ducks_by_rarity():
@@ -502,7 +529,7 @@ def roll_duck_id():
 
     if error_ducks:
         available_tiers = available_tiers + ["_error"]
-        weights = weights + [ERROR_WEIGHT]
+        weights = weights + [effective_error_weight()]
 
     if not available_tiers:
         return None
@@ -1175,6 +1202,43 @@ class ErrorAdminView(discord.ui.View):
     @discord.ui.button(label="Toggle Error Status", style=discord.ButtonStyle.danger, emoji="🚫")
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ErrorToggleModal())
+
+    @discord.ui.button(label="Error Mode", style=discord.ButtonStyle.secondary, emoji="⚠️")
+    async def toggle_error_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Lock weather at max + boost ERROR weight, or restore normal daily weather."""
+        environment_state.setdefault("error_mode", False)
+        turning_on = not environment_state["error_mode"]
+        environment_state["error_mode"] = turning_on
+
+        if turning_on:
+            environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+            environment_state["egg_count"] = 5
+            await save_duck_state()
+            msg = (
+                "⚠️ **Error Mode ON**\n"
+                f"• Drop chance locked at **{ENVIRONMENT_MAX_CHANCE:g}%**\n"
+                "• Eggs per drop locked at **5**\n"
+                f"• ERROR weight **{ERROR_WEIGHT} → {ERROR_WEIGHT_EVENT}** (Quackpot-tier)\n"
+                "• Daily weather re-roll paused until you turn this off"
+            )
+        else:
+            # Resume normal cycle: re-roll today's weather immediately
+            today_str = time.strftime("%Y-%m-%d", time.gmtime())
+            chance = round(
+                random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+            )
+            environment_state["date"] = today_str
+            environment_state["drop_chance_percent"] = chance
+            environment_state["egg_count"] = _roll_egg_count()
+            await save_duck_state()
+            msg = (
+                "✅ **Error Mode OFF**\n"
+                f"• Weather re-rolled: **{chance}%** drop · "
+                f"**{environment_state['egg_count']}** egg(s) per drop\n"
+                f"• ERROR weight back to **{ERROR_WEIGHT}**"
+            )
+
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 class HatchToggleView(discord.ui.View):
@@ -2614,11 +2678,15 @@ class DuckCog(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def error_cmd(self, interaction: discord.Interaction):
         any_error = any(d.get("is_error") for d in duck_index.values())
-        description = (
-            "Choose a category below to view."
-            if any_error
-            else "No ERROR:404 ducks exist yet."
+        mode_line = (
+            "⚠️ **Error Mode is ON** — max drops + boosted ERROR odds."
+            if is_error_mode()
+            else "Error Mode is off — normal weather cycle."
         )
+        if any_error:
+            description = f"{mode_line}\n\nChoose a category below to view."
+        else:
+            description = f"{mode_line}\n\nNo ERROR:404 ducks exist yet."
         embed = discord.Embed(
             title="🚫 ERROR:404",
             description=description,
@@ -2878,6 +2946,19 @@ class DuckCog(commands.Cog):
         env = await ensure_environment_for_today()
         chance = env["drop_chance_percent"]
         egg_count = env.get("egg_count", 1)
+        egg_word = "egg" if egg_count == 1 else "eggs"
+
+        if is_error_mode():
+            lines = [
+                "# ⚠️ Error - Connection Issues",
+                f"🥚 Drop Chance: **{chance:g}%** per check",
+                f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
+                f"🪲 Admin: Error odds **{ERROR_WEIGHT} > {ERROR_WEIGHT_EVENT}**",
+            ]
+            embed = discord.Embed(description="\n".join(lines), color=discord.Color.from_str("#000000"))
+            embed.set_footer(text="📶 Attempting to reconnect..")
+            await interaction.response.send_message(embed=embed)
+            return
 
         if chance <= 8:
             label = "🌦️ Calm"
@@ -2888,7 +2969,6 @@ class DuckCog(commands.Cog):
         else:
             label = "🌩️ Frenzy"
 
-        egg_word = "egg" if egg_count == 1 else "eggs"
         lines = [
             f"# {label}",
             f"🥚 Drop Chance: **{chance}%** per check",
