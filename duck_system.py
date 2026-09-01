@@ -25,6 +25,7 @@ import time
 import random
 import uuid
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -181,9 +182,13 @@ pending_gifts = {}
 
 # redeem_codes[code] = {
 #   "eggs": int, "duck_ids": [duck_id, ...],
-#   "expires_at": float | None, "redeemed_by": [discord_id, ...]
+#   "expires_at": float | None, "redeemed_by": [discord_id, ...],
+#   "max_uses": int | None  — None = unlimited (until expiry)
 # }
 redeem_codes = {}
+
+# Crown role: duck_config[guild_id]["crown_role_id"] + "crown_last_paid_date" (YYYY-MM-DD in US/Eastern)
+CROWN_ROLE_EGGS = 5
 
 # nest_state[guild_id] = {
 #   "pool_total": int (always starts at 8),
@@ -1745,6 +1750,12 @@ class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
         max_length=10,
         placeholder="Leave blank for no expiration",
     )
+    max_uses_input = discord.ui.TextInput(
+        label="Max uses (optional)",
+        required=False,
+        max_length=10,
+        placeholder="Leave blank for unlimited uses",
+    )
     eggs_input = discord.ui.TextInput(
         label="Egg Amount (optional)", required=False, max_length=10
     )
@@ -1808,11 +1819,25 @@ class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
                 )
             expires_at = time.time() + hours * 3600
 
+        max_uses = None
+        max_uses_raw = str(self.max_uses_input).strip()
+        if max_uses_raw:
+            try:
+                max_uses = int(max_uses_raw)
+                if max_uses < 1:
+                    raise ValueError
+            except ValueError:
+                return await interaction.response.send_message(
+                    "❌ Max uses must be a whole number of at least 1, or blank for unlimited.",
+                    ephemeral=True,
+                )
+
         redeem_codes[code_key] = {
             "eggs": eggs_amount,
             "duck_ids": duck_ids,
             "expires_at": expires_at,
             "redeemed_by": [],
+            "max_uses": max_uses,
         }
         await save_duck_state()
 
@@ -1824,8 +1849,10 @@ class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
             reward_parts.append(f"🦆 {names}")
 
         expiry_text = f"in {expires_raw} hour(s)" if expires_at else "never"
+        uses_text = f"**{max_uses}** total" if max_uses is not None else "unlimited"
         await interaction.response.send_message(
-            f"✅ Code **{code_key}** created — grants {' + '.join(reward_parts)}. Expires: {expiry_text}\n"
+            f"✅ Code **{code_key}** created — grants {' + '.join(reward_parts)}.\n"
+            f"Expires: {expiry_text} · Uses: {uses_text}\n"
             f"-# Creating a code with the same text again overwrites it, including its redemption history.",
             ephemeral=True,
         )
@@ -1841,11 +1868,17 @@ class RedeemModal(discord.ui.Modal, title="Redeem a Code"):
         if not entry:
             return await interaction.response.send_message("❌ That code isn't valid.", ephemeral=True)
 
-        if entry["expires_at"] and time.time() > entry["expires_at"]:
+        if entry.get("expires_at") and time.time() > entry["expires_at"]:
             return await interaction.response.send_message("❌ That code has expired.", ephemeral=True)
 
+        max_uses = entry.get("max_uses")
+        if max_uses is not None and len(entry.get("redeemed_by", [])) >= max_uses:
+            return await interaction.response.send_message(
+                "❌ That code has reached its maximum number of uses.", ephemeral=True
+            )
+
         discord_id = str(interaction.user.id)
-        if discord_id in entry["redeemed_by"]:
+        if discord_id in entry.get("redeemed_by", []):
             return await interaction.response.send_message(
                 "❌ You've already redeemed this code.", ephemeral=True
             )
@@ -2003,18 +2036,40 @@ def member_qualifies_for_role_reward(
 
 def build_role_rewards_embed(guild: discord.Guild | None) -> discord.Embed:
     guild_id = str(guild.id) if guild else ""
-    rewards = duck_config.get(guild_id, {}).get("role_rewards", {})
-    if not rewards:
-        desc = "No role rewards configured yet.\nUse **Add Reward** to link a role to eggs and/or a duck."
+    cfg = duck_config.get(guild_id, {})
+    rewards = cfg.get("role_rewards", {})
+    lines = []
+
+    crown_id = cfg.get("crown_role_id")
+    if crown_id and guild:
+        crown_role = guild.get_role(int(crown_id))
+        crown_bit = crown_role.mention if crown_role else f"`role {crown_id}`"
+        lines.append(
+            f"👑 **Crown** {crown_bit} — 🥚 **{CROWN_ROLE_EGGS}** eggs daily at 00:01 Eastern "
+            f"(whoever holds the role)"
+        )
+    elif crown_id:
+        lines.append(f"👑 **Crown** `{crown_id}` — 🥚 **{CROWN_ROLE_EGGS}** eggs / day @ 00:01 Eastern")
+
+    if rewards:
+        lines.extend(format_role_reward_line(guild, rid, rew) for rid, rew in rewards.items())
+
+    if not lines:
+        desc = (
+            "No role rewards configured yet.\n"
+            "Use **Add Reward** for one-time grants, or **Crown Role** for a daily 5-egg holder payout."
+        )
     else:
-        lines = [format_role_reward_line(guild, rid, rew) for rid, rew in rewards.items()]
         desc = "\n".join(lines)
+
     embed = discord.Embed(
         title="🎖️ Role Rewards",
         description=desc,
         color=discord.Color.gold(),
     )
-    embed.set_footer(text="Granted once when the role is added · kept if the role is later removed")
+    embed.set_footer(
+        text="One-time rewards: kept if role removed · Crown: paid daily to current holders @ 00:01 Eastern"
+    )
     return embed
 
 
@@ -2243,10 +2298,44 @@ class RoleRewardsAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Refresh List", style=discord.ButtonStyle.secondary, emoji="🔄")
-    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Crown Role", style=discord.ButtonStyle.secondary, emoji="👑")
+    async def crown_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"Pick the **crown role**. Whoever holds it at **00:01 Eastern** each day gets "
+            f"**{CROWN_ROLE_EGGS}** eggs (including back-to-back winners).\n"
+            f"-# Same role again overwrites the previous crown setting.",
+            view=CrownRoleSelectView(),
+            ephemeral=True,
+        )
+
+
+class CrownRoleSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.RoleSelect(
+            placeholder="Choose the daily crown role",
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        role = self.select.values[0]
+        guild_id = str(interaction.guild.id)
+        cfg = duck_config.setdefault(guild_id, {})
+        cfg["crown_role_id"] = role.id
+        await save_duck_state()
         embed = build_role_rewards_embed(interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(
+            content=(
+                f"👑 Crown role set to {role.mention}.\n"
+                f"Each day at **00:01 Eastern**, everyone with this role receives "
+                f"**{CROWN_ROLE_EGGS}** eggs."
+            ),
+            embed=embed,
+            view=None,
+        )
 
 
 class EditorView(discord.ui.View):
@@ -2350,6 +2439,7 @@ class DuckCog(commands.Cog):
         self.update_egg_counter_channels.start()
         self.nest_reset_loop.start()
         self.expire_pending_gifts_loop.start()
+        self.crown_role_payout_loop.start()
 
         # Re-register persistent gift offer buttons after restart
         for gift_id in list(pending_gifts.keys()):
@@ -2370,6 +2460,7 @@ class DuckCog(commands.Cog):
         self.update_egg_counter_channels.cancel()
         self.nest_reset_loop.cancel()
         self.expire_pending_gifts_loop.cancel()
+        self.crown_role_payout_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
@@ -2814,6 +2905,62 @@ class DuckCog(commands.Cog):
 
     @expire_pending_gifts_loop.before_loop
     async def before_expire_pending_gifts_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ---------- background: crown role daily eggs @ 00:01 America/New_York ----------
+
+    @tasks.loop(minutes=1)
+    async def crown_role_payout_loop(self):
+        try:
+            eastern = ZoneInfo("America/New_York")
+        except Exception:
+            eastern = timezone(timedelta(hours=-4))  # fallback EDT-ish
+        now = datetime.now(eastern)
+        # Pay once per calendar day after 00:01 Eastern (role is assigned at 00:00 by another bot)
+        if now.hour != 0 or now.minute < 1:
+            return
+
+        date_str = now.strftime("%Y-%m-%d")
+        changed = False
+
+        for guild in self.bot.guilds:
+            guild_id = str(guild.id)
+            cfg = duck_config.get(guild_id, {})
+            role_id = cfg.get("crown_role_id")
+            if not role_id:
+                continue
+            if cfg.get("crown_last_paid_date") == date_str:
+                continue
+
+            role = guild.get_role(int(role_id))
+            if role is None:
+                continue
+
+            paid = 0
+            for member in role.members:
+                if member.bot:
+                    continue
+                rec = get_user_record(str(member.id))
+                rec["inventory"] += CROWN_ROLE_EGGS
+                paid += 1
+                try:
+                    await member.send(
+                        f"👑 Crown reward: **+{CROWN_ROLE_EGGS}** eggs for holding **{role.name}** today."
+                    )
+                except Exception:
+                    pass
+
+            cfg = duck_config.setdefault(guild_id, {})
+            cfg["crown_last_paid_date"] = date_str
+            cfg["crown_role_id"] = role_id
+            changed = True
+            print(f"[crown] {guild.name}: paid {CROWN_ROLE_EGGS} eggs to {paid} member(s) on {date_str}")
+
+        if changed:
+            await save_duck_state()
+
+    @crown_role_payout_loop.before_loop
+    async def before_crown_role_payout_loop(self):
         await self.bot.wait_until_ready()
 
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
