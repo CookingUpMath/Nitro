@@ -59,7 +59,11 @@ RARITY_DISPLAY = {
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
-EGG_COUNTER_UPDATE_MINUTES = 5  # how often the VC name is allowed to refresh
+# Channel renames (PATCH) are strictly rate-limited by Discord (~2/10min per
+# channel). Only attempt updates at these Eastern minutes so we never share
+# the :00 / :30 windows used by external Shortcuts renames.
+EGG_COUNTER_ALLOWED_MINUTES = (7, 22, 37, 52)  # ~15 min apart, clear of :00 and :30
+EGG_COUNTER_MIN_SECONDS_BETWEEN_EDITS = 600  # hard floor between renames of the same VC
 
 # --- Environment: today's drop odds fluctuate, picked once per day ---
 ENVIRONMENT_MIN_CHANCE = 6.0
@@ -1295,8 +1299,11 @@ class EggChannelSelectView(discord.ui.View):
         except Exception as e:
             print(f"[duck_system] initial egg counter rename failed: {e}")
         await interaction.response.edit_message(
-            content=f"Egg counter channel set to {channel.mention}. It refreshes every "
-                    f"{EGG_COUNTER_UPDATE_MINUTES} minutes.",
+            content=(
+                f"Egg counter channel set to {channel.mention}. "
+                f"It refreshes around :07 / :22 / :37 / :52 Eastern "
+                f"(never on the hour or half-hour)."
+            ),
             view=None,
         )
 
@@ -2844,20 +2851,49 @@ class DuckCog(commands.Cog):
     async def before_check_expired_limited(self):
         await self.bot.wait_until_ready()
 
-    # ---------- background: keep the egg counter + nest VC names in sync ----------
+    # ---------- background: keep the egg counter VC name in sync ----------
+    # Runs every minute but only renames at Eastern :07/:22/:37/:52 so it
+    # never lands on the :00/:30 windows used by iPhone Shortcuts renames.
 
-    @tasks.loop(minutes=EGG_COUNTER_UPDATE_MINUTES)
+    @tasks.loop(minutes=1)
     async def update_egg_counter_channels(self):
+        try:
+            eastern = ZoneInfo("America/New_York")
+        except Exception:
+            eastern = timezone(timedelta(hours=-4))
+        now_eastern = datetime.now(eastern)
+        if now_eastern.minute not in EGG_COUNTER_ALLOWED_MINUTES:
+            return
+
+        if not hasattr(self, "_egg_counter_last_edit"):
+            self._egg_counter_last_edit = {}  # channel_id -> monotonic timestamp
+
         desired_egg_name = format_egg_channel_name(duck_stats.get("total_dropped", 0))
+        now_mono = time.monotonic()
+
         for guild_id, config in duck_config.items():
             channel_id = config.get("egg_counter_channel_id")
-            if channel_id:
-                channel = self.bot.get_channel(channel_id)
-                if channel and channel.name != desired_egg_name:
-                    try:
-                        await channel.edit(name=desired_egg_name)
-                    except Exception as e:
-                        print(f"[duck_system] failed to rename egg counter channel: {e}")
+            if not channel_id:
+                continue
+            channel = self.bot.get_channel(channel_id)
+            if not channel or channel.name == desired_egg_name:
+                continue
+
+            last = self._egg_counter_last_edit.get(channel_id, 0)
+            if now_mono - last < EGG_COUNTER_MIN_SECONDS_BETWEEN_EDITS:
+                continue
+
+            try:
+                await channel.edit(name=desired_egg_name)
+                self._egg_counter_last_edit[channel_id] = time.monotonic()
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    # Back off this channel; don't spam logs
+                    self._egg_counter_last_edit[channel_id] = time.monotonic()
+                else:
+                    print(f"[duck_system] failed to rename egg counter channel: {e}")
+            except Exception as e:
+                print(f"[duck_system] failed to rename egg counter channel: {e}")
 
     @update_egg_counter_channels.before_loop
     async def before_update_egg_counter_channels(self):
