@@ -58,6 +58,7 @@ RARITY_DISPLAY = {
 
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
+DROP_MIN_CONTENT_LENGTH = 8    # letters/digits only — spaces & symbols don't count
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
 # Channel renames (PATCH) are strictly rate-limited by Discord (~2/10min per
 # channel). Only attempt updates at these Eastern minutes so we never share
@@ -244,16 +245,18 @@ def format_limited_remaining(limited_until: float | None) -> str:
 
 # environment_state = {
 #   "date": "2026-08-16", "drop_chance_percent": 8.42, "egg_count": 1,
-#   "error_mode": False  — staff Error Mode locks weather at max + boosts ERROR weight
+#   "error_mode": False  — locks weather at max + boosts ERROR weight
+#   "purge_mode": False  — drop chance 15%, Steal button on drops (egg count unchanged)
 # }
 # Global, not per-guild — one "weather" for the whole bot. Both values are
 # re-rolled together, once per UTC day, the first time anything checks
-# that day (a message, or someone running /weather) — unless error_mode is on.
+# that day (a message, or someone running /weather) — unless a mode locks it.
 environment_state = {
     "date": None,
     "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
     "egg_count": 1,
     "error_mode": False,
+    "purge_mode": False,
 }
 
 
@@ -267,17 +270,32 @@ def is_error_mode() -> bool:
     return bool(environment_state.get("error_mode"))
 
 
+def is_purge_mode() -> bool:
+    return bool(environment_state.get("purge_mode"))
+
+
 def effective_error_weight() -> float:
     return ERROR_WEIGHT_EVENT if is_error_mode() else ERROR_WEIGHT
 
 
 async def ensure_environment_for_today() -> dict:
     environment_state.setdefault("error_mode", False)
+    environment_state.setdefault("purge_mode", False)
 
     # Error Mode: lock at maximum drop stats; skip daily re-roll
     if environment_state.get("error_mode"):
         environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
         environment_state["egg_count"] = 5
+        return environment_state
+
+    # Purge Mode: lock drop chance only; keep today's egg_count (or roll if none yet)
+    if environment_state.get("purge_mode"):
+        environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+        today_str = time.strftime("%Y-%m-%d", time.gmtime())
+        if environment_state.get("date") != today_str:
+            environment_state["date"] = today_str
+            environment_state["egg_count"] = _roll_egg_count()
+            await save_duck_state()
         return environment_state
 
     today_str = time.strftime("%Y-%m-%d", time.gmtime())
@@ -290,6 +308,53 @@ async def ensure_environment_for_today() -> dict:
         environment_state["egg_count"] = _roll_egg_count()
         await save_duck_state()
     return environment_state
+
+
+# Last message body per user (normalized) — exact repeat spam cannot roll drops.
+# In-memory only; fine to reset on restart.
+_last_egg_drop_message_content: dict[int, str] = {}
+
+
+def _egg_drop_meaningful_len(content: str) -> int:
+    """Count only letters and digits — spaces and symbols ($, @, (, etc.) don't count."""
+    return sum(1 for ch in content if ch.isalnum())
+
+
+def message_qualifies_for_egg_drop(message: discord.Message) -> bool:
+    """Anti-spam gates for passive egg drops. Karma / daily egg ignore this."""
+    content = (message.content or "").strip()
+    meaningful = _egg_drop_meaningful_len(content)
+
+    # Stickers / attachments / GIF embeds with little or no real text
+    has_stickers = bool(getattr(message, "stickers", None))
+    has_attachments = bool(message.attachments)
+    has_gif = False
+    for att in message.attachments:
+        ct = (att.content_type or "").lower()
+        fn = (att.filename or "").lower()
+        if "gif" in ct or fn.endswith(".gif"):
+            has_gif = True
+            break
+    if not has_gif:
+        for emb in message.embeds:
+            if emb.type in ("gifv", "image"):
+                has_gif = True
+                break
+
+    if has_stickers or has_attachments or has_gif:
+        if meaningful < DROP_MIN_CONTENT_LENGTH:
+            return False
+
+    if meaningful < DROP_MIN_CONTENT_LENGTH:
+        return False
+
+    # Exact same text as this user's previous message (copy-paste farming)
+    uid = message.author.id
+    normalized = content.casefold()
+    if _last_egg_drop_message_content.get(uid) == normalized:
+        return False
+    _last_egg_drop_message_content[uid] = normalized
+    return True
 
 
 # --- In-memory only (short-lived windows, fine to lose on restart) ---
@@ -404,10 +469,12 @@ async def load_duck_state():
                     "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
                     "egg_count": 1,
                     "error_mode": False,
+                    "purge_mode": False,
                 },
             )
             environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
             environment_state.setdefault("error_mode", False)
+            environment_state.setdefault("purge_mode", False)
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s), {len(pending_gifts)} pending gift(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -737,26 +804,49 @@ def format_egg_channel_name(count: int) -> str:
 ###############################################
 
 class EggDropView(discord.ui.View):
-    """Fully public — the drop message itself has the Hatch/Inventory
-    buttons. Only the person who found it can press them; anyone else gets
-    a quiet ephemeral 'not yours' notice. Whichever button is pressed edits
-    the original public message in place with the outcome.
+    """Drop claim UI. Hatch/Inventory are finder-only. During Purge Mode a
+    🥷 Steal button is added — any other member gets one 50/50 attempt;
+    failure locks only that member out, success claims the eggs.
     """
 
-    def __init__(self, owner_id: int, egg_count: int = 1):
+    def __init__(self, owner_id: int, egg_count: int = 1, purge: bool = False):
         super().__init__(timeout=CLAIM_TIMEOUT_SECONDS)
         self.owner_id = owner_id
         self.egg_count = egg_count
         self.message: discord.Message | None = None
+        self.steal_failed: set[int] = set()
+        self.claimed = False
+        self.purge = purge
+
+        if purge:
+            steal_btn = discord.ui.Button(
+                label="Steal",
+                style=discord.ButtonStyle.danger,
+                emoji="🥷",
+                custom_id=f"egg_steal:{owner_id}:{id(self)}",
+            )
+            steal_btn.callback = self.steal
+            self.add_item(steal_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.bot:
+            return False
+        return True
+
+    async def _require_owner(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("This egg isn't yours!", ephemeral=True)
+            return False
+        if self.claimed:
+            await interaction.response.send_message("These eggs are already gone.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
     async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_owner(interaction):
+            return
+        self.claimed = True
         discord_id = str(interaction.user.id)
 
         if self.egg_count == 1:
@@ -832,8 +922,11 @@ class EggDropView(discord.ui.View):
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
     async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_owner(interaction):
+            return
+        self.claimed = True
         discord_id = str(interaction.user.id)
-        rec = duck_users.setdefault(discord_id, default_user_record())
+        rec = get_user_record(discord_id)
         rec["inventory"] += self.egg_count
         await save_duck_state()
         self.stop()
@@ -843,6 +936,48 @@ class EggDropView(discord.ui.View):
             embed=None,
             view=None,
         )
+
+    async def steal(self, interaction: discord.Interaction):
+        """Purge Mode only — 50/50 steal attempt by a non-owner."""
+        if not self.purge:
+            return await interaction.response.send_message("Purge isn't active.", ephemeral=True)
+        if self.claimed:
+            return await interaction.response.send_message("These eggs are already gone.", ephemeral=True)
+        if interaction.user.id == self.owner_id:
+            return await interaction.response.send_message(
+                "You can't steal your own eggs — use Hatch or Inventory.", ephemeral=True
+            )
+        if interaction.user.id in self.steal_failed:
+            return await interaction.response.send_message(
+                "You already failed to steal these eggs — someone else can still try, "
+                "or the finder can claim them.",
+                ephemeral=True,
+            )
+
+        if random.random() < 0.5:
+            # Success — eggs go to the thief's inventory
+            self.claimed = True
+            stealer_id = str(interaction.user.id)
+            rec = get_user_record(stealer_id)
+            rec["inventory"] += self.egg_count
+            await save_duck_state()
+            self.stop()
+            egg_word = "egg" if self.egg_count == 1 else "eggs"
+            await interaction.response.edit_message(
+                content=(
+                    f"🥷 {interaction.user.mention} stole **{self.egg_count}** {egg_word} "
+                    f"from <@{self.owner_id}>!"
+                ),
+                embed=None,
+                view=None,
+            )
+        else:
+            self.steal_failed.add(interaction.user.id)
+            await interaction.response.send_message(
+                "🥷 Steal **failed**! You can't try again on this drop — "
+                "the finder can still claim, and other members can still attempt a steal.",
+                ephemeral=True,
+            )
 
     async def on_timeout(self):
         if self.message is None:
@@ -1223,6 +1358,7 @@ class ErrorAdminView(discord.ui.View):
     async def toggle_error_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Lock weather at max + boost ERROR weight, or restore normal daily weather."""
         environment_state.setdefault("error_mode", False)
+        environment_state.setdefault("purge_mode", False)
         turning_on = not environment_state["error_mode"]
         environment_state["error_mode"] = turning_on
 
@@ -1238,21 +1374,79 @@ class ErrorAdminView(discord.ui.View):
                 "• Daily weather re-roll paused until you turn this off"
             )
         else:
-            # Resume normal cycle: re-roll today's weather immediately
             today_str = time.strftime("%Y-%m-%d", time.gmtime())
-            chance = round(
-                random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
-            )
             environment_state["date"] = today_str
-            environment_state["drop_chance_percent"] = chance
-            environment_state["egg_count"] = _roll_egg_count()
+            if is_purge_mode():
+                # Purge still on — keep 15% drop, re-roll egg count only
+                environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+                environment_state["egg_count"] = _roll_egg_count()
+                await save_duck_state()
+                msg = (
+                    "✅ **Error Mode OFF** (Purge Mode still active)\n"
+                    f"• Drop chance stays **{ENVIRONMENT_MAX_CHANCE:g}%**\n"
+                    f"• Eggs per drop re-rolled to **{environment_state['egg_count']}**\n"
+                    f"• ERROR weight back to **{ERROR_WEIGHT}**"
+                )
+            else:
+                chance = round(
+                    random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+                )
+                environment_state["drop_chance_percent"] = chance
+                environment_state["egg_count"] = _roll_egg_count()
+                await save_duck_state()
+                msg = (
+                    "✅ **Error Mode OFF**\n"
+                    f"• Weather re-rolled: **{chance}%** drop · "
+                    f"**{environment_state['egg_count']}** egg(s) per drop\n"
+                    f"• ERROR weight back to **{ERROR_WEIGHT}**"
+                )
+
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Purge Mode", style=discord.ButtonStyle.danger, emoji="🚨")
+    async def toggle_purge_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """15% drop chance + Steal button on drops. Egg count is not forced."""
+        environment_state.setdefault("purge_mode", False)
+        environment_state.setdefault("error_mode", False)
+        turning_on = not environment_state["purge_mode"]
+        environment_state["purge_mode"] = turning_on
+
+        if turning_on:
+            environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+            # Do not change egg_count — leave today's (or error-mode's) value
             await save_duck_state()
             msg = (
-                "✅ **Error Mode OFF**\n"
-                f"• Weather re-rolled: **{chance}%** drop · "
-                f"**{environment_state['egg_count']}** egg(s) per drop\n"
-                f"• ERROR weight back to **{ERROR_WEIGHT}**"
+                "🚨 **Purge Mode ON**\n"
+                f"• Drop chance locked at **{ENVIRONMENT_MAX_CHANCE:g}%**\n"
+                "• Eggs per drop **unchanged**\n"
+                "• Drops gain a **🥷 Steal** button (50/50 — fail locks only that person out)\n"
+                "• Daily drop-chance re-roll paused while this is on"
             )
+        else:
+            if is_error_mode():
+                environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+                environment_state["egg_count"] = 5
+                await save_duck_state()
+                msg = (
+                    "✅ **Purge Mode OFF** (Error Mode still active)\n"
+                    f"• Drop chance stays **{ENVIRONMENT_MAX_CHANCE:g}%** · eggs per drop **5**\n"
+                    "• Steal button removed from new drops"
+                )
+            else:
+                today_str = time.strftime("%Y-%m-%d", time.gmtime())
+                chance = round(
+                    random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+                )
+                environment_state["date"] = today_str
+                environment_state["drop_chance_percent"] = chance
+                environment_state["egg_count"] = _roll_egg_count()
+                await save_duck_state()
+                msg = (
+                    "✅ **Purge Mode OFF**\n"
+                    f"• Weather re-rolled: **{chance}%** drop · "
+                    f"**{environment_state['egg_count']}** egg(s) per drop\n"
+                    "• Steal button removed from new drops"
+                )
 
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -2560,6 +2754,10 @@ class DuckCog(commands.Cog):
         if message.channel.id in blocked_channels:
             return  # karma (reactions, GM, welcome, invite) still works here — only the drop itself is blocked
 
+        # Anti-spam: min length, no media-only / GIF / sticker spam, no exact repeat text
+        if not message_qualifies_for_egg_drop(message):
+            return
+
         now = time.time()
         if now - rec.get("last_roll_check_ts", 0) < DROP_COOLDOWN_SECONDS:
             return
@@ -2572,13 +2770,14 @@ class DuckCog(commands.Cog):
             return  # pool is empty, nothing to give right now
 
         egg_count = env.get("egg_count", 1)
-        view = EggDropView(message.author.id, egg_count)
+        purge = is_purge_mode()
+        view = EggDropView(message.author.id, egg_count, purge=purge)
         egg_word = "egg" if egg_count == 1 else "eggs"
+        drop_text = f"🥚 {message.author.mention} found {egg_count} {egg_word} on the ground!"
+        if purge:
+            drop_text += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
         try:
-            sent = await message.channel.send(
-                content=f"🥚 {message.author.mention} found {egg_count} {egg_word} on the ground!",
-                view=view,
-            )
+            sent = await message.channel.send(content=drop_text, view=view)
             view.message = sent
             duck_stats["total_dropped"] = duck_stats.get("total_dropped", 0) + egg_count
             await save_duck_state()
@@ -2789,11 +2988,16 @@ class DuckCog(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def error_cmd(self, interaction: discord.Interaction):
         any_error = any(d.get("is_error") for d in duck_index.values())
-        mode_line = (
-            "⚠️ **Error Mode is ON** — max drops + boosted ERROR odds."
-            if is_error_mode()
-            else "Error Mode is off — normal weather cycle."
-        )
+        modes = []
+        if is_error_mode():
+            modes.append("⚠️ **Error Mode ON** — max drops + boosted ERROR odds")
+        else:
+            modes.append("Error Mode off")
+        if is_purge_mode():
+            modes.append("🚨 **Purge Mode ON** — 15% drops + Steal button")
+        else:
+            modes.append("Purge Mode off")
+        mode_line = " · ".join(modes)
         if any_error:
             description = f"{mode_line}\n\nChoose a category below to view."
         else:
@@ -3151,8 +3355,22 @@ class DuckCog(commands.Cog):
                 f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
                 f"🪲 Admin: Error odds **{ERROR_WEIGHT} > {ERROR_WEIGHT_EVENT}**",
             ]
+            if is_purge_mode():
+                lines.append("🚨 **Purge Mode** also active — drops can be stolen")
             embed = discord.Embed(description="\n".join(lines), color=discord.Color.from_str("#000000"))
             embed.set_footer(text="📶 Attempting to reconnect..")
+            await interaction.response.send_message(embed=embed)
+            return
+
+        if is_purge_mode():
+            lines = [
+                "# 🚨 PURGE MODE",
+                f"🥚 Drop Chance: **{chance:g}%** per check",
+                f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
+                "🥷 Drops can be **stolen** (50/50) by other members",
+            ]
+            embed = discord.Embed(description="\n".join(lines), color=discord.Color.red())
+            embed.set_footer(text="Finders keepers — unless someone is faster.")
             await interaction.response.send_message(embed=embed)
             return
 
