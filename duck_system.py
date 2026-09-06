@@ -1865,19 +1865,43 @@ class KarmaChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(content=content, view=None)
 
 
+def _blocked_egg_channel_ids(guild_id: str) -> list[int]:
+    """Always return int channel IDs (JSON may have left them as ints already)."""
+    raw = duck_config.get(guild_id, {}).get("egg_blocked_channel_ids", []) or []
+    out = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _format_blocked_egg_channels(guild: discord.Guild | None, ids: list[int]) -> str:
+    if not ids:
+        return "None — eggs can drop in every channel."
+    if guild is None:
+        return ", ".join(f"`{i}`" for i in ids)
+    parts = []
+    for i in ids:
+        ch = guild.get_channel(i)
+        parts.append(ch.mention if ch else f"`{i}` (deleted?)")
+    return ", ".join(parts)
+
+
 class EggBlockedChannelSelectView(discord.ui.View):
     """Pick channels where the passive egg drop can never trigger — a
-    block-list, not an allow-list. Stored under a separate config key from
-    karma_reaction_channel_ids, so blocking a channel here has zero effect
-    on heart/wave-reaction karma in that same channel.
+    block-list, not an allow-list. Selecting channels *replaces* the whole
+    list. Use **Clear All Blocks** to unblock everything (Discord channel
+    selects cannot reliably submit an empty selection).
     """
 
-    def __init__(self):
+    def __init__(self, guild: discord.Guild | None = None):
         super().__init__(timeout=180)
         self.select = discord.ui.ChannelSelect(
-            placeholder="Channels where eggs can NEVER drop (none = allowed everywhere)",
+            placeholder="Select channels to block (replaces the current list)",
             channel_types=[discord.ChannelType.text],
-            min_values=0,
+            min_values=1,
             max_values=25,
         )
         self.select.callback = self.on_select
@@ -1886,14 +1910,25 @@ class EggBlockedChannelSelectView(discord.ui.View):
     async def on_select(self, interaction: discord.Interaction):
         channels = self.select.values
         guild_id = str(interaction.guild.id)
+        # Full replace — not a merge — so re-running with a new set unblocks the old ones
         duck_config.setdefault(guild_id, {})["egg_blocked_channel_ids"] = [c.id for c in channels]
         await save_duck_state()
 
-        if channels:
-            content = "Egg drops are now blocked in: " + ", ".join(c.mention for c in channels)
-        else:
-            content = "No channels are blocked — eggs can drop anywhere."
+        content = (
+            "**Egg-drop block list updated** (previous blocks cleared).\n"
+            "Blocked: " + ", ".join(c.mention for c in channels)
+        )
         await interaction.response.edit_message(content=content, view=None)
+
+    @discord.ui.button(label="Clear All Blocks", style=discord.ButtonStyle.danger, emoji="✅")
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["egg_blocked_channel_ids"] = []
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content="✅ **All egg-drop channel blocks cleared.** Eggs can drop anywhere again.",
+            view=None,
+        )
 
 
 class IntroChannelSelectView(discord.ui.View):
@@ -2615,9 +2650,16 @@ class EditorView(discord.ui.View):
                 ephemeral=True,
             )
         elif choice == "egg_blocked_channels":
+            guild_id = str(interaction.guild.id)
+            current = _blocked_egg_channel_ids(guild_id)
+            current_txt = _format_blocked_egg_channels(interaction.guild, current)
             await interaction.response.send_message(
-                "Pick channels where eggs can never drop (this doesn't affect karma reactions there):",
-                view=EggBlockedChannelSelectView(),
+                "**Block egg-drop channels**\n"
+                f"Currently blocked: {current_txt}\n\n"
+                "• Use the menu to set a **new** block list (replaces the old one).\n"
+                "• Use **Clear All Blocks** to unblock every channel.\n"
+                "-# Does not affect karma reactions in those channels.",
+                view=EggBlockedChannelSelectView(interaction.guild),
                 ephemeral=True,
             )
         elif choice == "intro_channel":
@@ -2750,7 +2792,7 @@ class DuckCog(commands.Cog):
         if not duck_config.get(guild_id, {}).get("hatching_enabled", True):
             return
 
-        blocked_channels = duck_config.get(guild_id, {}).get("egg_blocked_channel_ids", [])
+        blocked_channels = _blocked_egg_channel_ids(guild_id)
         if message.channel.id in blocked_channels:
             return  # karma (reactions, GM, welcome, invite) still works here — only the drop itself is blocked
 
