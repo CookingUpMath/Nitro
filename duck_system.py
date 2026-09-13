@@ -181,7 +181,7 @@ AIR_DROP_IMAGE_URL = (
     "?ex=6aa7595d&is=6aa607dd&hm=11bb1f1bf260dd16e22a22aa251c076bc24653bd4fdb7355a137c96710e35600&"
 )
 AIR_DROP_MIN_INTERVAL = 30 * 60       # 30 minutes
-AIR_DROP_MAX_INTERVAL = 4 * 60 * 60   # 4 hours
+AIR_DROP_MAX_INTERVAL = 3 * 60 * 60   # 3 hours
 AIR_DROP_EXPIRY_SECONDS = 30 * 60     # unclaimed drops expire
 AIR_DROP_TARGET_MIN = 3
 AIR_DROP_TARGET_MAX = 5
@@ -569,7 +569,7 @@ def get_air_drop_state(guild_id: str) -> dict:
 
 
 def schedule_next_air_drop(guild_id: str) -> float:
-    """Set next_drop_at to now + random 30m–4h. Returns that timestamp."""
+    """Set next_drop_at to now + random 30m–3h. Returns that timestamp."""
     delay = random.randint(AIR_DROP_MIN_INTERVAL, AIR_DROP_MAX_INTERVAL)
     when = time.time() + delay
     get_air_drop_state(guild_id)["next_drop_at"] = when
@@ -2785,7 +2785,7 @@ class AirDropChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"🪂 Air drop channel set to {channel.mention}.\n"
-                f"Drops every **30 min–4 hours** (when no active drop). "
+                f"Drops every **30 min–3 hours** (when no active drop). "
                 f"Unclaimed drops expire after **30 minutes**.\n"
                 f"-# Use **Channel Setter → Toggle Air Drops** to pause them."
             ),
@@ -2921,16 +2921,27 @@ class DuckCog(commands.Cog):
         self.air_drop_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        orig = getattr(error, "original", error)
+        # Interaction timed out (>~3s) or was already acknowledged — nothing useful to send
+        if isinstance(orig, discord.NotFound):
+            return
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "You do not have permission to use this command.", ephemeral=True
-            )
-        else:
-            print(f"[duck_system] command error: {error}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "You do not have permission to use this command.", ephemeral=True
+                    )
+            except discord.HTTPException:
+                pass
+            return
+        print(f"[duck_system] command error: {error}")
+        try:
             if not interaction.response.is_done():
                 await interaction.response.send_message(
                     "Something went wrong running that command.", ephemeral=True
                 )
+        except discord.HTTPException:
+            pass
 
     # ---------- daily egg, GM karma, welcome karma, invite karma, passive drop ----------
 
@@ -3875,6 +3886,9 @@ class DuckCog(commands.Cog):
 
     @app_commands.command(name="weather", description="Check today's egg-drop odds and eggs per drop.")
     async def weather_cmd(self, interaction: discord.Interaction):
+        # Defer immediately — ensure_environment may hit the DB and Discord
+        # expires interactions after ~3s (Unknown interaction / 10062).
+        await interaction.response.defer()
         env = await ensure_environment_for_today()
         chance = env["drop_chance_percent"]
         egg_count = env.get("egg_count", 1)
@@ -3891,7 +3905,7 @@ class DuckCog(commands.Cog):
                 lines.append("🚨 **Purge Mode** also active — drops can be stolen")
             embed = discord.Embed(description="\n".join(lines), color=discord.Color.from_str("#000000"))
             embed.set_footer(text="📶 Attempting to reconnect..")
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
             return
 
         if is_purge_mode():
@@ -3903,7 +3917,7 @@ class DuckCog(commands.Cog):
             ]
             embed = discord.Embed(description="\n".join(lines), color=discord.Color.red())
             embed.set_footer(text="Finders keepers — unless someone is faster.")
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
             return
 
         if chance <= 8:
@@ -3922,7 +3936,7 @@ class DuckCog(commands.Cog):
         ]
 
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.blue())
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
     async def hatchpool(self, interaction: discord.Interaction):
