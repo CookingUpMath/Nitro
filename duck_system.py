@@ -187,6 +187,11 @@ AIR_DROP_TARGET_MIN = 3
 AIR_DROP_TARGET_MAX = 5
 AIR_DROP_EGGS_MIN = 2
 AIR_DROP_EGGS_MAX = 25
+# Unicode-only emojis for reaction air drops (no custom server emojis)
+AIR_DROP_REACTION_EMOJIS = [
+    "🥚", "🎯", "🪂", "🦆", "⭐", "🔥", "💫", "🎉", "🍀", "💎",
+    "⚡", "🌟", "🎁", "🏆", "✨", "🎈", "🔔", "🌙", "☀️", "🌈",
+]
 
 # duck_stats = {"total_dropped": int}  — global count of eggs that have
 # ever spawned in the pond (i.e. successful passive-chat drops).
@@ -571,12 +576,19 @@ def schedule_next_air_drop(guild_id: str) -> float:
     return when
 
 
-def build_air_drop_announce_embed(target: int, eggs: int) -> discord.Embed:
+def build_air_drop_announce_embed(
+    eggs: int,
+    *,
+    kind: str = "messages",
+    target: int | None = None,
+    emoji: str | None = None,
+) -> discord.Embed:
+    if kind == "reaction":
+        body = f"First person to react {emoji} to this post gets **{eggs}** eggs!"
+    else:
+        body = f"First person to send **{target}** messages gets **{eggs}** eggs!"
     embed = discord.Embed(
-        description=(
-            f"# 🎯 Egg Drop\n"
-            f"First person to send **{target}** messages gets **{eggs}** eggs!"
-        ),
+        description=f"# 🎯 Egg Drop\n{body}",
         color=0xC4A35A,
     )
     embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
@@ -591,6 +603,24 @@ def build_air_drop_claim_embed(mention: str, inventory: int) -> discord.Embed:
         ),
         color=discord.Color.green(),
     )
+    return embed
+
+
+def build_air_drop_expired_embed(active: dict) -> discord.Embed:
+    eggs = active.get("eggs", "?")
+    if active.get("kind") == "reaction":
+        line = f"~~First person to react {active.get('emoji', '❓')} to this post gets **{eggs}** eggs!~~"
+    else:
+        line = (
+            f"~~First person to send **{active.get('target', '?')}** messages "
+            f"gets **{eggs}** eggs!~~"
+        )
+    embed = discord.Embed(
+        description=f"# 🎯 Egg Drop — Expired\n{line}\n**This drop expired unclaimed.**",
+        color=0x555555,
+    )
+    embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
+    embed.set_footer(text="🪂 Floated away")
     return embed
 
 
@@ -3084,6 +3114,12 @@ class DuckCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        # Air-drop reaction challenges (unicode emoji, first correct react wins)
+        try:
+            await self._process_air_drop_reaction(payload)
+        except Exception as e:
+            print(f"[air_drop] reaction handle failed: {e}")
+
         if payload.guild_id is None:
             return
         if payload.member is not None and payload.member.bot:
@@ -3446,8 +3482,37 @@ class DuckCog(commands.Cog):
 
     # ---------- air drops: random parachute challenges ----------
 
+    async def _complete_air_drop(
+        self,
+        guild_id: str,
+        channel: discord.abc.Messageable,
+        winner: discord.abc.User,
+        active: dict,
+    ):
+        """Award eggs, clear active drop, announce claim."""
+        state = get_air_drop_state(guild_id)
+        cur = state.get("active")
+        if not cur or cur.get("message_id") != active.get("message_id"):
+            return  # already claimed / expired
+
+        eggs = int(active["eggs"])
+        uid = str(winner.id)
+        rec = get_user_record(uid)
+        rec["inventory"] += eggs
+        state["active"] = None
+        state["last_drop_ended_at"] = time.time()
+        schedule_next_air_drop(guild_id)
+        await save_duck_state()
+
+        try:
+            await channel.send(
+                embed=build_air_drop_claim_embed(winner.mention, rec["inventory"])
+            )
+        except Exception as e:
+            print(f"[air_drop] claim announce failed: {e}")
+
     async def _process_air_drop_message(self, message: discord.Message):
-        """Count a qualifying message toward the active air drop in this channel."""
+        """Count a qualifying message toward a message-type air drop."""
         guild_id = str(message.guild.id)
         cfg = duck_config.get(guild_id, {})
         if not cfg.get("air_drops_enabled", True):
@@ -3460,9 +3525,10 @@ class DuckCog(commands.Cog):
         active = state.get("active")
         if not active:
             return
+        if active.get("kind", "messages") != "messages":
+            return
         if int(active.get("channel_id", 0)) != message.channel.id:
             return
-        # Only messages after the drop was posted
         if message.created_at.timestamp() < float(active.get("created_at", 0)):
             return
 
@@ -3475,43 +3541,88 @@ class DuckCog(commands.Cog):
             await save_duck_state()
             return
 
-        # Winner
-        eggs = int(active["eggs"])
-        rec = get_user_record(uid)
-        rec["inventory"] += eggs
-        state["active"] = None
-        state["last_drop_ended_at"] = time.time()
-        schedule_next_air_drop(guild_id)
-        await save_duck_state()
+        await self._complete_air_drop(guild_id, message.channel, message.author, active)
 
-        try:
-            await message.channel.send(
-                embed=build_air_drop_claim_embed(message.author.mention, rec["inventory"])
-            )
-        except Exception as e:
-            print(f"[air_drop] claim announce failed: {e}")
+    async def _process_air_drop_reaction(self, payload: discord.RawReactionActionEvent):
+        """First correct emoji reaction claims a reaction-type air drop."""
+        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+            return
+        guild_id = str(payload.guild_id)
+        cfg = duck_config.get(guild_id, {})
+        if not cfg.get("air_drops_enabled", True):
+            return
+
+        state = get_air_drop_state(guild_id)
+        active = state.get("active")
+        if not active or active.get("kind") != "reaction":
+            return
+        if int(active.get("message_id", 0)) != payload.message_id:
+            return
+        if int(active.get("channel_id", 0)) != payload.channel_id:
+            return
+
+        # Unicode emoji only — payload.emoji.name is the character for standard emoji
+        if payload.emoji.id is not None:
+            return  # custom emoji
+        if payload.emoji.name != active.get("emoji"):
+            return
+
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        member = guild.get_member(payload.user_id) or payload.member
+        if member is None or member.bot:
+            return
+
+        channel = self.bot.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(payload.channel_id)
+            except Exception:
+                return
+
+        await self._complete_air_drop(guild_id, channel, member, active)
 
     async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
-        target = random.randint(AIR_DROP_TARGET_MIN, AIR_DROP_TARGET_MAX)
         eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
+        kind = random.choice(["messages", "reaction"])
+
+        if kind == "reaction":
+            emoji = random.choice(AIR_DROP_REACTION_EMOJIS)
+            embed = build_air_drop_announce_embed(eggs, kind="reaction", emoji=emoji)
+            active = {
+                "kind": "reaction",
+                "channel_id": channel.id,
+                "message_id": None,
+                "emoji": emoji,
+                "eggs": eggs,
+                "created_at": time.time(),
+                "progress": {},
+            }
+        else:
+            target = random.randint(AIR_DROP_TARGET_MIN, AIR_DROP_TARGET_MAX)
+            embed = build_air_drop_announce_embed(eggs, kind="messages", target=target)
+            active = {
+                "kind": "messages",
+                "channel_id": channel.id,
+                "message_id": None,
+                "target": target,
+                "eggs": eggs,
+                "created_at": time.time(),
+                "progress": {},
+            }
+
         try:
-            sent = await channel.send(embed=build_air_drop_announce_embed(target, eggs))
+            sent = await channel.send(embed=embed)
         except Exception as e:
             print(f"[air_drop] post failed in {guild.name}: {e}")
             schedule_next_air_drop(guild_id)
             await save_duck_state()
             return
 
+        active["message_id"] = sent.id
         state = get_air_drop_state(guild_id)
-        state["active"] = {
-            "channel_id": channel.id,
-            "message_id": sent.id,
-            "target": target,
-            "eggs": eggs,
-            "created_at": time.time(),
-            "progress": {},
-        }
-        # Next drop only scheduled after claim or expiry
+        state["active"] = active
         state["next_drop_at"] = None
         await save_duck_state()
 
@@ -3544,18 +3655,7 @@ class DuckCog(commands.Cog):
                     if channel and msg_id:
                         try:
                             drop_msg = await channel.fetch_message(int(msg_id))
-                            expired = discord.Embed(
-                                title="🎯 Egg Drop — Expired",
-                                description=(
-                                    f"~~First person to send **{active.get('target', '?')}** messages "
-                                    f"gets **{active.get('eggs', '?')}** eggs!~~\n"
-                                    f"**This drop expired unclaimed.**"
-                                ),
-                                color=0x555555,
-                            )
-                            expired.set_thumbnail(url=AIR_DROP_IMAGE_URL)
-                            expired.set_footer(text="🪂 Floated away")
-                            await drop_msg.edit(embed=expired)
+                            await drop_msg.edit(embed=build_air_drop_expired_embed(active))
                         except Exception as e:
                             print(f"[air_drop] expire edit failed: {e}")
                 continue  # never post a new one while one is active (or just expired this tick)
