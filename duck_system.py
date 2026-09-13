@@ -161,9 +161,32 @@ duck_index = {}
 duck_users = {}
 
 # duck_config[guild_id] = {
-#   "hatching_enabled": bool, "egg_counter_channel_id": int | None
+#   "hatching_enabled": bool, "egg_counter_channel_id": int | None,
+#   "air_drop_channel_id": int | None, "air_drops_enabled": bool,
 # }
 duck_config = {}
+
+# air_drop_state[guild_id] = {
+#   "active": None | {
+#     "channel_id": int, "message_id": int, "target": int, "eggs": int,
+#     "created_at": float, "progress": {discord_id: int}
+#   },
+#   "next_drop_at": float | None,
+# }
+air_drop_state: dict = {}
+
+AIR_DROP_IMAGE_URL = (
+    "https://cdn.discordapp.com/attachments/1055252004114546799/"
+    "1548518103674265610/Egg_drop.png"
+    "?ex=6aa7595d&is=6aa607dd&hm=11bb1f1bf260dd16e22a22aa251c076bc24653bd4fdb7355a137c96710e35600&"
+)
+AIR_DROP_MIN_INTERVAL = 30 * 60       # 30 minutes
+AIR_DROP_MAX_INTERVAL = 4 * 60 * 60   # 4 hours
+AIR_DROP_EXPIRY_SECONDS = 30 * 60     # unclaimed drops expire
+AIR_DROP_TARGET_MIN = 3
+AIR_DROP_TARGET_MAX = 10
+AIR_DROP_EGGS_MIN = 2
+AIR_DROP_EGGS_MAX = 25
 
 # duck_stats = {"total_dropped": int}  — global count of eggs that have
 # ever spawned in the pond (i.e. successful passive-chat drops).
@@ -443,7 +466,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state
     if _pool is None:
         return
     try:
@@ -451,7 +474,8 @@ async def load_duck_state():
             rows = await conn.fetch(
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
-                "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts')"
+                "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts',"
+                "'duck_air_drop_state')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -462,6 +486,7 @@ async def load_duck_state():
             redeem_codes = data.get("duck_redeem_codes", {})
             nest_state = data.get("duck_nest_state", {})
             pending_gifts = data.get("duck_pending_gifts", {})
+            air_drop_state = data.get("duck_air_drop_state", {})
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -512,12 +537,63 @@ async def save_duck_state() -> bool:
                     ("duck_nest_state", json.dumps(nest_state)),
                     ("duck_environment", json.dumps(environment_state)),
                     ("duck_pending_gifts", json.dumps(pending_gifts)),
+                    ("duck_air_drop_state", json.dumps(air_drop_state)),
                 ],
             )
         return True
     except Exception as e:
         print(f"[duck_db] save failed: {e}")
         return False
+
+
+def get_air_drop_state(guild_id: str) -> dict:
+    state = air_drop_state.setdefault(
+        guild_id,
+        {
+            "active": None,
+            "next_drop_at": None,
+            "last_activity_at": None,
+            "last_drop_ended_at": None,
+        },
+    )
+    state.setdefault("active", None)
+    state.setdefault("next_drop_at", None)
+    state.setdefault("last_activity_at", None)
+    state.setdefault("last_drop_ended_at", None)
+    return state
+
+
+def schedule_next_air_drop(guild_id: str) -> float:
+    """Set next_drop_at to now + random 30m–4h. Returns that timestamp."""
+    delay = random.randint(AIR_DROP_MIN_INTERVAL, AIR_DROP_MAX_INTERVAL)
+    when = time.time() + delay
+    get_air_drop_state(guild_id)["next_drop_at"] = when
+    return when
+
+
+def build_air_drop_announce_embed(target: int, eggs: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎯 Egg Drop",
+        description=(
+            f"First person to send **{target}** messages gets **{eggs}** eggs!\n"
+            f"Spam is excluded from earning."
+        ),
+        color=0xC4A35A,
+    )
+    embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
+    return embed
+
+
+def build_air_drop_claim_embed(mention: str, inventory: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🧺 Drop claimed!",
+        description=(
+            f"{mention} claimed the drop!\n"
+            f"You now have **{inventory}** eggs in your inventory."
+        ),
+        color=discord.Color.green(),
+    )
+    return embed
 
 
 ###############################################
@@ -2587,6 +2663,108 @@ class CrownRoleSelectView(discord.ui.View):
         )
 
 
+class ChannelSetterView(discord.ui.View):
+    """One menu for egg counter, karma, intro, and air-drop channels + air-drop toggle."""
+
+    def __init__(self, guild: discord.Guild | None = None):
+        super().__init__(timeout=300)
+        self.guild = guild
+        options = [
+            discord.SelectOption(label="Egg Counter Channel", value="counter", emoji="🔢"),
+            discord.SelectOption(label="Karma Reaction Channels", value="karma", emoji="😇"),
+            discord.SelectOption(label="Introduction Channel", value="intro", emoji="👋"),
+            discord.SelectOption(label="Air Drop Channel", value="air_drop", emoji="🪂"),
+        ]
+        select = discord.ui.Select(placeholder="Choose which channel to set", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Nothing to see here.", ephemeral=True)
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        choice = interaction.data["values"][0]
+        if choice == "counter":
+            await interaction.response.send_message(
+                "Pick the voice channel to use as the live egg counter:",
+                view=EggChannelSelectView(),
+                ephemeral=True,
+            )
+        elif choice == "karma":
+            await interaction.response.send_message(
+                "Pick which channels count for heart-reaction karma:",
+                view=KarmaChannelSelectView(),
+                ephemeral=True,
+            )
+        elif choice == "intro":
+            await interaction.response.send_message(
+                "Pick the introduction channel for 👋 karma:",
+                view=IntroChannelSelectView(),
+                ephemeral=True,
+            )
+        elif choice == "air_drop":
+            await interaction.response.send_message(
+                "Pick the text channel for **air drops** (random parachute egg challenges):",
+                view=AirDropChannelSelectView(),
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Toggle Air Drops", style=discord.ButtonStyle.primary, emoji="🪂")
+    async def toggle_air(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        cfg = duck_config.setdefault(guild_id, {})
+        cfg["air_drops_enabled"] = not cfg.get("air_drops_enabled", True)
+        enabled = cfg["air_drops_enabled"]
+        if enabled:
+            state = get_air_drop_state(guild_id)
+            if not state.get("next_drop_at") and not state.get("active"):
+                schedule_next_air_drop(guild_id)
+        await save_duck_state()
+        ch_id = cfg.get("air_drop_channel_id")
+        ch_bit = f"<#{ch_id}>" if ch_id else "*no channel set yet*"
+        status = "**ON**" if enabled else "**OFF**"
+        await interaction.response.send_message(
+            f"🪂 Air drops are now {status}.\nChannel: {ch_bit}",
+            ephemeral=True,
+        )
+
+
+class AirDropChannelSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.select = discord.ui.ChannelSelect(
+            placeholder="Choose the air drop channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        channel = self.select.values[0]
+        guild_id = str(interaction.guild.id)
+        cfg = duck_config.setdefault(guild_id, {})
+        cfg["air_drop_channel_id"] = channel.id
+        cfg.setdefault("air_drops_enabled", True)
+        state = get_air_drop_state(guild_id)
+        if not state.get("next_drop_at") and not state.get("active"):
+            schedule_next_air_drop(guild_id)
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=(
+                f"🪂 Air drop channel set to {channel.mention}.\n"
+                f"Drops every **30 min–4 hours** (when no active drop). "
+                f"Unclaimed drops expire after **30 minutes**.\n"
+                f"-# Use **Channel Setter → Toggle Air Drops** to pause them."
+            ),
+            view=None,
+        )
+
+
 class EditorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -2597,10 +2775,8 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Toggle Duck Activation", value="toggle_active", emoji="🔁"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
-            discord.SelectOption(label="Set Egg Counter Channel", value="counter", emoji="🔢"),
-            discord.SelectOption(label="Set Karma Reaction Channels", value="karma_channels", emoji="😇"),
+            discord.SelectOption(label="Channel Setter", value="channels", emoji="📡"),
             discord.SelectOption(label="Block Egg-Drop Channels", value="egg_blocked_channels", emoji="🚫"),
-            discord.SelectOption(label="Set Introduction Channel", value="intro_channel", emoji="👋"),
             discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
             discord.SelectOption(label="Set Nest Prize Duck", value="nest_prize_duck", emoji="🎁"),
             discord.SelectOption(label="Role Rewards", value="role_rewards", emoji="🎖️"),
@@ -2637,16 +2813,18 @@ class EditorView(discord.ui.View):
             await interaction.response.send_message(
                 "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
             )
-        elif choice == "counter":
+        elif choice == "channels":
+            guild_id = str(interaction.guild.id)
+            cfg = duck_config.get(guild_id, {})
+            air_on = cfg.get("air_drops_enabled", True)
+            air_ch = cfg.get("air_drop_channel_id")
+            air_line = f"Air drops: **{'ON' if air_on else 'OFF'}**"
+            if air_ch:
+                air_line += f" in <#{air_ch}>"
             await interaction.response.send_message(
-                "Pick the voice channel to use as the live egg counter:",
-                view=EggChannelSelectView(),
-                ephemeral=True,
-            )
-        elif choice == "karma_channels":
-            await interaction.response.send_message(
-                "Pick which channels count for heart-reaction karma:",
-                view=KarmaChannelSelectView(),
+                f"**📡 Channel Setter**\n{air_line}\n"
+                "Pick what to configure, or toggle air drops:",
+                view=ChannelSetterView(interaction.guild),
                 ephemeral=True,
             )
         elif choice == "egg_blocked_channels":
@@ -2660,12 +2838,6 @@ class EditorView(discord.ui.View):
                 "• Use **Clear All Blocks** to unblock every channel.\n"
                 "-# Does not affect karma reactions in those channels.",
                 view=EggBlockedChannelSelectView(interaction.guild),
-                ephemeral=True,
-            )
-        elif choice == "intro_channel":
-            await interaction.response.send_message(
-                "Pick the introduction channel for 👋 karma:",
-                view=IntroChannelSelectView(),
                 ephemeral=True,
             )
         elif choice == "redeem_code":
@@ -2696,6 +2868,7 @@ class DuckCog(commands.Cog):
         self.nest_reset_loop.start()
         self.expire_pending_gifts_loop.start()
         self.crown_role_payout_loop.start()
+        self.air_drop_loop.start()
 
         # Re-register persistent gift offer buttons after restart
         for gift_id in list(pending_gifts.keys()):
@@ -2717,6 +2890,7 @@ class DuckCog(commands.Cog):
         self.nest_reset_loop.cancel()
         self.expire_pending_gifts_loop.cancel()
         self.crown_role_payout_loop.cancel()
+        self.air_drop_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
@@ -2788,6 +2962,21 @@ class DuckCog(commands.Cog):
         if state_changed:
             await save_duck_state()
 
+        # Track chat in the air-drop channel so new drops only fire after real activity
+        air_ch = duck_config.get(guild_id, {}).get("air_drop_channel_id")
+        if air_ch and message.channel.id == int(air_ch):
+            st = get_air_drop_state(guild_id)
+            st["last_activity_at"] = time.time()
+            # persist lightly — next air-drop save will catch it; still save if we only track activity
+            # (avoid DB write every message: leave for air-drop progress / claim saves)
+
+        # Shared anti-spam gate for passive drops + air-drop challenge progress
+        qualifies = message_qualifies_for_egg_drop(message)
+
+        # --- Air drop challenge progress (same channel only, while a drop is active) ---
+        if qualifies:
+            await self._process_air_drop_message(message)
+
         # --- Passive egg drop (separate toggle: /editor → Toggle Egg Drops) ---
         if not duck_config.get(guild_id, {}).get("hatching_enabled", True):
             return
@@ -2796,8 +2985,7 @@ class DuckCog(commands.Cog):
         if message.channel.id in blocked_channels:
             return  # karma (reactions, GM, welcome, invite) still works here — only the drop itself is blocked
 
-        # Anti-spam: min length, no media-only / GIF / sticker spam, no exact repeat text
-        if not message_qualifies_for_egg_drop(message):
+        if not qualifies:
             return
 
         now = time.time()
@@ -3200,6 +3388,154 @@ class DuckCog(commands.Cog):
 
     @expire_pending_gifts_loop.before_loop
     async def before_expire_pending_gifts_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ---------- air drops: random parachute challenges ----------
+
+    async def _process_air_drop_message(self, message: discord.Message):
+        """Count a qualifying message toward the active air drop in this channel."""
+        guild_id = str(message.guild.id)
+        cfg = duck_config.get(guild_id, {})
+        if not cfg.get("air_drops_enabled", True):
+            return
+        channel_id = cfg.get("air_drop_channel_id")
+        if not channel_id or message.channel.id != int(channel_id):
+            return
+
+        state = get_air_drop_state(guild_id)
+        active = state.get("active")
+        if not active:
+            return
+        if int(active.get("channel_id", 0)) != message.channel.id:
+            return
+        # Only messages after the drop was posted
+        if message.created_at.timestamp() < float(active.get("created_at", 0)):
+            return
+
+        uid = str(message.author.id)
+        progress = active.setdefault("progress", {})
+        progress[uid] = progress.get(uid, 0) + 1
+        target = int(active["target"])
+
+        if progress[uid] < target:
+            await save_duck_state()
+            return
+
+        # Winner
+        eggs = int(active["eggs"])
+        rec = get_user_record(uid)
+        rec["inventory"] += eggs
+        state["active"] = None
+        state["last_drop_ended_at"] = time.time()
+        schedule_next_air_drop(guild_id)
+        await save_duck_state()
+
+        try:
+            await message.channel.send(
+                embed=build_air_drop_claim_embed(message.author.mention, rec["inventory"])
+            )
+        except Exception as e:
+            print(f"[air_drop] claim announce failed: {e}")
+
+    async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
+        target = random.randint(AIR_DROP_TARGET_MIN, AIR_DROP_TARGET_MAX)
+        eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
+        try:
+            sent = await channel.send(embed=build_air_drop_announce_embed(target, eggs))
+        except Exception as e:
+            print(f"[air_drop] post failed in {guild.name}: {e}")
+            schedule_next_air_drop(guild_id)
+            await save_duck_state()
+            return
+
+        state = get_air_drop_state(guild_id)
+        state["active"] = {
+            "channel_id": channel.id,
+            "message_id": sent.id,
+            "target": target,
+            "eggs": eggs,
+            "created_at": time.time(),
+            "progress": {},
+        }
+        # Next drop only scheduled after claim or expiry
+        state["next_drop_at"] = None
+        await save_duck_state()
+
+    @tasks.loop(minutes=1)
+    async def air_drop_loop(self):
+        now = time.time()
+        changed = False
+        for guild in self.bot.guilds:
+            guild_id = str(guild.id)
+            cfg = duck_config.get(guild_id, {})
+            if not cfg.get("air_drops_enabled", True):
+                continue
+            channel_id = cfg.get("air_drop_channel_id")
+            if not channel_id:
+                continue
+
+            state = get_air_drop_state(guild_id)
+            active = state.get("active")
+
+            # Expire unclaimed drops after 30 minutes — edit the original post
+            if active:
+                created = float(active.get("created_at", 0))
+                if now - created >= AIR_DROP_EXPIRY_SECONDS:
+                    state["active"] = None
+                    state["last_drop_ended_at"] = now
+                    schedule_next_air_drop(guild_id)
+                    changed = True
+                    channel = self.bot.get_channel(int(active.get("channel_id", channel_id)))
+                    msg_id = active.get("message_id")
+                    if channel and msg_id:
+                        try:
+                            drop_msg = await channel.fetch_message(int(msg_id))
+                            expired = discord.Embed(
+                                title="🎯 Egg Drop — Expired",
+                                description=(
+                                    f"~~First person to send **{active.get('target', '?')}** messages "
+                                    f"gets **{active.get('eggs', '?')}** eggs!~~\n"
+                                    f"**This drop expired unclaimed.**"
+                                ),
+                                color=0x555555,
+                            )
+                            expired.set_thumbnail(url=AIR_DROP_IMAGE_URL)
+                            expired.set_footer(text="🪂 Floated away")
+                            await drop_msg.edit(embed=expired)
+                        except Exception as e:
+                            print(f"[air_drop] expire edit failed: {e}")
+                continue  # never post a new one while one is active (or just expired this tick)
+
+            # Schedule first timer if missing
+            if not state.get("next_drop_at"):
+                schedule_next_air_drop(guild_id)
+                changed = True
+                continue
+
+            if now < float(state["next_drop_at"]):
+                continue
+
+            # Dead-channel guard: only post if someone chatted since the last drop ended.
+            # (First drop ever has no last_drop_ended_at — timer alone is enough.)
+            last_ended = state.get("last_drop_ended_at")
+            last_activity = state.get("last_activity_at")
+            if last_ended is not None:
+                if last_activity is None or float(last_activity) <= float(last_ended):
+                    # No new chat — push the timer again instead of posting into a dead channel
+                    schedule_next_air_drop(guild_id)
+                    changed = True
+                    continue
+
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                continue
+            await self._post_air_drop(guild, guild_id, channel)
+
+        if changed:
+            await save_duck_state()
+
+    @air_drop_loop.before_loop
+    async def before_air_drop_loop(self):
         await self.bot.wait_until_ready()
 
     # ---------- background: crown role daily eggs @ 00:01 America/New_York ----------
