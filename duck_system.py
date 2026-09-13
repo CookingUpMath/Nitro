@@ -185,8 +185,8 @@ AIR_DROP_MAX_INTERVAL = 3 * 60 * 60   # 3 hours
 AIR_DROP_EXPIRY_SECONDS = 30 * 60     # unclaimed drops expire
 AIR_DROP_TARGET_MIN = 3
 AIR_DROP_TARGET_MAX = 5
-AIR_DROP_EGGS_MIN = 2
-AIR_DROP_EGGS_MAX = 25
+AIR_DROP_EGGS_MIN = 5
+AIR_DROP_EGGS_MAX = 30
 # Unicode-only emojis for reaction air drops (no custom server emojis)
 AIR_DROP_REACTION_EMOJIS = [
     "🥚", "🎯", "🪂", "🦆", "⭐", "🔥", "💫", "🎉", "🍀", "💎",
@@ -3001,13 +3001,17 @@ class DuckCog(commands.Cog):
         if state_changed:
             await save_duck_state()
 
-        # Track chat in the air-drop channel so new drops only fire after real activity
+        # Track chat in the air-drop channel so new drops only fire after real activity.
+        # Persist at most every 2 minutes so restarts still see recent activity without
+        # writing the DB on every single message.
         air_ch = duck_config.get(guild_id, {}).get("air_drop_channel_id")
         if air_ch and message.channel.id == int(air_ch):
             st = get_air_drop_state(guild_id)
-            st["last_activity_at"] = time.time()
-            # persist lightly — next air-drop save will catch it; still save if we only track activity
-            # (avoid DB write every message: leave for air-drop progress / claim saves)
+            now_act = time.time()
+            prev = st.get("last_activity_at")
+            st["last_activity_at"] = now_act
+            if prev is None or (now_act - float(prev)) >= 120:
+                await save_duck_state()
 
         # Shared anti-spam gate for passive drops + air-drop challenge progress
         qualifies = message_qualifies_for_egg_drop(message)
