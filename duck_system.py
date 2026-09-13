@@ -3239,6 +3239,62 @@ class DuckCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, view=ErrorAdminView(), ephemeral=True)
 
+    @app_commands.command(name="drop", description="Staff: force an air drop in the air-drop channel now.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def drop_cmd(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+        guild_id = str(guild.id)
+        cfg = duck_config.get(guild_id, {})
+        channel_id = cfg.get("air_drop_channel_id")
+        if not channel_id:
+            return await interaction.response.send_message(
+                "No air drop channel set. Use `/editor` → **Channel Setter** → **Air Drop Channel** first.",
+                ephemeral=True,
+            )
+
+        channel = guild.get_channel(int(channel_id)) or self.bot.get_channel(int(channel_id))
+        if channel is None:
+            return await interaction.response.send_message(
+                "Air drop channel not found — it may have been deleted. Set it again in Channel Setter.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        state = get_air_drop_state(guild_id)
+        active = state.get("active")
+        if active:
+            # Close out the current drop so a fresh one can post
+            state["active"] = None
+            state["last_drop_ended_at"] = time.time()
+            msg_id = active.get("message_id")
+            try:
+                if msg_id:
+                    old = await channel.fetch_message(int(msg_id))
+                    expired = discord.Embed(
+                        title="🎯 Egg Drop — Ended early",
+                        description=(
+                            f"~~First person to send **{active.get('target', '?')}** messages "
+                            f"gets **{active.get('eggs', '?')}** eggs!~~\n"
+                            f"**A staff member started a new drop.**"
+                        ),
+                        color=0x555555,
+                    )
+                    expired.set_thumbnail(url=AIR_DROP_IMAGE_URL)
+                    await old.edit(embed=expired)
+            except Exception:
+                pass
+
+        await self._post_air_drop(guild, guild_id, channel)
+        await interaction.followup.send(
+            f"🪂 Air drop posted in {channel.mention}.",
+            ephemeral=True,
+        )
+
     # ---------- public: redeem a code ----------
 
     @app_commands.command(name="redeem", description="Redeem a code for eggs or ducks.")
