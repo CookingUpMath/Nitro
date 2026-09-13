@@ -573,10 +573,9 @@ def schedule_next_air_drop(guild_id: str) -> float:
 
 def build_air_drop_announce_embed(target: int, eggs: int) -> discord.Embed:
     embed = discord.Embed(
-        title="🎯 Egg Drop",
         description=(
-            f"First person to send **{target}** messages gets **{eggs}** eggs!\n"
-            f"Spam is excluded from earning."
+            f"# 🎯 Egg Drop\n"
+            f"First person to send **{target}** messages gets **{eggs}** eggs!"
         ),
         color=0xC4A35A,
     )
@@ -586,10 +585,9 @@ def build_air_drop_announce_embed(target: int, eggs: int) -> discord.Embed:
 
 def build_air_drop_claim_embed(mention: str, inventory: int) -> discord.Embed:
     embed = discord.Embed(
-        title="🧺 Drop claimed!",
         description=(
-            f"{mention} claimed the drop!\n"
-            f"You now have **{inventory}** eggs in your inventory."
+            f"## 🧺 {mention} claimed the drop!\n"
+            f"-# You now have **{inventory}** eggs in your inventory."
         ),
         color=discord.Color.green(),
     )
