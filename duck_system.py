@@ -72,14 +72,13 @@ ENVIRONMENT_MAX_CHANCE = 15.0
 # Triangular distribution peaked at the low end — most days land near 6%,
 # 15% is a genuinely rare high.
 
-# --- Eggs per drop: 1-5, weighted using the same odds as rarity tiers,
-# with common+rare combined into one bucket to make exactly 5 groups. ---
+# --- Eggs per drop: 1-5, weighted (sums to 100). ---
 EGG_COUNT_WEIGHTS = [
-    (1, RARITY_WEIGHTS["common"] + RARITY_WEIGHTS["rare"]),  # 85 — typical
-    (2, RARITY_WEIGHTS["legendary"]),                          # 10
-    (3, RARITY_WEIGHTS["divine"]),                             # 3
-    (4, RARITY_WEIGHTS["secret"]),                             # 1.5
-    (5, RARITY_WEIGHTS["quackpot"]),                           # 0.5 — matches "rare 5-egg" chance
+    (1, 75.0),   # typical
+    (2, 15.0),
+    (3, 5.0),
+    (4, 3.5),
+    (5, 1.5),    # rare high day
 ]
 
 # --- Karma ---
@@ -109,6 +108,7 @@ def rarity_header(r: str) -> str:
 # How much of a "win" a hatch announcement should feel like, scaled to how
 # hard the rarity actually is to get. Common barely registers; Quackpot
 # gets the full fanfare treatment.
+# Solo-hatch hype: one line, only the duck emoji. Text decor scales with rarity.
 HYPE_STYLE = {
     "common": {
         "color": discord.Color.light_grey(),
@@ -116,29 +116,39 @@ HYPE_STYLE = {
     },
     "rare": {
         "color": discord.Color.blue(),
-        "banner": "✨ {emoji} {mention} hatched **{title}**!",
+        "banner": "{emoji} {mention} hatched **{title}**!",
     },
     "legendary": {
         "color": discord.Color.gold(),
-        "banner": "🌟 **{emoji} {mention} hatched a {title}!** 🌟",
+        "banner": "✦ {emoji} {mention} hatched **{title}**! ✦",
     },
     "divine": {
         "color": discord.Color.purple(),
-        "banner": "💥 **{emoji} {mention} HATCHED A {title}!!** 💥",
+        "banner": "✧ {emoji} {mention} hatched **{title}**!! ✧",
     },
     "secret": {
         "color": discord.Color.red(),
-        "banner": "🎇🎇 **{emoji} {mention} UNCOVERED THE SECRET {title}!!** 🎇🎇",
+        "banner": "◆ {emoji} {mention} uncovered **{title}**!! ◆",
     },
     "quackpot": {
         "color": discord.Color.dark_purple(),
-        "banner": (
-            "👻═══════════👻\n"
-            "**{emoji} {mention} HATCHED THE QUACKPOT DUCK — {title}!!!**\n"
-            "👻═══════════👻"
-        ),
+        "banner": "◈ {emoji} {mention} hit the Quackpot — **{title}**!!! ◈",
     },
 }
+
+# Overrides rarity hype when the duck is flagged ERROR:404
+ERROR_HYPE_STYLE = {
+    "color": discord.Color.from_str("#000000"),
+    "banner": "✵ {emoji} {mention} glitched **{title}** ✵",
+}
+
+
+def hype_for_hatch(duck_id: str, rarity: str) -> dict:
+    """Pick solo-hatch banner + color; ERROR ducks get the glitch treatment."""
+    duck = duck_index.get(duck_id) or {}
+    if duck.get("is_error"):
+        return ERROR_HYPE_STYLE
+    return HYPE_STYLE.get(rarity, HYPE_STYLE["common"])
 
 
 ###############################################
@@ -675,7 +685,7 @@ def rename_duck(old_id: str, new_title: str) -> str:
     return new_id
 
 
-ERROR_WEIGHT = 0.05  # ERROR:404's odds — a hidden 7th pool, shared across however many error ducks are active
+ERROR_WEIGHT = 0.1  # ERROR:404's odds — a hidden 7th pool, shared across however many error ducks are active
 ERROR_WEIGHT_EVENT = 0.5  # while Error Mode is on (Quackpot-tier)
 
 
@@ -974,12 +984,11 @@ class EggDropView(discord.ui.View):
                     text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
                 await interaction.response.edit_message(content=text, embed=None, view=None)
             else:
-                style = HYPE_STYLE[result["rarity"]]
+                style = hype_for_hatch(result["duck_id"], result["rarity"])
                 banner = style["banner"].format(
                     emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
                 )
                 embed = discord.Embed(description=banner, color=style["color"])
-                embed.set_footer(text=rarity_header(result["rarity"]))
                 await interaction.response.edit_message(content=None, embed=embed, view=None)
             return
 
