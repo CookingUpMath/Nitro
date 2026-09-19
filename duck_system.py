@@ -2682,10 +2682,11 @@ class CollectionBrowserView(discord.ui.View):
                 )
             ]
             for r in RARITY_ORDER:
+                # No component emojis — Discord rejects some unicode (e.g. ⭕️)
+                # on select options and fails the whole interaction edit.
                 r_opts.append(discord.SelectOption(
                     label=RARITY_DISPLAY[r],
                     value=f"rarity:{r}",
-                    emoji=RARITY_SUMMARY_ICONS.get(r),
                     default=(self.rarity == r),
                 ))
             owned = self._owned()
@@ -2693,7 +2694,6 @@ class CollectionBrowserView(discord.ui.View):
                 r_opts.append(discord.SelectOption(
                     label="ERROR",
                     value="rarity:error",
-                    emoji="💢",
                     default=(self.rarity == "error"),
                 ))
             r_select = discord.ui.Select(placeholder="Rarities", options=r_opts, custom_id="col_rarity")
