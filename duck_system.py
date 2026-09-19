@@ -899,21 +899,17 @@ RARITY_SUMMARY_ICONS = {
     "legendary": "🟡",
     "divine": "🟠",
     "secret": "🔴",
-    "quackpot": "⭕",
+    "quackpot": "⭕️",
 }
 
 
 def format_flat_row(duck_ids) -> str:
-    """Emoji-only row(s). Splits across lines if needed to stay readable."""
+    """One large-emoji block — single '# ' line so Discord doesn't insert
+    huge gaps between multiple heading rows."""
     ducks = [duck_index[d] for d in duck_ids if d in duck_index]
     if not ducks:
         return ""
-    emojis = [duck["emoji"] for duck in ducks]
-    lines = []
-    chunk = 30
-    for i in range(0, len(emojis), chunk):
-        lines.append("# " + " ".join(emojis[i : i + chunk]))
-    return "\n".join(lines)
+    return "# " + " ".join(duck["emoji"] for duck in ducks)
 
 
 def pad3(n: int) -> str:
@@ -969,11 +965,17 @@ def build_collection_home_embed(owned: list, favorites: list, display_name: str,
 
     parts.append("")
     parts.append("**Summary**")
-    row1 = " ".join(f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}" for r in ("common", "rare", "legendary", "divine"))
-    row2 = " ".join(f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}" for r in ("secret", "quackpot"))
+    row1 = " ".join(
+        f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}"
+        for r in ("common", "rare", "legendary", "divine")
+    )
+    row2 = " ".join(
+        f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}"
+        for r in ("secret", "quackpot")
+    )
     row2 += f" 💢 {pad3(errors)}"
-    parts.append(row1)
-    parts.append(row2)
+    parts.append(f"-# {row1}")
+    parts.append(f"-# {row2}")
 
     embed = discord.Embed(description="\n".join(parts), color=color)
     embed.set_footer(text=f"🎒 {display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed")
