@@ -330,6 +330,10 @@ def weekly_kills_for(info: dict) -> int:
 
 _startup_done = False
 
+# Names currently shown in the bot's custom status (win announcements).
+# Used so we can clear presence when a displayed winner leaves the server.
+_last_status_names = []
+
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
@@ -362,10 +366,62 @@ async def on_ready():
         print(f"[startup] slash command sync failed (will retry on next reconnect): {e}")
     print(f"Bot is online as {bot.user}")
     print(f"[startup] Application ID: {bot.application_id}")
+    # Presence does not survive process restarts — clear to a neutral default
+    # so we never show a stale win from a previous run.
+    try:
+        await bot.change_presence(activity=discord.CustomActivity(name="Tracking Fortnite wins"))
+    except Exception as e:
+        print(f"[status] failed to set default presence on ready: {e}")
     if not check_wins.is_running():
         check_wins.start()
     if not weekly_reset_loop.is_running():
         weekly_reset_loop.start()
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Fully disconnect a leaving member from the Fortnite side of the bot:
+    wipe their user_db record, drop them from any weekly champion holder list,
+    and refresh presence if they were the one shown in the win status.
+    """
+    discord_id = str(member.id)
+    guild_id = str(member.guild.id) if member.guild else None
+    changed = False
+
+    # Remove them from any guild's fortboard_role_holders list.
+    for gid, config in list(guild_config.items()):
+        holders = config.get("fortboard_role_holders") or []
+        if discord_id in holders:
+            config["fortboard_role_holders"] = [h for h in holders if h != discord_id]
+            changed = True
+
+    # Wipe stored Fortnite link + all related fields for this Discord user.
+    if discord_id in user_db:
+        record = user_db[discord_id]
+        # Only clear if they were linked from this guild (or had no guild stored).
+        stored_gid = record.get("guild_id")
+        if stored_gid is None or stored_gid == guild_id:
+            del user_db[discord_id]
+            changed = True
+            print(f"[member_remove] fully unlinked Fortnite data for {discord_id} ({member.display_name})")
+
+    if changed:
+        await save_db()
+
+    # If the current status is showing this person's display name, clear or
+    # refresh it so a departed member's win doesn't stick on the bot forever.
+    global _last_status_names
+    display = member.display_name
+    if display and display in _last_status_names:
+        remaining = [n for n in _last_status_names if n != display]
+        if remaining:
+            await update_status(remaining)
+        else:
+            try:
+                await bot.change_presence(activity=discord.CustomActivity(name="Tracking Fortnite wins"))
+            except Exception as e:
+                print(f"[status] failed to clear presence after member leave: {e}")
+            _last_status_names = []
 
 
 ###############################################
@@ -916,7 +972,9 @@ async def check_wins_error(error):
 
 
 async def update_status(winner_names: list):
+    global _last_status_names
     names = list(dict.fromkeys(winner_names))  # de-dupe, keep order
+    _last_status_names = names
     if len(names) == 1:
         status_text = f"🏆 {names[0]}"
     elif len(names) == 2:
@@ -1089,6 +1147,7 @@ async def run_weekly_reset():
     for guild_id, members in by_guild.items():
         config = guild_config.get(guild_id, {})
         role_id = config.get("fortboard_role_id")
+        win_channel_id = config.get("win_channel_id")
         guild = bot.get_guild(int(guild_id))
 
         if not guild:
@@ -1099,6 +1158,52 @@ async def run_weekly_reset():
 
         top_wins_id = wins_ranked[0][0] if wins_ranked and weekly_wins_for(wins_ranked[0][1]) > 0 else None
         top_kills_id = kills_ranked[0][0] if kills_ranked and weekly_kills_for(kills_ranked[0][1]) > 0 else None
+
+        top_wins_count = weekly_wins_for(wins_ranked[0][1]) if top_wins_id else 0
+        top_kills_count = weekly_kills_for(kills_ranked[0][1]) if top_kills_id else 0
+
+        # Resolve display names for the announcement embed.
+        def _name_for(discord_id_str: str) -> str:
+            info = next((i for did, i in members if did == discord_id_str), None)
+            epic = (info or {}).get("display_name")
+            try:
+                m = guild.get_member(int(discord_id_str))
+                if m:
+                    return m.display_name
+            except Exception:
+                pass
+            return epic or "Unknown"
+
+        # Announce weekly champions in the same channel used for win alerts.
+        if win_channel_id:
+            channel = guild.get_channel(win_channel_id)
+            if channel:
+                lines = ["# 🏆 Weekly Fortnite Champions", ""]
+                if top_wins_id:
+                    lines.append(
+                        f"**Wins:** {_name_for(top_wins_id)} — **{top_wins_count}** win"
+                        f"{'s' if top_wins_count != 1 else ''}"
+                    )
+                else:
+                    lines.append("**Wins:** No one scored any wins this week.")
+                if top_kills_id:
+                    lines.append(
+                        f"**Kills:** {_name_for(top_kills_id)} — **{top_kills_count}** kill"
+                        f"{'s' if top_kills_count != 1 else ''}"
+                    )
+                else:
+                    lines.append("**Kills:** No one scored any kills this week.")
+                lines.append("")
+                lines.append("-# Leaderboard resets now. Good luck this week!")
+
+                embed = discord.Embed(
+                    description="\n".join(lines),
+                    color=discord.Color.gold(),
+                )
+                try:
+                    await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[weekly_reset] failed to post champions embed in guild {guild_id}: {e}")
 
         # 10 eggs per category on the duck side — 20 total if the same
         # person tops both wins and kills. Independent of whether a
