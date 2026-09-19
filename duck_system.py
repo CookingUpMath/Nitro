@@ -165,6 +165,13 @@ def hype_for_hatch(duck_id: str, rarity: str) -> dict:
 # }
 duck_index = {}
 
+# duck_series[casefold_name] = {
+#   "name": str,           # display name (first casing used)
+#   "duck_ids": [str, ...],
+# }
+# A duck may appear in multiple series. Empty series are deleted automatically.
+duck_series: dict = {}
+
 # duck_users[discord_id] = {
 #   "inventory": int, "collection": [duck_id, ...], "last_roll_check_ts": float
 # }
@@ -481,7 +488,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series
     if _pool is None:
         return
     try:
@@ -490,7 +497,7 @@ async def load_duck_state():
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
                 "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts',"
-                "'duck_air_drop_state')"
+                "'duck_air_drop_state','duck_series')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -502,6 +509,7 @@ async def load_duck_state():
             nest_state = data.get("duck_nest_state", {})
             pending_gifts = data.get("duck_pending_gifts", {})
             air_drop_state = data.get("duck_air_drop_state", {})
+            duck_series = data.get("duck_series", {})
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -553,12 +561,69 @@ async def save_duck_state() -> bool:
                     ("duck_environment", json.dumps(environment_state)),
                     ("duck_pending_gifts", json.dumps(pending_gifts)),
                     ("duck_air_drop_state", json.dumps(air_drop_state)),
+                    ("duck_series", json.dumps(duck_series)),
                 ],
             )
         return True
     except Exception as e:
         print(f"[duck_db] save failed: {e}")
         return False
+
+
+def series_key(name: str) -> str:
+    return name.strip().casefold()
+
+
+def list_series_names() -> list[str]:
+    """Display names sorted case-insensitively."""
+    return sorted(
+        (s.get("name") or k for k, s in duck_series.items()),
+        key=lambda n: n.casefold(),
+    )
+
+
+def toggle_duck_in_series(series_name: str, duck_id: str) -> str:
+    """Add duck to series, or remove if already present. Returns
+    'added' | 'removed' | 'removed_series' (series deleted because empty).
+    """
+    key = series_key(series_name)
+    if not key:
+        raise ValueError("Series name cannot be empty.")
+    if duck_id not in duck_index:
+        raise ValueError("Duck not in index.")
+
+    entry = duck_series.get(key)
+    if entry is None:
+        duck_series[key] = {
+            "name": series_name.strip(),
+            "duck_ids": [duck_id],
+            "created_at": time.time(),
+        }
+        return "added"
+
+    ids = entry.setdefault("duck_ids", [])
+    if duck_id in ids:
+        ids.remove(duck_id)
+        if not ids:
+            duck_series.pop(key, None)
+            return "removed_series"
+        return "removed"
+
+    ids.append(duck_id)
+    return "added"
+
+
+def remove_duck_from_all_series(duck_id: str) -> None:
+    """Drop a duck id from every series (e.g. on permanent delete / rename)."""
+    empty_keys = []
+    for key, entry in duck_series.items():
+        ids = entry.get("duck_ids") or []
+        if duck_id in ids:
+            ids.remove(duck_id)
+        if not ids:
+            empty_keys.append(key)
+    for key in empty_keys:
+        duck_series.pop(key, None)
 
 
 def get_air_drop_state(guild_id: str) -> dict:
@@ -681,6 +746,12 @@ def rename_duck(old_id: str, new_title: str) -> str:
         collection = rec.get("collection", [])
         if old_id in collection:
             rec["collection"] = [new_id if d == old_id else d for d in collection]
+
+    # Keep series membership pointed at the new id
+    for entry in duck_series.values():
+        ids = entry.get("duck_ids") or []
+        if old_id in ids:
+            entry["duck_ids"] = [new_id if d == old_id else d for d in ids]
 
     return new_id
 
@@ -818,46 +889,123 @@ def group_by_rarity(duck_ids):
     return grouped
 
 
+
+COLLECTION_PAGE_SIZE = 60
+MAX_FAVORITES = 60
+
+RARITY_SUMMARY_ICONS = {
+    "common": "🟢",
+    "rare": "🔵",
+    "legendary": "🟡",
+    "divine": "🟠",
+    "secret": "🔴",
+    "quackpot": "⭕",
+}
+
+
 def format_flat_row(duck_ids) -> str:
-    """All ducks together on one '#' line, no rarity grouping/labels at
-    all. Used by /collection.
-    """
+    """Emoji-only row(s). Splits across lines if needed to stay readable."""
     ducks = [duck_index[d] for d in duck_ids if d in duck_index]
     if not ducks:
         return ""
-    return "# " + " ".join(duck["emoji"] for duck in ducks)
+    emojis = [duck["emoji"] for duck in ducks]
+    lines = []
+    chunk = 30
+    for i in range(0, len(emojis), chunk):
+        lines.append("# " + " ".join(emojis[i : i + chunk]))
+    return "\n".join(lines)
 
 
-def build_collection_body(owned, favorites, choice: str = "_all") -> str:
-    """Splits the current filtered view into a Favorites section (if any)
-    and the rest, so a favorited duck never shows twice.
+def pad3(n: int) -> str:
+    return f"{int(n):03d}"
 
-    choice "error" lists ERROR ducks only. Normal rarity filters still include
-    error ducks that share that rarity (they also appear under Error).
-    """
-    if choice == "_all":
-        ids = owned
-        section_label = "Collection"
-    elif choice == "error":
-        ids = [d for d in owned if duck_index.get(d, {}).get("is_error")]
-        section_label = "ERROR"
-    else:
-        ids = [d for d in owned if duck_index.get(d, {}).get("rarity") == choice]
-        section_label = RARITY_DISPLAY.get(choice, choice)
 
-    if not ids:
-        return "No ducks in this view yet."
+def owned_series_keys(owned: list) -> list[str]:
+    """Series keys the user owns at least one duck from, newest first."""
+    owned_set = set(owned)
+    scored = []
+    for key, entry in duck_series.items():
+        ids = [d for d in (entry.get("duck_ids") or []) if d in owned_set and d in duck_index]
+        if not ids:
+            continue
+        scored.append((float(entry.get("created_at") or 0), key))
+    scored.sort(key=lambda t: -t[0])
+    return [k for _, k in scored]
 
-    fav_ids = [d for d in favorites if d in ids]
-    rest_ids = [d for d in ids if d not in fav_ids]
 
-    parts = []
+def filter_owned_ids(owned: list, *, series_key_name: str | None = None, rarity: str | None = None) -> list:
+    """Owned duck ids in acquire order, optional series + rarity/error filter."""
+    ids = [d for d in owned if d in duck_index]
+    if series_key_name:
+        entry = duck_series.get(series_key_name) or {}
+        series_set = set(entry.get("duck_ids") or [])
+        ids = [d for d in ids if d in series_set]
+    if rarity == "error":
+        ids = [d for d in ids if duck_index[d].get("is_error")]
+    elif rarity:
+        ids = [d for d in ids if duck_index[d].get("rarity") == rarity]
+    return ids
+
+
+def build_collection_home_embed(owned: list, favorites: list, display_name: str, color: discord.Color) -> discord.Embed:
+    fav_ids = [d for d in favorites if d in owned and d in duck_index][:MAX_FAVORITES]
+    by_rarity = {r: 0 for r in RARITY_ORDER}
+    errors = 0
+    for duck_id in owned:
+        duck = duck_index.get(duck_id)
+        if not duck:
+            continue
+        r = duck.get("rarity")
+        if r in by_rarity:
+            by_rarity[r] += 1
+        if duck.get("is_error"):
+            errors += 1
+
+    parts = [f"**Favorite ({len(fav_ids)}/{MAX_FAVORITES})**"]
     if fav_ids:
-        parts.append("### Favorites\n" + format_flat_row(fav_ids))
-    if rest_ids:
-        parts.append(f"### {section_label}\n" + format_flat_row(rest_ids))
+        parts.append(format_flat_row(fav_ids))
+    else:
+        parts.append("-# No favorites yet — use `/fav`")
 
-    return "\n\n".join(parts)
+    parts.append("")
+    parts.append("**Summary**")
+    row1 = " ".join(f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}" for r in ("common", "rare", "legendary", "divine"))
+    row2 = " ".join(f"{RARITY_SUMMARY_ICONS[r]} {pad3(by_rarity[r])}" for r in ("secret", "quackpot"))
+    row2 += f" 💢 {pad3(errors)}"
+    parts.append(row1)
+    parts.append(row2)
+
+    embed = discord.Embed(description="\n".join(parts), color=color)
+    embed.set_footer(text=f"🎒 {display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed")
+    return embed
+
+
+def build_collection_page_embed(
+    ids: list,
+    *,
+    page: int,
+    display_name: str,
+    color: discord.Color,
+    header: str | None = None,
+    footer: str,
+) -> discord.Embed:
+    total = len(ids)
+    pages = max(1, (total + COLLECTION_PAGE_SIZE - 1) // COLLECTION_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * COLLECTION_PAGE_SIZE
+    chunk = ids[start : start + COLLECTION_PAGE_SIZE]
+
+    lines = [f"-# Page {page + 1}/{pages}"]
+    if header:
+        lines.append(header)
+    if chunk:
+        lines.append(format_flat_row(chunk))
+    else:
+        lines.append("-# No ducks in this view.")
+
+    embed = discord.Embed(description="\n".join(lines), color=color)
+    embed.set_footer(text=footer)
+    return embed
 
 
 def format_grouped_row(grouped) -> str:
@@ -956,10 +1104,27 @@ class EggDropView(discord.ui.View):
             return False
         return True
 
+    async def _finish_drop_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+    ):
+        """Edit the drop message after a deferred response; swallow expired interactions."""
+        try:
+            await interaction.edit_original_response(content=content, embed=embed, view=None)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"[duck_system] drop message edit failed: {e}")
+
     @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
     async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_owner(interaction):
             return
+        # Acknowledge immediately — DB save + rate limits can exceed Discord's ~3s window
+        await interaction.response.defer()
         self.claimed = True
         discord_id = str(interaction.user.id)
 
@@ -968,10 +1133,10 @@ class EggDropView(discord.ui.View):
 
             if result is None:
                 await save_duck_state()
-                return await interaction.response.edit_message(
+                self.stop()
+                return await self._finish_drop_message(
+                    interaction,
                     content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
-                    embed=None,
-                    view=None,
                 )
 
             await save_duck_state()
@@ -982,14 +1147,14 @@ class EggDropView(discord.ui.View):
                 if result["bonus_egg"]:
                     inv = duck_users[discord_id]["inventory"]
                     text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
-                await interaction.response.edit_message(content=text, embed=None, view=None)
+                await self._finish_drop_message(interaction, content=text)
             else:
                 style = hype_for_hatch(result["duck_id"], result["rarity"])
                 banner = style["banner"].format(
                     emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
                 )
                 embed = discord.Embed(description=banner, color=style["color"])
-                await interaction.response.edit_message(content=None, embed=embed, view=None)
+                await self._finish_drop_message(interaction, content=None, embed=embed)
             return
 
         # Multiple eggs at once — grouped bulk-style list, same as /hatch.
@@ -1005,10 +1170,9 @@ class EggDropView(discord.ui.View):
         self.stop()
 
         if not results:
-            return await interaction.response.edit_message(
+            return await self._finish_drop_message(
+                interaction,
                 content="The pool is empty right now — nothing to hatch. Sorry, eggs gone!",
-                embed=None,
-                view=None,
             )
 
         grouped = {}
@@ -1020,23 +1184,23 @@ class EggDropView(discord.ui.View):
 
         lines = [f"🥚 {interaction.user.mention} hatched {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
-            err_mark = " ✨" if duck_index.get(duck_id, {}).get("is_error") else ""
+            err_mark = " 💢" if duck_index.get(duck_id, {}).get("is_error") else ""
             entry = (
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
                 f"{RARITY_DISPLAY[g['rarity']]}{err_mark}"
             )
-            # Owned before this batch → small text; new → bold + (NEW)
             if duck_id in pre_existing:
                 lines.append(f"-# {entry}")
             else:
                 lines.append(f"**{entry} (NEW)**")
 
-        await interaction.response.edit_message(content="\n".join(lines), embed=None, view=None)
+        await self._finish_drop_message(interaction, content="\n".join(lines))
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
     async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_owner(interaction):
             return
+        await interaction.response.defer()
         self.claimed = True
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
@@ -1044,10 +1208,12 @@ class EggDropView(discord.ui.View):
         await save_duck_state()
         self.stop()
         egg_word = "egg" if self.egg_count == 1 else "eggs"
-        await interaction.response.edit_message(
-            content=f"🎒 {interaction.user.mention} stored {self.egg_count} {egg_word}! Inventory: **{rec['inventory']}**",
-            embed=None,
-            view=None,
+        await self._finish_drop_message(
+            interaction,
+            content=(
+                f"🎒 {interaction.user.mention} stored {self.egg_count} {egg_word}! "
+                f"Inventory: **{rec['inventory']}**"
+            ),
         )
 
     async def steal(self, interaction: discord.Interaction):
@@ -1068,7 +1234,7 @@ class EggDropView(discord.ui.View):
             )
 
         if random.random() < 0.5:
-            # Success — eggs go to the thief's inventory
+            await interaction.response.defer()
             self.claimed = True
             stealer_id = str(interaction.user.id)
             rec = get_user_record(stealer_id)
@@ -1076,21 +1242,23 @@ class EggDropView(discord.ui.View):
             await save_duck_state()
             self.stop()
             egg_word = "egg" if self.egg_count == 1 else "eggs"
-            await interaction.response.edit_message(
+            await self._finish_drop_message(
+                interaction,
                 content=(
                     f"🥷 {interaction.user.mention} stole **{self.egg_count}** {egg_word} "
                     f"from <@{self.owner_id}>!"
                 ),
-                embed=None,
-                view=None,
             )
         else:
             self.steal_failed.add(interaction.user.id)
-            await interaction.response.send_message(
-                "🥷 Steal **failed**! You can't try again on this drop — "
-                "the finder can still claim, and other members can still attempt a steal.",
-                ephemeral=True,
-            )
+            try:
+                await interaction.response.send_message(
+                    "🥷 Steal **failed**! You can't try again on this drop — "
+                    "the finder can still claim, and other members can still attempt a steal.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
 
     async def on_timeout(self):
         if self.message is None:
@@ -1258,6 +1426,8 @@ class ConfirmRemoveView(discord.ui.View):
         if not duck:
             return await interaction.response.edit_message(content="That duck no longer exists.", view=None)
 
+        remove_duck_from_all_series(self.duck_id)
+
         affected = 0
         for rec in duck_users.values():
             if self.duck_id in rec.get("collection", []):
@@ -1325,30 +1495,40 @@ class ConfirmClearPoolView(discord.ui.View):
 
 
 class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
-    """One combined toggle, like /fav — each listed duck flips based on
-    ITS OWN current state independently, not a single batch direction.
-    Type 3 titles where 1 is already active and 2 aren't: the active one
-    deactivates, the two inactive ones activate, all in the same submit.
-    The optional Hours field only applies to ducks that go inactive→active
-    in this action; deactivating always clears any limited-time expiry.
+    """Duck titles toggle individually. Optional series name *activates*
+    every duck in that series (no limited timer). Need at least one of
+    titles or series name.
     """
     duck_titles = discord.ui.TextInput(
         label="Duck Title(s)",
         style=discord.TextStyle.paragraph,
-        placeholder="One per line, or comma-separated, e.g.\nGolden Duck\nIce Duck, Fire Duck",
+        required=False,
+        placeholder="One per line or comma-separated (optional if series set)",
         max_length=2000,
+    )
+    series_name = discord.ui.TextInput(
+        label="Series Name (optional)",
+        required=False,
+        max_length=100,
+        placeholder="Activates ALL ducks in this series (no limited time)",
     )
     hours = discord.ui.TextInput(
         label="Limited Hours (optional)",
         required=False,
         max_length=10,
-        placeholder="Leave blank for a normal, non-expiring activation",
+        placeholder="Only applies to individual duck activations above",
     )
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.duck_titles)
         titles = [t.strip() for line in raw.split("\n") for t in line.split(",")]
         titles = [t for t in titles if t]
+        series_raw = str(self.series_name).strip()
+
+        if not titles and not series_raw:
+            return await interaction.response.send_message(
+                "❌ Enter duck title(s) and/or a series name.", ephemeral=True
+            )
 
         hours_raw = str(self.hours).strip()
         hours_val = None
@@ -1378,7 +1558,26 @@ class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
                 duck["limited_until"] = time.time() + hours_val * 3600 if hours_val else None
                 activated.append(duck["title"])
 
-        if activated or deactivated:
+        series_activated = []
+        series_missing = None
+        if series_raw:
+            entry = duck_series.get(series_key(series_raw))
+            if not entry:
+                series_missing = series_raw
+            else:
+                for duck_id in list(entry.get("duck_ids") or []):
+                    duck = duck_index.get(duck_id)
+                    if not duck:
+                        continue
+                    if not duck.get("active"):
+                        duck["active"] = True
+                        duck["limited_until"] = None  # series activate = permanent for this action
+                        series_activated.append(duck["title"])
+                    else:
+                        # Already active — clear limited timer so series means "fully on"
+                        duck["limited_until"] = None
+
+        if activated or deactivated or series_activated:
             await save_duck_state()
 
         lines = []
@@ -1387,9 +1586,84 @@ class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
             lines.append(f"✅ Activated{suffix}: " + ", ".join(activated))
         if deactivated:
             lines.append("⛔ Deactivated: " + ", ".join(deactivated))
+        if series_activated:
+            lines.append(
+                f"✅ Series **{entry['name']}** activated: " + ", ".join(series_activated)
+            )
+        elif series_raw and entry and not series_activated:
+            lines.append(
+                f"✅ Series **{entry['name']}** — all members already active "
+                f"(limited timers cleared)."
+            )
+        if series_missing:
+            lines.append(f"⚠️ Series not found: **{series_missing}**")
         if missing:
             lines.append("⚠️ Not found in the index: " + ", ".join(missing))
         await interaction.response.send_message("\n".join(lines) or "Nothing to do.", ephemeral=True)
+
+
+class SeriesToggleModal(discord.ui.Modal, title="Manage Series"):
+    """Toggle listed ducks into/out of a series (same name = same series)."""
+    series_name = discord.ui.TextInput(
+        label="Series Name",
+        max_length=100,
+        placeholder="e.g. Sep 2026",
+    )
+    duck_titles = discord.ui.TextInput(
+        label="Duck Title(s)",
+        style=discord.TextStyle.paragraph,
+        placeholder="One per line or comma-separated — already in series = remove",
+        max_length=2000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = str(self.series_name).strip()
+        if not name:
+            return await interaction.response.send_message(
+                "❌ Series name cannot be empty.", ephemeral=True
+            )
+
+        raw = str(self.duck_titles)
+        titles = [t.strip() for line in raw.split("\n") for t in line.split(",")]
+        titles = [t for t in titles if t]
+        if not titles:
+            return await interaction.response.send_message(
+                "❌ List at least one duck title.", ephemeral=True
+            )
+
+        added, removed, missing = [], [], []
+        series_deleted = False
+        for title in titles:
+            duck_id = slugify(title)
+            duck = duck_index.get(duck_id)
+            if not duck:
+                missing.append(title)
+                continue
+            result = toggle_duck_in_series(name, duck_id)
+            if result == "added":
+                added.append(duck["title"])
+            elif result == "removed":
+                removed.append(duck["title"])
+            elif result == "removed_series":
+                removed.append(duck["title"])
+                series_deleted = True
+
+        await save_duck_state()
+
+        display = duck_series.get(series_key(name), {}).get("name", name)
+        lines = [f"**Series: {display}**"]
+        if added:
+            lines.append("✅ Added: " + ", ".join(added))
+        if removed:
+            lines.append("➖ Removed: " + ", ".join(removed))
+        if series_deleted:
+            lines.append("-# Series is now empty and was removed.")
+        elif series_key(name) in duck_series:
+            n = len(duck_series[series_key(name)].get("duck_ids") or [])
+            lines.append(f"-# Now has **{n}** duck(s).")
+        if missing:
+            lines.append("⚠️ Not found: " + ", ".join(missing))
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 class ErrorToggleModal(discord.ui.Modal, title="Toggle ERROR:404 Status"):
@@ -2279,47 +2553,232 @@ class RedeemModal(discord.ui.Modal, title="Redeem a Code"):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-class CollectionFilterView(discord.ui.View):
-    """Attached to /collection — lets anyone viewing it filter the embed
-    down to one rarity, with 'View All' as the default. Purely a display
-    toggle, so it's open to anyone, not just the person who ran the command.
-    """
+
+class CollectionBrowserView(discord.ui.View):
+    """/collection V2 — home summary, paged full collection, series, rarities."""
 
     def __init__(self, target_id: int, target_display_name: str, color: discord.Color):
         super().__init__(timeout=300)
         self.target_id = target_id
         self.target_display_name = target_display_name
         self.color = color
+        self.mode = "home"  # home | collection | series
+        self.series_key_name: str | None = None
+        self.rarity: str | None = None
+        self.page = 0
+        self._rebuild_items()
 
-        options = [discord.SelectOption(label="View All", value="_all", emoji="🦆", default=True)]
-        options += [discord.SelectOption(label=rarity_header(r), value=r) for r in RARITY_ORDER]
-        # Error filter only if this collection owns at least one ERROR:404 duck
-        owned = get_user_record(str(target_id)).get("collection", [])
-        if any(duck_index.get(d, {}).get("is_error") for d in owned):
-            options.append(
-                discord.SelectOption(label="ERROR", value="error", emoji="🚫")
-            )
-        select = discord.ui.Select(placeholder="Filter by rarity", options=options)
-        select.callback = self.on_select
-        self.add_item(select)
+    def _rec(self):
+        return get_user_record(str(self.target_id))
 
-    async def on_select(self, interaction: discord.Interaction):
-        choice = interaction.data["values"][0]
-        discord_id = str(self.target_id)
-        rec = get_user_record(discord_id)
-        owned = rec["collection"]
+    def _owned(self):
+        return self._rec().get("collection", [])
 
-        content = build_collection_body(owned, rec.get("favorites", []), choice)
-        embed = discord.Embed(description=content, color=self.color)
-        embed.set_footer(text=f"🎒 {self.target_display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed")
+    def _series_list(self):
+        return owned_series_keys(self._owned())
 
-        # Reflect the current choice as the visibly-selected option next time.
-        for item in self.children:
-            if isinstance(item, discord.ui.Select):
-                for opt in item.options:
-                    opt.default = (opt.value == choice)
+    def _filtered_ids(self):
+        return filter_owned_ids(
+            self._owned(),
+            series_key_name=self.series_key_name if self.mode == "series" else None,
+            rarity=self.rarity,
+        )
 
-        await interaction.response.edit_message(embed=embed, view=self)
+    def _page_count(self, n: int) -> int:
+        return max(1, (n + COLLECTION_PAGE_SIZE - 1) // COLLECTION_PAGE_SIZE)
+
+    def build_embed(self) -> discord.Embed:
+        owned = self._owned()
+        rec = self._rec()
+        favs = rec.get("favorites", [])
+        if self.mode == "home":
+            return build_collection_home_embed(owned, favs, self.target_display_name, self.color)
+
+        ids = self._filtered_ids()
+        if self.mode == "series" and self.series_key_name:
+            entry = duck_series.get(self.series_key_name) or {}
+            sname = entry.get("name") or self.series_key_name
+            series_ids = [d for d in (entry.get("duck_ids") or []) if d in duck_index]
+            owned_in = len([d for d in series_ids if d in owned])
+            header = f"**{sname}**"
+            if self.rarity == "error":
+                header += " · ERROR"
+            elif self.rarity:
+                header += f" · {RARITY_DISPLAY.get(self.rarity, self.rarity)}"
+            footer = f"🎒 {self.target_display_name} · {sname} {owned_in}/{len(series_ids)}"
+        else:
+            header = None
+            if self.rarity == "error":
+                header = "**ERROR**"
+            elif self.rarity:
+                header = f"**{RARITY_DISPLAY.get(self.rarity, self.rarity)}**"
+            footer = f"🎒 {self.target_display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed"
+
+        return build_collection_page_embed(
+            ids,
+            page=self.page,
+            display_name=self.target_display_name,
+            color=self.color,
+            header=header,
+            footer=footer,
+        )
+
+    def _rebuild_items(self):
+        self.clear_items()
+
+        home_btn = discord.ui.Button(style=discord.ButtonStyle.success, emoji="🏠", custom_id="col_home")
+        prev_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="◀", custom_id="col_prev")
+        next_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="▶", custom_id="col_next")
+
+        # Enable/disable arrows
+        if self.mode == "home":
+            prev_btn.disabled = True
+            next_btn.disabled = len(self._owned()) == 0
+        elif self.mode == "collection":
+            ids = self._filtered_ids()
+            pages = self._page_count(len(ids))
+            prev_btn.disabled = self.page <= 0
+            next_btn.disabled = self.page >= pages - 1
+        else:  # series
+            ids = self._filtered_ids()
+            pages = self._page_count(len(ids))
+            series_keys = self._series_list()
+            idx = series_keys.index(self.series_key_name) if self.series_key_name in series_keys else 0
+            prev_btn.disabled = self.page <= 0 and idx <= 0
+            next_btn.disabled = self.page >= pages - 1 and idx >= len(series_keys) - 1
+
+        home_btn.callback = self.on_home
+        prev_btn.callback = self.on_prev
+        next_btn.callback = self.on_next
+        self.add_item(home_btn)
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+        # Series select — only series with owned ducks, newest first (max 25)
+        series_keys = self._series_list()[:25]
+        if series_keys:
+            s_opts = []
+            for key in series_keys:
+                entry = duck_series.get(key) or {}
+                label = (entry.get("name") or key)[:100]
+                s_opts.append(discord.SelectOption(
+                    label=label,
+                    value=f"series:{key}",
+                    default=(self.mode == "series" and self.series_key_name == key),
+                ))
+            s_select = discord.ui.Select(placeholder="Series", options=s_opts, custom_id="col_series")
+            s_select.callback = self.on_series
+            self.add_item(s_select)
+
+        # Rarities — hidden on home
+        if self.mode != "home":
+            r_opts = [
+                discord.SelectOption(
+                    label="All rarities",
+                    value="rarity:_all",
+                    default=(self.rarity is None),
+                )
+            ]
+            for r in RARITY_ORDER:
+                r_opts.append(discord.SelectOption(
+                    label=RARITY_DISPLAY[r],
+                    value=f"rarity:{r}",
+                    emoji=RARITY_SUMMARY_ICONS.get(r),
+                    default=(self.rarity == r),
+                ))
+            owned = self._owned()
+            if any(duck_index.get(d, {}).get("is_error") for d in owned):
+                r_opts.append(discord.SelectOption(
+                    label="ERROR",
+                    value="rarity:error",
+                    emoji="💢",
+                    default=(self.rarity == "error"),
+                ))
+            r_select = discord.ui.Select(placeholder="Rarities", options=r_opts, custom_id="col_rarity")
+            r_select.callback = self.on_rarity
+            self.add_item(r_select)
+
+    async def _edit(self, interaction: discord.Interaction):
+        self._rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_home(self, interaction: discord.Interaction):
+        self.mode = "home"
+        self.series_key_name = None
+        self.rarity = None
+        self.page = 0
+        await self._edit(interaction)
+
+    async def on_prev(self, interaction: discord.Interaction):
+        if self.mode == "home":
+            return await interaction.response.defer()
+        if self.mode == "collection":
+            if self.page > 0:
+                self.page -= 1
+            await self._edit(interaction)
+            return
+        # series: prev page, or previous series
+        if self.page > 0:
+            self.page -= 1
+        else:
+            keys = self._series_list()
+            if self.series_key_name in keys:
+                idx = keys.index(self.series_key_name)
+                if idx > 0:
+                    self.series_key_name = keys[idx - 1]
+                    self.page = 0
+                    # optional: jump to last page of previous series
+                    n = len(self._filtered_ids())
+                    self.page = max(0, self._page_count(n) - 1)
+        await self._edit(interaction)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if self.mode == "home":
+            self.mode = "collection"
+            self.series_key_name = None
+            self.rarity = None
+            self.page = 0
+            await self._edit(interaction)
+            return
+        if self.mode == "collection":
+            ids = self._filtered_ids()
+            pages = self._page_count(len(ids))
+            if self.page < pages - 1:
+                self.page += 1
+            await self._edit(interaction)
+            return
+        # series
+        ids = self._filtered_ids()
+        pages = self._page_count(len(ids))
+        if self.page < pages - 1:
+            self.page += 1
+        else:
+            keys = self._series_list()
+            if self.series_key_name in keys:
+                idx = keys.index(self.series_key_name)
+                if idx < len(keys) - 1:
+                    self.series_key_name = keys[idx + 1]
+                    self.page = 0
+        await self._edit(interaction)
+
+    async def on_series(self, interaction: discord.Interaction):
+        val = interaction.data["values"][0]
+        key = val.split(":", 1)[1]
+        self.mode = "series"
+        self.series_key_name = key
+        self.page = 0
+        # keep rarity filter if any
+        await self._edit(interaction)
+
+    async def on_rarity(self, interaction: discord.Interaction):
+        val = interaction.data["values"][0]
+        choice = val.split(":", 1)[1]
+        self.rarity = None if choice == "_all" else choice
+        self.page = 0
+        if self.mode == "home":
+            self.mode = "collection"
+        await self._edit(interaction)
+
 
 
 def format_role_reward_line(guild: discord.Guild | None, role_id: str, reward: dict) -> str:
@@ -2810,6 +3269,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Edit Duck Emoji", value="edit", emoji="✏️"),
             discord.SelectOption(label="Remove Duck", value="remove", emoji="🗑️"),
             discord.SelectOption(label="Toggle Duck Activation", value="toggle_active", emoji="🔁"),
+            discord.SelectOption(label="Manage Series", value="series", emoji="📚"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
             discord.SelectOption(label="Channel Setter", value="channels", emoji="📡"),
@@ -2840,6 +3300,8 @@ class EditorView(discord.ui.View):
             await interaction.response.send_modal(DuckRemoveModal())
         elif choice == "toggle_active":
             await interaction.response.send_modal(DuckToggleActiveModal())
+        elif choice == "series":
+            await interaction.response.send_modal(SeriesToggleModal())
         elif choice == "clear_pool":
             await interaction.response.send_message(
                 "Deactivate every currently active duck? They stay in the index, just leave the earnable pool.",
@@ -3263,6 +3725,40 @@ class DuckCog(commands.Cog):
             view=EditorView(),
             ephemeral=True,
         )
+
+    @app_commands.command(name="series", description="Staff: list series and their ducks.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def series_cmd(self, interaction: discord.Interaction):
+        if not duck_series:
+            return await interaction.response.send_message(
+                "No series defined yet. Use `/editor` → **Manage Series**.",
+                ephemeral=True,
+            )
+
+        lines = []
+        for key in sorted(duck_series.keys(), key=lambda k: (duck_series[k].get("name") or k).casefold()):
+            entry = duck_series[key]
+            name = entry.get("name") or key
+            ids = [d for d in (entry.get("duck_ids") or []) if d in duck_index]
+            if not ids:
+                lines.append(f"**{name}** — empty")
+                continue
+            emojis = " ".join(duck_index[d]["emoji"] for d in ids)
+            titles = ", ".join(duck_index[d]["title"] for d in ids)
+            lines.append(f"**{name}** · {len(ids)}\n{emojis}\n-# {titles}")
+
+        # Stay under embed limits by splitting if needed
+        text = "\n\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3900] + "\n-# …truncated for length. Use Manage Series to inspect."
+
+        embed = discord.Embed(
+            title="📚 Duck Series",
+            description=text,
+            color=discord.Color.teal(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---------- staff only, hidden from everyone else: ERROR:404 ----------
     # default_permissions restricts this command's visibility in the slash
@@ -3976,16 +4472,9 @@ class DuckCog(commands.Cog):
     @app_commands.describe(member="Whose collection to view")
     async def collection_cmd(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
-        discord_id = str(target.id)
-        rec = get_user_record(discord_id)
-
-        content = build_collection_body(rec["collection"], rec.get("favorites", []))
         role_color = target.color if target.color.value != 0 else discord.Color.teal()
-        embed = discord.Embed(description=content, color=role_color)
-        embed.set_footer(text=f"🎒 {target.display_name}'s Collection - {len(rec['collection'])}/{len(duck_index)} indexed")
-
-        view = CollectionFilterView(target.id, target.display_name, role_color)
-        await interaction.response.send_message(embed=embed, view=view)
+        view = CollectionBrowserView(target.id, target.display_name, role_color)
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
 
     @app_commands.command(name="fav", description="Favorite or unfavorite a duck from your collection.")
     @app_commands.describe(duck="Start typing — only ducks you own will show up")
@@ -4011,6 +4500,13 @@ class DuckCog(commands.Cog):
             await save_duck_state()
             return await interaction.response.send_message(
                 f"💔 Removed {duck_emoji} **{duck_title}** from your favorites.", ephemeral=True
+            )
+
+        if len(favorites) >= MAX_FAVORITES:
+            return await interaction.response.send_message(
+                "Oops, there are too many ducks in this pond. You will have to remove some "
+                "from your favorites in order to make room.",
+                ephemeral=True,
             )
 
         favorites.append(duck_id)
@@ -4114,7 +4610,7 @@ class DuckCog(commands.Cog):
         lines = [f"🥚 Opened {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
             bonus = f" · 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
-            err_mark = " ✨" if duck_index.get(duck_id, {}).get("is_error") else ""
+            err_mark = " 💢" if duck_index.get(duck_id, {}).get("is_error") else ""
             entry = (
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
                 f"{RARITY_DISPLAY[g['rarity']]}{err_mark}{bonus}"
