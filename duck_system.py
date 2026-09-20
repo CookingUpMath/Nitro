@@ -1046,7 +1046,8 @@ def format_grouped_plain(active_ids, owned_ids: set | None = None) -> str:
         ids = grouped_ids[r]
         if not ids:
             continue
-        lines.append(f"**{rarity_header(r)}**")
+        icon = RARITY_SUMMARY_ICONS.get(r, "🦆")
+        lines.append(f"**`{icon}` {rarity_header(r)}**")
         for duck_id in ids:
             duck = duck_index[duck_id]
             entry = f"{duck['emoji']} {duck['title']}"
@@ -4454,7 +4455,7 @@ class DuckCog(commands.Cog):
         active_ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
         owned_ids = set(get_user_record(str(interaction.user.id)).get("collection", []))
         content = format_grouped_plain(active_ids, owned_ids) or "The pool is currently empty."
-        embed = discord.Embed(title="🥚 Current Hatch Pool", description=content, color=discord.Color.gold())
+        embed = discord.Embed(description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="index", description="View every duck that has ever been added.")
