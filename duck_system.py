@@ -2702,8 +2702,25 @@ class CollectionBrowserView(discord.ui.View):
             self.add_item(r_select)
 
     async def _edit(self, interaction: discord.Interaction):
+        """Defer first so slow embed/view rebuilds don't hit Unknown Interaction."""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except discord.HTTPException:
+            return
+
         self._rebuild_items()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        embed = self.build_embed()
+        # Embed hard limit 4096 — trim rather than fail the whole click
+        if embed.description and len(embed.description) > 4096:
+            embed.description = embed.description[:4000] + "\n-# …truncated"
+
+        try:
+            await interaction.edit_original_response(embed=embed, view=self)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"[collection] edit failed: {e}")
 
     async def on_home(self, interaction: discord.Interaction):
         self.mode = "home"
@@ -2714,7 +2731,11 @@ class CollectionBrowserView(discord.ui.View):
 
     async def on_prev(self, interaction: discord.Interaction):
         if self.mode == "home":
-            return await interaction.response.defer()
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
         if self.mode == "collection":
             if self.page > 0:
                 self.page -= 1
@@ -2729,8 +2750,6 @@ class CollectionBrowserView(discord.ui.View):
                 idx = keys.index(self.series_key_name)
                 if idx > 0:
                     self.series_key_name = keys[idx - 1]
-                    self.page = 0
-                    # optional: jump to last page of previous series
                     n = len(self._filtered_ids())
                     self.page = max(0, self._page_count(n) - 1)
         await self._edit(interaction)
@@ -2770,7 +2789,6 @@ class CollectionBrowserView(discord.ui.View):
         self.mode = "series"
         self.series_key_name = key
         self.page = 0
-        # keep rarity filter if any
         await self._edit(interaction)
 
     async def on_rarity(self, interaction: discord.Interaction):
