@@ -197,18 +197,35 @@ AIR_DROP_IMAGE_URL = (
     "1548518103674265610/Egg_drop.png"
     "?ex=6aa7595d&is=6aa607dd&hm=11bb1f1bf260dd16e22a22aa251c076bc24653bd4fdb7355a137c96710e35600&"
 )
-AIR_DROP_MIN_INTERVAL = 30 * 60       # 30 minutes
-AIR_DROP_MAX_INTERVAL = 3 * 60 * 60   # 3 hours
+# Quiet tier (default when chat is cold)
+AIR_DROP_QUIET_MIN = 1 * 60 * 60      # 1 hour
+AIR_DROP_QUIET_MAX = 3 * 60 * 60      # 3 hours
+# Warm tier
+AIR_DROP_WARM_MIN = 30 * 60           # 30 minutes
+AIR_DROP_WARM_MAX = 1 * 60 * 60       # 1 hour
+# Hot tier
+AIR_DROP_HOT_MIN = 10 * 60            # 10 minutes
+AIR_DROP_HOT_MAX = 30 * 60            # 30 minutes
+AIR_DROP_HEAT_WINDOW = 15 * 60        # look back 15 minutes
+AIR_DROP_WARM_MSGS = 3
+AIR_DROP_WARM_USERS = 2
+AIR_DROP_HOT_MSGS = 4
+AIR_DROP_HOT_USERS = 3
 AIR_DROP_EXPIRY_SECONDS = 30 * 60     # unclaimed drops expire
 AIR_DROP_TARGET_MIN = 3
 AIR_DROP_TARGET_MAX = 5
 AIR_DROP_EGGS_MIN = 5
 AIR_DROP_EGGS_MAX = 30
+# Winner slots per drop: 1 / 2 / 3
+AIR_DROP_SLOT_WEIGHTS = [(1, 50), (2, 35), (3, 15)]
 # Unicode-only emojis for reaction air drops (no custom server emojis)
 AIR_DROP_REACTION_EMOJIS = [
     "🥚", "🎯", "🪂", "🦆", "⭐", "🔥", "💫", "🎉", "🍀", "💎",
     "⚡", "🌟", "🎁", "🏆", "✨", "🎈", "🔔", "🌙", "☀️", "🌈",
 ]
+# Back-compat aliases used by older comments / any stragglers
+AIR_DROP_MIN_INTERVAL = AIR_DROP_QUIET_MIN
+AIR_DROP_MAX_INTERVAL = AIR_DROP_QUIET_MAX
 
 # duck_stats = {"total_dropped": int}  — global count of eggs that have
 # ever spawned in the pond (i.e. successful passive-chat drops).
@@ -634,21 +651,68 @@ def get_air_drop_state(guild_id: str) -> dict:
             "next_drop_at": None,
             "last_activity_at": None,
             "last_drop_ended_at": None,
+            "heat_events": [],
         },
     )
     state.setdefault("active", None)
     state.setdefault("next_drop_at", None)
     state.setdefault("last_activity_at", None)
     state.setdefault("last_drop_ended_at", None)
+    state.setdefault("heat_events", [])
     return state
 
 
+def prune_air_drop_heat(guild_id: str, now: float | None = None) -> list:
+    """Drop heat events older than the window. Returns remaining events."""
+    now = now if now is not None else time.time()
+    state = get_air_drop_state(guild_id)
+    cutoff = now - AIR_DROP_HEAT_WINDOW
+    events = [e for e in state.get("heat_events") or [] if float(e.get("ts", 0)) >= cutoff]
+    state["heat_events"] = events
+    return events
+
+
+def record_air_drop_heat(guild_id: str, user_id: str) -> None:
+    """Log a qualifying message toward heat (air-drop channel only)."""
+    now = time.time()
+    state = get_air_drop_state(guild_id)
+    events = state.setdefault("heat_events", [])
+    events.append({"ts": now, "uid": str(user_id)})
+    prune_air_drop_heat(guild_id, now)
+
+
+def measure_air_drop_heat(guild_id: str) -> str:
+    """Return 'hot' | 'warm' | 'quiet' from recent qualifying chat."""
+    events = prune_air_drop_heat(guild_id)
+    if not events:
+        return "quiet"
+    msgs = len(events)
+    users = len({e.get("uid") for e in events if e.get("uid")})
+    if msgs >= AIR_DROP_HOT_MSGS and users >= AIR_DROP_HOT_USERS:
+        return "hot"
+    if msgs >= AIR_DROP_WARM_MSGS and users >= AIR_DROP_WARM_USERS:
+        return "warm"
+    return "quiet"
+
+
 def schedule_next_air_drop(guild_id: str) -> float:
-    """Set next_drop_at to now + random 30m–3h. Returns that timestamp."""
-    delay = random.randint(AIR_DROP_MIN_INTERVAL, AIR_DROP_MAX_INTERVAL)
+    """Set next_drop_at from current chat heat. Returns that timestamp."""
+    tier = measure_air_drop_heat(guild_id)
+    if tier == "hot":
+        delay = random.randint(AIR_DROP_HOT_MIN, AIR_DROP_HOT_MAX)
+    elif tier == "warm":
+        delay = random.randint(AIR_DROP_WARM_MIN, AIR_DROP_WARM_MAX)
+    else:
+        delay = random.randint(AIR_DROP_QUIET_MIN, AIR_DROP_QUIET_MAX)
     when = time.time() + delay
     get_air_drop_state(guild_id)["next_drop_at"] = when
     return when
+
+
+def roll_air_drop_slots() -> int:
+    slots = [s for s, _ in AIR_DROP_SLOT_WEIGHTS]
+    weights = [w for _, w in AIR_DROP_SLOT_WEIGHTS]
+    return random.choices(slots, weights=weights, k=1)[0]
 
 
 def build_air_drop_announce_embed(
@@ -657,11 +721,25 @@ def build_air_drop_announce_embed(
     kind: str = "messages",
     target: int | None = None,
     emoji: str | None = None,
+    slots: int = 1,
 ) -> discord.Embed:
+    slots = max(1, int(slots))
     if kind == "reaction":
-        body = f"First person to react {emoji} to this post gets **{eggs}** eggs!"
+        if slots == 1:
+            body = f"First person to react {emoji} to this post gets **{eggs}** eggs!"
+        else:
+            body = (
+                f"First **{slots}** people to react {emoji} to this post "
+                f"get **{eggs}** eggs each!"
+            )
     else:
-        body = f"First person to send **{target}** messages gets **{eggs}** eggs!"
+        if slots == 1:
+            body = f"First person to send **{target}** messages gets **{eggs}** eggs!"
+        else:
+            body = (
+                f"First **{slots}** people to send **{target}** messages "
+                f"get **{eggs}** eggs each!"
+            )
     embed = discord.Embed(
         description=f"# 🎯 Egg Drop\n{body}",
         color=0xC4A35A,
@@ -670,28 +748,56 @@ def build_air_drop_announce_embed(
     return embed
 
 
-def build_air_drop_claim_embed(mention: str, inventory: int) -> discord.Embed:
-    embed = discord.Embed(
-        description=(
+def build_air_drop_claim_embed(
+    mention: str,
+    inventory: int,
+    *,
+    slots: int = 1,
+    winners_so_far: int = 1,
+) -> discord.Embed:
+    if slots > 1:
+        desc = (
+            f"## 🧺 {mention} claimed a slot!\n"
+            f"-# You now have **{inventory}** eggs in your inventory.\n"
+            f"-# Winners **{winners_so_far}/{slots}**"
+        )
+    else:
+        desc = (
             f"## 🧺 {mention} claimed the drop!\n"
             f"-# You now have **{inventory}** eggs in your inventory."
-        ),
-        color=discord.Color.green(),
-    )
+        )
+    embed = discord.Embed(description=desc, color=discord.Color.green())
     return embed
 
 
 def build_air_drop_expired_embed(active: dict) -> discord.Embed:
     eggs = active.get("eggs", "?")
+    slots = int(active.get("slots") or 1)
+    winners = active.get("winners") or []
     if active.get("kind") == "reaction":
-        line = f"~~First person to react {active.get('emoji', '❓')} to this post gets **{eggs}** eggs!~~"
+        if slots == 1:
+            line = f"~~First person to react {active.get('emoji', '❓')} to this post gets **{eggs}** eggs!~~"
+        else:
+            line = (
+                f"~~First **{slots}** people to react {active.get('emoji', '❓')} "
+                f"get **{eggs}** eggs each!~~"
+            )
     else:
-        line = (
-            f"~~First person to send **{active.get('target', '?')}** messages "
-            f"gets **{eggs}** eggs!~~"
-        )
+        if slots == 1:
+            line = (
+                f"~~First person to send **{active.get('target', '?')}** messages "
+                f"gets **{eggs}** eggs!~~"
+            )
+        else:
+            line = (
+                f"~~First **{slots}** people to send **{active.get('target', '?')}** messages "
+                f"get **{eggs}** eggs each!~~"
+            )
+    extra = ""
+    if winners:
+        extra = f"\n-# Claimed by {len(winners)}/{slots} before it floated away."
     embed = discord.Embed(
-        description=f"# 🎯 Egg Drop — Expired\n{line}\n**This drop expired unclaimed.**",
+        description=f"# 🎯 Egg Drop — Expired\n{line}\n**This drop expired.**{extra}",
         color=0x555555,
     )
     embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
@@ -1011,19 +1117,48 @@ def build_collection_page_embed(
 
 
 def format_grouped_row(grouped) -> str:
-    """Large-emoji, emoji-only style, but all ducks in a rarity tier share
-    ONE '#' line instead of one line each — compresses the display
-    horizontally. Used by /index.
-    """
+    """Large-emoji rows by rarity for /index. One '# ' line per tier."""
     lines = []
     for r in RARITY_ORDER:
         ducks = grouped.get(r, [])
         if not ducks:
             continue
-        lines.append(f"-# {rarity_header(r)}")
+        icon = RARITY_SUMMARY_ICONS.get(r, "🦆")
+        lines.append(f"**`{icon}` {rarity_header(r)}**")
         lines.append("# " + " ".join(duck["emoji"] for duck in ducks))
-        lines.append("")
     return "\n".join(lines).strip()
+
+
+def all_series_member_ids() -> set:
+    ids: set = set()
+    for entry in duck_series.values():
+        for d in entry.get("duck_ids") or []:
+            ids.add(d)
+    return ids
+
+
+def index_series_keys_newest_first() -> list[str]:
+    scored = [
+        (float(entry.get("created_at") or 0), key)
+        for key, entry in duck_series.items()
+    ]
+    scored.sort(key=lambda t: -t[0])
+    return [k for _, k in scored]
+
+
+def index_filter_ids(ids: list, activity: str) -> list:
+    """activity: all | active | inactive"""
+    out = []
+    for duck_id in ids:
+        duck = duck_index.get(duck_id)
+        if not duck:
+            continue
+        if activity == "active" and not duck.get("active"):
+            continue
+        if activity == "inactive" and duck.get("active"):
+            continue
+        out.append(duck_id)
+    return out
 
 
 def format_grouped_plain(active_ids, owned_ids: set | None = None) -> str:
@@ -2346,33 +2481,133 @@ class IntroChannelSelectView(discord.ui.View):
         )
 
 
-class IndexView(discord.ui.View):
-    """Lets anyone pick Currently Earnable vs Not Currently Active instead
-    of cramming both into one big embed.
-    """
+class IndexBrowserView(discord.ui.View):
+    """Staff /index — unsorted sorting tray + series album + active/inactive filter."""
 
     def __init__(self):
-        super().__init__(timeout=180)
-        options = [
-            discord.SelectOption(label="Currently Earnable", value="active", emoji="✅"),
-            discord.SelectOption(label="Not Currently Active", value="inactive", emoji="⛔"),
-        ]
-        select = discord.ui.Select(placeholder="Choose a category to view", options=options)
-        select.callback = self.on_select
-        self.add_item(select)
+        super().__init__(timeout=300)
+        self.page_key = "unsorted"  # or series key
+        self.activity = "all"  # all | active | inactive
+        self._rebuild_items()
 
-    async def on_select(self, interaction: discord.Interaction):
-        choice = interaction.data["values"][0]
-        if choice == "active":
-            ids = [d for d, v in duck_index.items() if v["active"] and not v.get("is_error")]
-            title = "📖 Duck Index — Currently Earnable"
+    def _album_keys(self) -> list[str]:
+        return ["unsorted"] + index_series_keys_newest_first()
+
+    def _current_ids(self) -> list:
+        if self.page_key == "unsorted":
+            in_series = all_series_member_ids()
+            ids = [d for d in duck_index.keys() if d not in in_series]
         else:
-            ids = [d for d, v in duck_index.items() if not v["active"] and not v.get("is_error")]
-            title = "📖 Duck Index — Not Currently Active"
+            entry = duck_series.get(self.page_key) or {}
+            ids = [d for d in (entry.get("duck_ids") or []) if d in duck_index]
+        return index_filter_ids(ids, self.activity)
 
-        content = format_grouped_row(group_by_rarity(ids)) or "Nothing in this category."
-        embed = discord.Embed(title=title, description=content, color=discord.Color.blurple())
-        await interaction.response.edit_message(embed=embed, view=self)
+    def build_embed(self) -> discord.Embed:
+        ids = self._current_ids()
+        content = format_grouped_row(group_by_rarity(ids)) or "-# No ducks in this view."
+
+        if self.page_key == "unsorted":
+            header = "**Sorting tray** — ducks not in any series"
+        else:
+            entry = duck_series.get(self.page_key) or {}
+            header = f"**Series · {entry.get('name') or self.page_key}**"
+
+        act = {"all": "All", "active": "Active only", "inactive": "Inactive only"}[self.activity]
+        desc = f"{header}\n-# Filter: {act} · {len(ids)} duck(s)\n\n{content}"
+        if len(desc) > 4096:
+            desc = desc[:4000] + "\n-# …truncated"
+
+        embed = discord.Embed(description=desc, color=discord.Color.blurple())
+        embed.set_footer(text="📖 Index · staff")
+        return embed
+
+    def _rebuild_items(self):
+        self.clear_items()
+        keys = self._album_keys()
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+            self.page_key = "unsorted"
+
+        prev_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="◀", custom_id="idx_prev")
+        next_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="▶", custom_id="idx_next")
+        prev_btn.disabled = idx <= 0
+        next_btn.disabled = idx >= len(keys) - 1
+        prev_btn.callback = self.on_prev
+        next_btn.callback = self.on_next
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+        series_keys = index_series_keys_newest_first()[:24]
+        s_opts = [
+            discord.SelectOption(
+                label="Sorting tray (no series)",
+                value="unsorted",
+                default=(self.page_key == "unsorted"),
+            )
+        ]
+        for key in series_keys:
+            entry = duck_series.get(key) or {}
+            s_opts.append(discord.SelectOption(
+                label=(entry.get("name") or key)[:100],
+                value=key,
+                default=(self.page_key == key),
+            ))
+        s_select = discord.ui.Select(placeholder="Series", options=s_opts, custom_id="idx_series")
+        s_select.callback = self.on_series
+        self.add_item(s_select)
+
+        a_opts = [
+            discord.SelectOption(label="All (active + inactive)", value="all", default=(self.activity == "all")),
+            discord.SelectOption(label="Active only", value="active", default=(self.activity == "active")),
+            discord.SelectOption(label="Inactive only", value="inactive", default=(self.activity == "inactive")),
+        ]
+        a_select = discord.ui.Select(placeholder="Active / inactive filter", options=a_opts, custom_id="idx_activity")
+        a_select.callback = self.on_activity
+        self.add_item(a_select)
+
+    async def _edit(self, interaction: discord.Interaction):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except discord.HTTPException:
+            return
+        self._rebuild_items()
+        try:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"[index] edit failed: {e}")
+
+    async def on_prev(self, interaction: discord.Interaction):
+        keys = self._album_keys()
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+        if idx > 0:
+            self.page_key = keys[idx - 1]
+        await self._edit(interaction)
+
+    async def on_next(self, interaction: discord.Interaction):
+        keys = self._album_keys()
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+        if idx < len(keys) - 1:
+            self.page_key = keys[idx + 1]
+        await self._edit(interaction)
+
+    async def on_series(self, interaction: discord.Interaction):
+        self.page_key = interaction.data["values"][0]
+        await self._edit(interaction)
+
+    async def on_activity(self, interaction: discord.Interaction):
+        self.activity = interaction.data["values"][0]
+        await self._edit(interaction)
 
 
 class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
@@ -3274,7 +3509,7 @@ class AirDropChannelSelectView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"🪂 Air drop channel set to {channel.mention}.\n"
-                f"Drops every **30 min–3 hours** (when no active drop). "
+                f"Timing scales with chat heat (quiet **1–3h**, warm **30m–1h**, hot **10–30m**). "
                 f"Unclaimed drops expire after **30 minutes**.\n"
                 f"-# Use **Channel Setter → Toggle Air Drops** to pause them."
             ),
@@ -3493,20 +3728,20 @@ class DuckCog(commands.Cog):
         if state_changed:
             await save_duck_state()
 
-        # Track chat in the air-drop channel so new drops only fire after real activity.
-        # Persist at most every 2 minutes so restarts still see recent activity without
-        # writing the DB on every single message.
+        # Shared anti-spam gate for passive drops + air-drop challenge progress
+        qualifies = message_qualifies_for_egg_drop(message)
+
+        # Track air-drop channel activity + heat (qualifying messages only)
         air_ch = duck_config.get(guild_id, {}).get("air_drop_channel_id")
         if air_ch and message.channel.id == int(air_ch):
             st = get_air_drop_state(guild_id)
             now_act = time.time()
             prev = st.get("last_activity_at")
             st["last_activity_at"] = now_act
+            if qualifies:
+                record_air_drop_heat(guild_id, discord_id)
             if prev is None or (now_act - float(prev)) >= 120:
                 await save_duck_state()
-
-        # Shared anti-spam gate for passive drops + air-drop challenge progress
-        qualifies = message_qualifies_for_egg_drop(message)
 
         # --- Air drop challenge progress (same channel only, while a drop is active) ---
         if qualifies:
@@ -4030,24 +4265,47 @@ class DuckCog(commands.Cog):
         winner: discord.abc.User,
         active: dict,
     ):
-        """Award eggs, clear active drop, announce claim."""
+        """Award eggs for one winner slot. Clears the drop only when all slots are filled."""
         state = get_air_drop_state(guild_id)
         cur = state.get("active")
         if not cur or cur.get("message_id") != active.get("message_id"):
-            return  # already claimed / expired
+            return  # already finished / expired
 
-        eggs = int(active["eggs"])
         uid = str(winner.id)
+        winners = cur.setdefault("winners", [])
+        if uid in winners:
+            return  # already claimed a slot on this drop
+
+        slots = max(1, int(cur.get("slots") or 1))
+        if len(winners) >= slots:
+            return
+
+        # Claim slot before any await so concurrent finishers can't over-fill
+        winners.append(uid)
+        filled = len(winners)
+        if filled > slots:
+            winners.pop()
+            return
+
+        eggs = int(cur["eggs"])
         rec = get_user_record(uid)
         rec["inventory"] += eggs
-        state["active"] = None
-        state["last_drop_ended_at"] = time.time()
-        schedule_next_air_drop(guild_id)
+
+        if filled >= slots:
+            state["active"] = None
+            state["last_drop_ended_at"] = time.time()
+            schedule_next_air_drop(guild_id)
+
         await save_duck_state()
 
         try:
             await channel.send(
-                embed=build_air_drop_claim_embed(winner.mention, rec["inventory"])
+                embed=build_air_drop_claim_embed(
+                    winner.mention,
+                    rec["inventory"],
+                    slots=slots,
+                    winners_so_far=filled,
+                )
             )
         except Exception as e:
             print(f"[air_drop] claim announce failed: {e}")
@@ -4074,6 +4332,9 @@ class DuckCog(commands.Cog):
             return
 
         uid = str(message.author.id)
+        if uid in (active.get("winners") or []):
+            return  # already won a slot — don't farm another
+
         progress = active.setdefault("progress", {})
         progress[uid] = progress.get(uid, 0) + 1
         target = int(active["target"])
@@ -4085,7 +4346,7 @@ class DuckCog(commands.Cog):
         await self._complete_air_drop(guild_id, message.channel, message.author, active)
 
     async def _process_air_drop_reaction(self, payload: discord.RawReactionActionEvent):
-        """First correct emoji reaction claims a reaction-type air drop."""
+        """Correct emoji reaction claims one winner slot on a reaction-type air drop."""
         if payload.guild_id is None or payload.user_id == self.bot.user.id:
             return
         guild_id = str(payload.guild_id)
@@ -4102,10 +4363,13 @@ class DuckCog(commands.Cog):
         if int(active.get("channel_id", 0)) != payload.channel_id:
             return
 
-        # Unicode emoji only — payload.emoji.name is the character for standard emoji
         if payload.emoji.id is not None:
             return  # custom emoji
         if payload.emoji.name != active.get("emoji"):
+            return
+
+        uid = str(payload.user_id)
+        if uid in (active.get("winners") or []):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
@@ -4127,28 +4391,37 @@ class DuckCog(commands.Cog):
     async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
         eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
         kind = random.choice(["messages", "reaction"])
+        slots = roll_air_drop_slots()
 
         if kind == "reaction":
             emoji = random.choice(AIR_DROP_REACTION_EMOJIS)
-            embed = build_air_drop_announce_embed(eggs, kind="reaction", emoji=emoji)
+            embed = build_air_drop_announce_embed(
+                eggs, kind="reaction", emoji=emoji, slots=slots
+            )
             active = {
                 "kind": "reaction",
                 "channel_id": channel.id,
                 "message_id": None,
                 "emoji": emoji,
                 "eggs": eggs,
+                "slots": slots,
+                "winners": [],
                 "created_at": time.time(),
                 "progress": {},
             }
         else:
             target = random.randint(AIR_DROP_TARGET_MIN, AIR_DROP_TARGET_MAX)
-            embed = build_air_drop_announce_embed(eggs, kind="messages", target=target)
+            embed = build_air_drop_announce_embed(
+                eggs, kind="messages", target=target, slots=slots
+            )
             active = {
                 "kind": "messages",
                 "channel_id": channel.id,
                 "message_id": None,
                 "target": target,
                 "eggs": eggs,
+                "slots": slots,
+                "winners": [],
                 "created_at": time.time(),
                 "progress": {},
             }
@@ -4476,18 +4749,18 @@ class DuckCog(commands.Cog):
         embed = discord.Embed(description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="index", description="View every duck that has ever been added.")
+    @app_commands.command(name="index", description="Staff: browse ducks by series / sorting tray.")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     async def index_cmd(self, interaction: discord.Interaction):
         if not duck_index:
-            embed = discord.Embed(
-                title="📖 Duck Index", description="No ducks have been added yet.", color=discord.Color.blurple()
+            return await interaction.response.send_message(
+                "No ducks have been added yet.", ephemeral=True
             )
-            return await interaction.response.send_message(embed=embed)
-
-        embed = discord.Embed(
-            title="📖 Duck Index", description="Choose a category below to view.", color=discord.Color.blurple()
+        view = IndexBrowserView()
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
         )
-        await interaction.response.send_message(embed=embed, view=IndexView())
 
     @app_commands.command(name="collection", description="View your (or someone else's) duck collection.")
     @app_commands.describe(member="Whose collection to view")
