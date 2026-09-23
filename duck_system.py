@@ -1830,58 +1830,177 @@ class ErrorToggleModal(discord.ui.Modal, title="Toggle ERROR:404 Status"):
 
 
 class ErrorAdminView(discord.ui.View):
-    """Staff ERROR:404 browser — same active/inactive split as /index, plus toggle."""
+    """Server-owner ERROR zone — same tray/series browser as /index, ERROR ducks only."""
 
     def __init__(self):
-        super().__init__(timeout=180)
-        options = [
-            discord.SelectOption(label="Currently Earnable", value="active", emoji="✅"),
-            discord.SelectOption(label="Not Currently Active", value="inactive", emoji="⛔"),
-        ]
-        select = discord.ui.Select(placeholder="Choose a category to view", options=options)
-        select.callback = self.on_select
-        self.add_item(select)
+        super().__init__(timeout=300)
+        self.page_key = "unsorted"
+        self.activity = "all"
+        self._rebuild_items()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Nothing to see here.", ephemeral=True)
+        guild = interaction.guild
+        if guild is None or interaction.user.id != guild.owner_id:
+            await interaction.response.send_message("Server owner only.", ephemeral=True)
             return False
         return True
 
-    async def on_select(self, interaction: discord.Interaction):
-        choice = interaction.data["values"][0]
-        if choice == "active":
-            ducks = [
-                duck for duck in duck_index.values()
-                if duck.get("is_error") and duck.get("active")
+    def _album_keys(self) -> list[str]:
+        keys = []
+        for key in index_series_keys_newest_first():
+            entry = duck_series.get(key) or {}
+            if any(
+                duck_index.get(d, {}).get("is_error")
+                for d in (entry.get("duck_ids") or [])
+            ):
+                keys.append(key)
+        return ["unsorted"] + keys
+
+    def _current_ids(self) -> list:
+        if self.page_key == "unsorted":
+            in_series = all_series_member_ids()
+            ids = [
+                d for d, duck in duck_index.items()
+                if duck.get("is_error") and d not in in_series
             ]
-            title = "🚫 ERROR:404 — Currently Earnable"
         else:
-            ducks = [
-                duck for duck in duck_index.values()
-                if duck.get("is_error") and not duck.get("active")
+            entry = duck_series.get(self.page_key) or {}
+            ids = [
+                d for d in (entry.get("duck_ids") or [])
+                if duck_index.get(d, {}).get("is_error")
             ]
-            title = "🚫 ERROR:404 — Not Currently Active"
+        return index_filter_ids(ids, self.activity)
 
-        if ducks:
-            lines = [
-                f"{duck['emoji']} **{duck['title']}** — {RARITY_DISPLAY[duck['rarity']]} (Error)"
-                for duck in ducks
-            ]
-            content = "\n".join(lines)
+    def build_embed(self) -> discord.Embed:
+        ids = self._current_ids()
+        content = format_grouped_row(group_by_rarity(ids)) or "-# No ERROR ducks in this view."
+
+        if self.page_key == "unsorted":
+            header = "**ERROR tray** — error ducks not in any series"
         else:
-            content = "Nothing in this category."
+            entry = duck_series.get(self.page_key) or {}
+            header = f"**ERROR · Series · {entry.get('name') or self.page_key}**"
 
-        embed = discord.Embed(title=title, description=content, color=discord.Color.dark_red())
-        await interaction.response.edit_message(embed=embed, view=self)
+        act = {"all": "All", "active": "Active only", "inactive": "Inactive only"}[self.activity]
+        modes = []
+        if is_error_mode():
+            modes.append("⚠️ Error Mode ON")
+        if is_purge_mode():
+            modes.append("🚨 Purge Mode ON")
+        mode_line = " · ".join(modes) if modes else "Modes off"
 
-    @discord.ui.button(label="Toggle Error Status", style=discord.ButtonStyle.danger, emoji="🚫")
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        desc = f"{header}\n-# {mode_line} · Filter: {act} · {len(ids)} duck(s)\n\n{content}"
+        if len(desc) > 4096:
+            desc = desc[:4000] + "\n-# …truncated"
+
+        embed = discord.Embed(description=desc, color=discord.Color.dark_red())
+        embed.set_footer(text="🚫 ERROR zone · server owner")
+        return embed
+
+    def _rebuild_items(self):
+        self.clear_items()
+        keys = self._album_keys()
+        if self.page_key not in keys:
+            self.page_key = "unsorted"
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+
+        prev_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="◀")
+        next_btn = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="▶")
+        prev_btn.disabled = idx <= 0
+        next_btn.disabled = idx >= len(keys) - 1
+        prev_btn.callback = self.on_prev
+        next_btn.callback = self.on_next
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+        s_opts = [
+            discord.SelectOption(
+                label="ERROR tray (no series)",
+                value="unsorted",
+                default=(self.page_key == "unsorted"),
+            )
+        ]
+        for key in keys[1:24]:
+            entry = duck_series.get(key) or {}
+            s_opts.append(discord.SelectOption(
+                label=(entry.get("name") or key)[:100],
+                value=key,
+                default=(self.page_key == key),
+            ))
+        s_select = discord.ui.Select(placeholder="Series", options=s_opts)
+        s_select.callback = self.on_series
+        self.add_item(s_select)
+
+        a_opts = [
+            discord.SelectOption(label="All (active + inactive)", value="all", default=(self.activity == "all")),
+            discord.SelectOption(label="Active only", value="active", default=(self.activity == "active")),
+            discord.SelectOption(label="Inactive only", value="inactive", default=(self.activity == "inactive")),
+        ]
+        a_select = discord.ui.Select(placeholder="Active / inactive filter", options=a_opts)
+        a_select.callback = self.on_activity
+        self.add_item(a_select)
+
+        toggle_btn = discord.ui.Button(label="Toggle Error Status", style=discord.ButtonStyle.danger, emoji="🚫")
+        toggle_btn.callback = self.toggle
+        self.add_item(toggle_btn)
+
+        err_mode = discord.ui.Button(label="Error Mode", style=discord.ButtonStyle.secondary, emoji="⚠️")
+        err_mode.callback = self.toggle_error_mode
+        self.add_item(err_mode)
+
+        purge_mode = discord.ui.Button(label="Purge Mode", style=discord.ButtonStyle.danger, emoji="🚨")
+        purge_mode.callback = self.toggle_purge_mode
+        self.add_item(purge_mode)
+
+    async def _edit(self, interaction: discord.Interaction):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except discord.HTTPException:
+            return
+        self._rebuild_items()
+        try:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"[error_zone] edit failed: {e}")
+
+    async def on_prev(self, interaction: discord.Interaction):
+        keys = self._album_keys()
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+        if idx > 0:
+            self.page_key = keys[idx - 1]
+        await self._edit(interaction)
+
+    async def on_next(self, interaction: discord.Interaction):
+        keys = self._album_keys()
+        try:
+            idx = keys.index(self.page_key)
+        except ValueError:
+            idx = 0
+        if idx < len(keys) - 1:
+            self.page_key = keys[idx + 1]
+        await self._edit(interaction)
+
+    async def on_series(self, interaction: discord.Interaction):
+        self.page_key = interaction.data["values"][0]
+        await self._edit(interaction)
+
+    async def on_activity(self, interaction: discord.Interaction):
+        self.activity = interaction.data["values"][0]
+        await self._edit(interaction)
+
+    async def toggle(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ErrorToggleModal())
 
-    @discord.ui.button(label="Error Mode", style=discord.ButtonStyle.secondary, emoji="⚠️")
-    async def toggle_error_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Lock weather at max + boost ERROR weight, or restore normal daily weather."""
+    async def toggle_error_mode(self, interaction: discord.Interaction):
         environment_state.setdefault("error_mode", False)
         environment_state.setdefault("purge_mode", False)
         turning_on = not environment_state["error_mode"]
@@ -1902,7 +2021,6 @@ class ErrorAdminView(discord.ui.View):
             today_str = time.strftime("%Y-%m-%d", time.gmtime())
             environment_state["date"] = today_str
             if is_purge_mode():
-                # Purge still on — keep 15% drop, re-roll egg count only
                 environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
                 environment_state["egg_count"] = _roll_egg_count()
                 await save_duck_state()
@@ -1928,9 +2046,7 @@ class ErrorAdminView(discord.ui.View):
 
         await interaction.response.send_message(msg, ephemeral=True)
 
-    @discord.ui.button(label="Purge Mode", style=discord.ButtonStyle.danger, emoji="🚨")
-    async def toggle_purge_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """15% drop chance + Steal button on drops. Egg count is not forced."""
+    async def toggle_purge_mode(self, interaction: discord.Interaction):
         environment_state.setdefault("purge_mode", False)
         environment_state.setdefault("error_mode", False)
         turning_on = not environment_state["purge_mode"]
@@ -1938,7 +2054,6 @@ class ErrorAdminView(discord.ui.View):
 
         if turning_on:
             environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
-            # Do not change egg_count — leave today's (or error-mode's) value
             await save_duck_state()
             msg = (
                 "🚨 **Purge Mode ON**\n"
@@ -2496,10 +2611,16 @@ class IndexBrowserView(discord.ui.View):
     def _current_ids(self) -> list:
         if self.page_key == "unsorted":
             in_series = all_series_member_ids()
-            ids = [d for d in duck_index.keys() if d not in in_series]
+            ids = [
+                d for d in duck_index.keys()
+                if d not in in_series and not duck_index[d].get("is_error")
+            ]
         else:
             entry = duck_series.get(self.page_key) or {}
-            ids = [d for d in (entry.get("duck_ids") or []) if d in duck_index]
+            ids = [
+                d for d in (entry.get("duck_ids") or [])
+                if d in duck_index and not duck_index[d].get("is_error")
+            ]
         return index_filter_ids(ids, self.activity)
 
     def build_embed(self) -> discord.Embed:
@@ -4023,31 +4144,17 @@ class DuckCog(commands.Cog):
     # The one thing that can't be hidden: Discord always shows "X used
     # /error" as a channel system message, even for ephemeral responses.
 
-    @app_commands.command(name="error", description="Staff only.")
-    @app_commands.default_permissions(manage_guild=True)
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.command(name="error", description="Server owner: ERROR duck zone and modes.")
+    @app_commands.default_permissions(administrator=True)
     async def error_cmd(self, interaction: discord.Interaction):
-        any_error = any(d.get("is_error") for d in duck_index.values())
-        modes = []
-        if is_error_mode():
-            modes.append("⚠️ **Error Mode ON** — max drops + boosted ERROR odds")
-        else:
-            modes.append("Error Mode off")
-        if is_purge_mode():
-            modes.append("🚨 **Purge Mode ON** — 15% drops + Steal button")
-        else:
-            modes.append("Purge Mode off")
-        mode_line = " · ".join(modes)
-        if any_error:
-            description = f"{mode_line}\n\nChoose a category below to view."
-        else:
-            description = f"{mode_line}\n\nNo ERROR:404 ducks exist yet."
-        embed = discord.Embed(
-            title="🚫 ERROR:404",
-            description=description,
-            color=discord.Color.dark_red(),
+        if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+            return await interaction.response.send_message(
+                "Server owner only.", ephemeral=True
+            )
+        view = ErrorAdminView()
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
         )
-        await interaction.response.send_message(embed=embed, view=ErrorAdminView(), ephemeral=True)
 
     @app_commands.command(name="drop", description="Staff: force an air drop in the air-drop channel now.")
     @app_commands.default_permissions(manage_guild=True)
