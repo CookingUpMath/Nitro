@@ -24,6 +24,7 @@ import json
 import time
 import random
 import uuid
+import asyncio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -1356,6 +1357,7 @@ class EggDropView(discord.ui.View):
         self.treat_bonus = 0
         self.treat_uses = 0
         self.treat_pressers: set[int] = set()
+        self._public_edit_task: asyncio.Task | None = None
 
         if halloween:
             candy = discord.ui.Button(
@@ -1558,13 +1560,8 @@ class EggDropView(discord.ui.View):
         self.egg_count += amount
         await save_duck_state()
 
-        # Refresh public drop text anonymously
-        if self.message is not None:
-            try:
-                mention = f"<@{self.owner_id}>"
-                await self.message.edit(content=self.drop_content(mention), view=self)
-            except Exception as e:
-                print(f"[halloween] treat message edit failed: {e}")
+        # Batch public message edits — many treats in a short window → one PATCH
+        self._schedule_public_edit()
 
         try:
             await interaction.followup.send(
@@ -1574,6 +1571,25 @@ class EggDropView(discord.ui.View):
             )
         except discord.HTTPException:
             pass
+
+    def _schedule_public_edit(self) -> None:
+        """Debounce drop-message edits (~2.5s after the last treat)."""
+        if self._public_edit_task is not None and not self._public_edit_task.done():
+            self._public_edit_task.cancel()
+        self._public_edit_task = asyncio.create_task(self._flush_public_edit())
+
+    async def _flush_public_edit(self) -> None:
+        try:
+            await asyncio.sleep(2.5)
+        except asyncio.CancelledError:
+            return
+        if self.claimed or self.message is None:
+            return
+        try:
+            mention = f"<@{self.owner_id}>"
+            await self.message.edit(content=self.drop_content(mention), view=self)
+        except Exception as e:
+            print(f"[halloween] treat message edit failed: {e}")
 
     async def steal(self, interaction: discord.Interaction):
         """Purge Mode only — 50/50 steal attempt by a non-owner."""
