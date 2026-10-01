@@ -611,6 +611,9 @@ async def load_duck_state():
         print(f"[duck_db] load failed: {e}")
 
 
+_debounced_save_task: asyncio.Task | None = None
+
+
 async def save_duck_state() -> bool:
     if _pool is None:
         return False
@@ -639,6 +642,24 @@ async def save_duck_state() -> bool:
     except Exception as e:
         print(f"[duck_db] save failed: {e}")
         return False
+
+
+def schedule_debounced_save(delay: float = 4.0) -> None:
+    """Coalesce bursty writes (e.g. many treats) into one DB save."""
+    global _debounced_save_task
+
+    async def _flush():
+        global _debounced_save_task
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        _debounced_save_task = None
+        await save_duck_state()
+
+    if _debounced_save_task is not None and not _debounced_save_task.done():
+        return
+    _debounced_save_task = asyncio.create_task(_flush())
 
 
 def series_key(name: str) -> str:
@@ -1358,6 +1379,7 @@ class EggDropView(discord.ui.View):
         self.treat_uses = 0
         self.treat_pressers: set[int] = set()
         self._public_edit_task: asyncio.Task | None = None
+        self._last_public_edit_at: float = 0.0
 
         if halloween:
             candy = discord.ui.Button(
@@ -1549,7 +1571,6 @@ class EggDropView(discord.ui.View):
                 ephemeral=True,
             )
 
-        await interaction.response.defer(ephemeral=True)
         amount = random.randint(1, 3)
         rec["treats"] = treats - 1
         rec["inventory"] = int(rec.get("inventory") or 0) + amount
@@ -1558,13 +1579,13 @@ class EggDropView(discord.ui.View):
         self.treat_bonus += amount
         self.treat_uses += 1
         self.egg_count += amount
-        await save_duck_state()
 
-        # Batch public message edits — many treats in a short window → one PATCH
+        # One interaction reply only (no defer+followup). State flush is batched.
+        schedule_debounced_save()
         self._schedule_public_edit()
 
         try:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"🍬 You left a treat (**+{amount}** eggs on the drop). "
                 f"You received **{amount}** egg(s) too. Treats left: **{rec['treats']}/{MAX_TREATS}**",
                 ephemeral=True,
@@ -1573,21 +1594,26 @@ class EggDropView(discord.ui.View):
             pass
 
     def _schedule_public_edit(self) -> None:
-        """Debounce drop-message edits (~2.5s after the last treat)."""
+        """At most one public edit per ~10s per drop (giveaway-style counter refresh)."""
         if self._public_edit_task is not None and not self._public_edit_task.done():
-            self._public_edit_task.cancel()
+            return  # already scheduled — totals are in memory; flush will pick them up
         self._public_edit_task = asyncio.create_task(self._flush_public_edit())
 
     async def _flush_public_edit(self) -> None:
+        # Respect minimum gap since last successful public edit
+        gap = 10.0 - (time.time() - self._last_public_edit_at)
+        delay = max(2.0, gap)
         try:
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
+        self._public_edit_task = None
         if self.claimed or self.message is None:
             return
         try:
             mention = f"<@{self.owner_id}>"
             await self.message.edit(content=self.drop_content(mention), view=self)
+            self._last_public_edit_at = time.time()
         except Exception as e:
             print(f"[halloween] treat message edit failed: {e}")
 
