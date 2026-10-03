@@ -58,6 +58,7 @@ RARITY_DISPLAY = {
 }
 
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
+MAX_HATCH_PER_COMMAND = 300    # hard cap per /hatch (including "all")
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 DROP_MIN_CONTENT_LENGTH = 8    # letters/digits only — spaces & symbols don't count
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
@@ -5356,13 +5357,14 @@ class DuckCog(commands.Cog):
     # ---------- open eggs from inventory ----------
 
     @app_commands.command(name="hatch", description="Open eggs from your inventory.")
-    @app_commands.describe(amount='How many eggs to open, or type "all" to hatch everything')
+    @app_commands.describe(amount='How many eggs to open, or type "all" (max 300 per hatch)')
     async def open_eggs(self, interaction: discord.Interaction, amount: str):
         await interaction.response.defer()
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
         raw = amount.strip().lower()
+        capped = False
         if raw == "all":
             hatch_count = rec["inventory"]
             if hatch_count < 1:
@@ -5381,9 +5383,14 @@ class DuckCog(commands.Cog):
                     f"You only have **{rec['inventory']}** egg(s) — you can't open {hatch_count}."
                 )
 
+        if hatch_count > MAX_HATCH_PER_COMMAND:
+            hatch_count = MAX_HATCH_PER_COMMAND
+            capped = True
+
         pre_existing = set(rec["collection"])  # ownership snapshot BEFORE this batch
 
         results = []
+        treats_got = 0
         for _ in range(hatch_count):
             # Spend one egg only when we still have it (guards double-spend races)
             if not try_spend_eggs(discord_id, 1):
@@ -5394,6 +5401,8 @@ class DuckCog(commands.Cog):
                 rec["inventory"] += 1
                 break
             results.append(result)
+            if result.get("treat_gained"):
+                treats_got += 1
 
         await save_duck_state()
 
@@ -5413,6 +5422,11 @@ class DuckCog(commands.Cog):
                 g["bonus_eggs"] += 1
 
         lines = [f"🥚 Opened {len(results)} egg(s):"]
+        if capped:
+            lines.append(
+                f"-# Capped at **{MAX_HATCH_PER_COMMAND}** per hatch "
+                f"(**{rec['inventory']}** still in inventory)."
+            )
         for duck_id, g in grouped.items():
             bonus = f" · 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
             err_mark = " 💢" if duck_index.get(duck_id, {}).get("is_error") else ""
@@ -5425,6 +5439,12 @@ class DuckCog(commands.Cog):
                 lines.append(f"-# {entry}")
             else:
                 lines.append(f"**{entry} (NEW)**")
+
+        if treats_got:
+            inv_t = get_user_record(discord_id).get("treats", 0)
+            lines.append(
+                f"🍬 **{treats_got}** treat(s) collected · Treats: **{inv_t}/{MAX_TREATS}**"
+            )
 
         await interaction.followup.send("\n".join(lines))
 
