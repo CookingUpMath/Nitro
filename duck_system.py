@@ -195,6 +195,7 @@ duck_users = {}
 # duck_config[guild_id] = {
 #   "hatching_enabled": bool, "egg_counter_channel_id": int | None,
 #   "air_drop_channel_id": int | None, "air_drops_enabled": bool,
+#   "duck_giving_enabled": bool,  # /give transfers (50/50; fail = duck runs away)
 # }
 duck_config = {}
 
@@ -918,6 +919,10 @@ async def fav_duck_autocomplete(interaction: discord.Interaction, current: str):
             matches.append(duck["title"])
 
     return [app_commands.Choice(name=title, value=title) for title in matches[:25]]
+
+
+# Same owned-duck suggestions for /give
+give_duck_autocomplete = fav_duck_autocomplete
 
 
 def rename_duck(old_id: str, new_title: str) -> str:
@@ -2434,6 +2439,31 @@ class HatchToggleView(discord.ui.View):
         await interaction.response.edit_message(content="Egg drops are now **Off**.", view=None)
 
 
+class DuckGivingToggleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
+    async def turn_on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["duck_giving_enabled"] = True
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=(
+                "Duck giving is now **On**.\n"
+                "-# `/give` — 50/50 transfer. Fail = the duck runs away (gone from the giver)."
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Turn Off", style=discord.ButtonStyle.danger)
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        duck_config.setdefault(guild_id, {})["duck_giving_enabled"] = False
+        await save_duck_state()
+        await interaction.response.edit_message(content="Duck giving is now **Off**.", view=None)
+
+
 class EggChannelSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
@@ -2497,6 +2527,14 @@ class NestConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger, emoji="🪺")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer first — save can exceed Discord's ~3s window under load
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            return
+        except discord.HTTPException:
+            return
+
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
 
@@ -2506,7 +2544,11 @@ class NestConfirmView(discord.ui.View):
             msg = f"You only have **{free}** egg(s) available to donate now — donation cancelled."
             if locked > 0:
                 msg += f"\n-# **{locked}** egg(s) from nest wins can't go back into the nest (hatch or gift them instead)."
-            return await interaction.response.edit_message(content=msg, view=None)
+            try:
+                await interaction.edit_original_response(content=msg, view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
 
         guild_id = str(interaction.guild.id)
         state = get_nest_state(guild_id)
@@ -2515,18 +2557,24 @@ class NestConfirmView(discord.ui.View):
         await save_duck_state()
 
         my_entries = state["entries"][discord_id]
-        await interaction.response.edit_message(
-            content=(
-                f"🪺 You donated **{self.amount}** egg(s) to the nest! The pool doubled your "
-                f"contribution — it's now at **{state['pool_total']}** eggs.\n"
-                f"You have **{my_entries}** entr{'y' if my_entries == 1 else 'ies'} in this week's draw."
-            ),
-            view=None,
-        )
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    f"🪺 You donated **{self.amount}** egg(s) to the nest! The pool doubled your "
+                    f"contribution — it's now at **{state['pool_total']}** eggs.\n"
+                    f"You have **{my_entries}** entr{'y' if my_entries == 1 else 'ies'} in this week's draw."
+                ),
+                view=None,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled — no eggs were donated.", view=None)
+        try:
+            await interaction.response.edit_message(content="Cancelled — no eggs were donated.", view=None)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 # --- Gift eggs: transit loss flavor ---
@@ -3973,6 +4021,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Manage Series", value="series", emoji="📚"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
+            discord.SelectOption(label="Toggle Duck Giving", value="toggle_give", emoji="🎁"),
             discord.SelectOption(label="Channel Setter", value="channels", emoji="📡"),
             discord.SelectOption(label="Block Egg-Drop Channels", value="egg_blocked_channels", emoji="🚫"),
             discord.SelectOption(label="Create Redeem Code", value="redeem_code", emoji="🎟️"),
@@ -4012,6 +4061,17 @@ class EditorView(discord.ui.View):
         elif choice == "toggle":
             await interaction.response.send_message(
                 "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
+            )
+        elif choice == "toggle_give":
+            guild_id = str(interaction.guild.id)
+            on = duck_config.get(guild_id, {}).get("duck_giving_enabled", False)
+            await interaction.response.send_message(
+                f"**Duck giving** is currently **{'ON' if on else 'OFF'}**.\n"
+                "When on, `/give` transfers a duck with a **50/50** chance. "
+                "Failure removes it from the giver (runs away).\n"
+                "Cannot give a duck the target already owns.",
+                view=DuckGivingToggleView(),
+                ephemeral=True,
             )
         elif choice == "channels":
             guild_id = str(interaction.guild.id)
@@ -5269,6 +5329,84 @@ class DuckCog(commands.Cog):
         await save_duck_state()
         await interaction.response.send_message(
             f"⭐ Added {duck_emoji} **{duck_title}** to your favorites.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="give",
+        description="Give a duck from your collection to someone (50/50 — fail and it runs away).",
+    )
+    @app_commands.describe(
+        member="Who should receive the duck",
+        duck="Start typing — only ducks you own will show up",
+    )
+    @app_commands.autocomplete(duck=give_duck_autocomplete)
+    async def give_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        duck: str,
+    ):
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+
+        guild_id = str(interaction.guild.id)
+        if not duck_config.get(guild_id, {}).get("duck_giving_enabled", False):
+            return await interaction.response.send_message(
+                "Duck giving is currently **off**. A staff member can enable it in `/editor`.",
+                ephemeral=True,
+            )
+
+        if member.bot:
+            return await interaction.response.send_message(
+                "You can't give a duck to a bot.", ephemeral=True
+            )
+        if member.id == interaction.user.id:
+            return await interaction.response.send_message(
+                "You can't give a duck to yourself.", ephemeral=True
+            )
+
+        giver_id = str(interaction.user.id)
+        target_id = str(member.id)
+        giver = get_user_record(giver_id)
+        target = get_user_record(target_id)
+
+        duck_id = slugify(duck)
+        if duck_id not in giver.get("collection", []):
+            return await interaction.response.send_message(
+                f"You don't own a duck matching **{duck}** — pick one of the suggestions as you type.",
+                ephemeral=True,
+            )
+
+        if duck_id in target.get("collection", []):
+            return await interaction.response.send_message(
+                f"{member.display_name} already owns that duck — no duplicates allowed.",
+                ephemeral=True,
+            )
+
+        duck_info = duck_index.get(duck_id)
+        duck_title = duck_info["title"] if duck_info else duck
+        duck_emoji = duck_info["emoji"] if duck_info else "🦆"
+
+        # Remove from giver first (and favorites)
+        giver["collection"] = [d for d in giver.get("collection", []) if d != duck_id]
+        favs = giver.get("favorites") or []
+        if duck_id in favs:
+            giver["favorites"] = [d for d in favs if d != duck_id]
+
+        if random.random() < 0.5:
+            target.setdefault("collection", []).append(duck_id)
+            await save_duck_state()
+            return await interaction.response.send_message(
+                f"{duck_emoji} **{duck_title}** made it to {member.mention}!",
+            )
+
+        # Fail — duck runs away (already removed from giver; not added to target)
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"{duck_emoji} **{duck_title}** ran away and is gone… "
+            f"{interaction.user.mention} lost it, {member.mention} never got it.",
         )
 
     @app_commands.command(name="inventory", description="Check how many eggs you have in storage.")
