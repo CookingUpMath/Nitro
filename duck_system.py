@@ -5063,8 +5063,8 @@ class DuckCog(commands.Cog):
             return
 
         eggs = int(cur["eggs"])
+        add_eggs(uid, eggs, kind="fresh")
         rec = get_user_record(uid)
-        add_eggs(discord_id, eggs, kind="fresh")
 
         if filled >= slots:
             state["active"] = None
