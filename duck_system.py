@@ -1212,24 +1212,52 @@ def try_spend_eggs(
 
 
 def try_spend_one_egg(discord_id: str) -> str | None:
-    """Spend one egg for hatch. Returns 'fresh'|'rotten'|'error' or None."""
+    """Spend one egg for hatch (fresh → rotten → error). Returns kind or None."""
     rec = get_user_record(discord_id)
     if int(rec.get("inventory_fresh") or 0) > 0:
+        return try_spend_one_egg_of_kind(discord_id, "fresh")
+    if int(rec.get("inventory_rotten") or 0) > 0:
+        return try_spend_one_egg_of_kind(discord_id, "rotten")
+    if int(rec.get("inventory_error") or 0) > 0:
+        return try_spend_one_egg_of_kind(discord_id, "error")
+    return None
+
+
+def try_spend_one_egg_of_kind(discord_id: str, kind: str) -> str | None:
+    """Spend exactly one egg of the given kind. Returns kind on success, else None."""
+    rec = get_user_record(discord_id)
+    if kind == "fresh":
+        if int(rec.get("inventory_fresh") or 0) < 1:
+            return None
         locked = int(rec.get("nest_locked") or 0)
         rec["inventory_fresh"] = int(rec["inventory_fresh"]) - 1
         _trim_fresh_batches(rec, 1)
         rec["nest_locked"] = max(0, locked - 1)
         _sync_inventory_total(rec)
         return "fresh"
-    if int(rec.get("inventory_rotten") or 0) > 0:
+    if kind == "rotten":
+        if int(rec.get("inventory_rotten") or 0) < 1:
+            return None
         rec["inventory_rotten"] = int(rec["inventory_rotten"]) - 1
         _sync_inventory_total(rec)
         return "rotten"
-    if int(rec.get("inventory_error") or 0) > 0:
+    if kind == "error":
+        if int(rec.get("inventory_error") or 0) < 1:
+            return None
         rec["inventory_error"] = int(rec["inventory_error"]) - 1
         _sync_inventory_total(rec)
         return "error"
     return None
+
+
+def _inventory_count_for_kind(rec: dict, kind: str) -> int:
+    if kind == "fresh":
+        return int(rec.get("inventory_fresh") or 0)
+    if kind == "rotten":
+        return int(rec.get("inventory_rotten") or 0)
+    if kind == "error":
+        return int(rec.get("inventory_error") or 0)
+    return 0
 
 
 def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
@@ -5766,19 +5794,37 @@ class DuckCog(commands.Cog):
 
     # ---------- open eggs from inventory ----------
 
-    @app_commands.command(name="hatch", description="Open eggs from your inventory.")
-    @app_commands.describe(amount='How many eggs to open, or type "all" (max 300 per hatch)')
-    async def open_eggs(self, interaction: discord.Interaction, amount: str):
+    @app_commands.command(name="hatch", description="Open eggs from your inventory by type.")
+    @app_commands.describe(
+        type="Which eggs to hatch",
+        amount='How many, or type "all" (max 300 per hatch)',
+    )
+    @app_commands.choices(type=[
+        app_commands.Choice(name="Fresh", value="fresh"),
+        app_commands.Choice(name="Rotten", value="rotten"),
+        app_commands.Choice(name="Error", value="error"),
+    ])
+    async def open_eggs(
+        self,
+        interaction: discord.Interaction,
+        type: app_commands.Choice[str],
+        amount: str,
+    ):
         await interaction.response.defer()
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
+        egg_kind = type.value  # fresh | rotten | error
+        available = _inventory_count_for_kind(rec, egg_kind)
+        em = egg_emoji(egg_kind)
 
         raw = amount.strip().lower()
         capped = False
         if raw == "all":
-            hatch_count = rec["inventory"]
+            hatch_count = available
             if hatch_count < 1:
-                return await interaction.followup.send("You don't have any eggs to hatch.")
+                return await interaction.followup.send(
+                    f"You don't have any {em} **{egg_kind}** eggs to hatch."
+                )
         else:
             try:
                 hatch_count = int(raw)
@@ -5788,32 +5834,30 @@ class DuckCog(commands.Cog):
                 return await interaction.followup.send(
                     'Amount must be a whole number of at least 1, or **all**.'
                 )
-            if rec["inventory"] < hatch_count:
+            if available < hatch_count:
                 return await interaction.followup.send(
-                    f"You only have **{rec['inventory']}** egg(s) — you can't open {hatch_count}."
+                    f"You only have **{available}** {em} **{egg_kind}** egg(s) — "
+                    f"you can't open {hatch_count}."
                 )
 
         if hatch_count > MAX_HATCH_PER_COMMAND:
             hatch_count = MAX_HATCH_PER_COMMAND
             capped = True
 
-        pre_existing = set(rec["collection"])  # ownership snapshot BEFORE this batch
+        pre_existing = set(rec["collection"])
 
         results = []
         treats_got = 0
         error_eggs_got = 0
-        kinds_used = {"fresh": 0, "rotten": 0, "error": 0}
         for _ in range(hatch_count):
-            kind = try_spend_one_egg(discord_id)
-            if kind is None:
+            spent = try_spend_one_egg_of_kind(discord_id, egg_kind)
+            if spent is None:
                 break
-            result = resolve_hatch(discord_id, egg_kind=kind)
+            result = resolve_hatch(discord_id, egg_kind=egg_kind)
             if result is None:
-                # Pool empty — refund this egg as the same kind
-                add_eggs(discord_id, 1, kind=kind)
+                add_eggs(discord_id, 1, kind=egg_kind)
                 break
             results.append(result)
-            kinds_used[kind] = kinds_used.get(kind, 0) + 1
             if result.get("treat_gained"):
                 treats_got += 1
             if result.get("error_egg_gained"):
@@ -5822,7 +5866,13 @@ class DuckCog(commands.Cog):
         await save_duck_state()
 
         if not results:
-            return await interaction.followup.send("The pool is currently empty — nothing could be hatched.")
+            if egg_kind == "error":
+                return await interaction.followup.send(
+                    "No ERROR ducks are active in the pool right now — nothing could be hatched."
+                )
+            return await interaction.followup.send(
+                "The pool is currently empty — nothing could be hatched."
+            )
 
         grouped = {}
         for r in results:
@@ -5834,20 +5884,12 @@ class DuckCog(commands.Cog):
             if r["bonus_egg"]:
                 g["bonus_eggs"] += 1
 
-        lines = [f"{egg_emoji('fresh')} Opened {len(results)} egg(s):"]
-        kind_bits = []
-        if kinds_used.get("fresh"):
-            kind_bits.append(f"{egg_emoji('fresh')} {kinds_used['fresh']} fresh")
-        if kinds_used.get("rotten"):
-            kind_bits.append(f"{egg_emoji('rotten')} {kinds_used['rotten']} rotten")
-        if kinds_used.get("error"):
-            kind_bits.append(f"{egg_emoji('error')} {kinds_used['error']} error")
-        if kind_bits:
-            lines.append("-# " + " · ".join(kind_bits))
+        lines = [f"{em} Opened **{len(results)}** {egg_kind} egg(s):"]
         if capped:
+            left = _inventory_count_for_kind(get_user_record(discord_id), egg_kind)
             lines.append(
                 f"-# Capped at **{MAX_HATCH_PER_COMMAND}** per hatch "
-                f"(**{rec['inventory']}** still in inventory)."
+                f"(**{left}** {egg_kind} still in inventory)."
             )
         for duck_id, g in grouped.items():
             bonus = f" · 🍀+{g['bonus_eggs']} bonus egg(s)" if g["bonus_eggs"] else ""
