@@ -59,6 +59,20 @@ RARITY_DISPLAY = {
 
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
 MAX_HATCH_PER_COMMAND = 300    # hard cap per /hatch (including "all")
+# --- Fresh / rotten / error eggs ---
+ROT_AFTER_SECONDS = 72 * 3600       # 72h before a fresh egg is eligible to rot
+ROT_MAX_PER_CHECK = 25              # cap eggs converted per user per rot pass
+ERROR_EGG_GAIN_CHANCE = 0.0005      # 0.05% chance to earn an error egg on any hatch
+ROTTEN_RARITY_WEIGHTS = {
+    "common": 78.0,
+    "rare": 16.0,
+    "legendary": 4.5,
+    "divine": 1.0,
+    "secret": 0.4,
+    "quackpot": 0.1,
+}
+ERROR_WEIGHT_ROTTEN = 0.05          # fixed; Error Mode never boosts rotten/error-egg rolls
+ERROR_WEIGHT_ERROR_EGG = 0.05       # reserved; error eggs only roll the error duck pool
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 DROP_MIN_CONTENT_LENGTH = 8    # letters/digits only — spaces & symbols don't count
 CLAIM_TIMEOUT_SECONDS = 600    # 10 minutes before an unclaimed drop expires
@@ -336,6 +350,10 @@ environment_state = {
     "error_mode": False,
     "purge_mode": False,
     "halloween_mode": False,
+    # Custom egg emojis (editor) — fresh replaces default 🥚 everywhere
+    "egg_emoji_fresh": "🥚",
+    "egg_emoji_rotten": "🦠",
+    "egg_emoji_error": "🪲",
 }
 
 
@@ -392,6 +410,9 @@ async def ensure_environment_for_today() -> dict:
     environment_state.setdefault("error_mode", False)
     environment_state.setdefault("purge_mode", False)
     environment_state.setdefault("halloween_mode", False)
+    environment_state.setdefault("egg_emoji_fresh", "🥚")
+    environment_state.setdefault("egg_emoji_rotten", "🦠")
+    environment_state.setdefault("egg_emoji_error", "🪲")
 
     # Error Mode: lock at maximum drop stats; skip daily re-roll
     if environment_state.get("error_mode"):
@@ -488,9 +509,15 @@ invite_cache = {}
 
 def default_user_record():
     return {
-        "inventory": 0,
+        "inventory": 0,  # always = fresh + rotten + error (synced)
+        "inventory_fresh": 0,
+        "inventory_rotten": 0,
+        "inventory_error": 0,  # never rots; hidden in UI until > 0
+        # FIFO batches of fresh eggs: {"amount": int, "acquired_at": float}
+        "egg_batches": [],
+        "last_qualifying_activity_at": None,
         # Eggs won from the nest — still hatchable/giftable, but cannot be
-        # donated back into the nest (stops win → re-donate loops).
+        # donated back into the nest (stops win → re-donate loops). Fresh only.
         "nest_locked": 0,
         "collection": [],
         "last_roll_check_ts": 0,
@@ -504,6 +531,98 @@ def default_user_record():
         "treats_given": 0,
         "treats_received": 0,
     }
+
+
+def egg_emoji(kind: str = "fresh") -> str:
+    """Configured egg emoji; fresh is the default 🥚 replacement everywhere."""
+    if kind == "rotten":
+        return environment_state.get("egg_emoji_rotten") or "🦠"
+    if kind == "error":
+        return environment_state.get("egg_emoji_error") or "🪲"
+    return environment_state.get("egg_emoji_fresh") or "🥚"
+
+
+def _sync_inventory_total(rec: dict) -> None:
+    rec["inventory"] = (
+        int(rec.get("inventory_fresh") or 0)
+        + int(rec.get("inventory_rotten") or 0)
+        + int(rec.get("inventory_error") or 0)
+    )
+
+
+def _migrate_egg_inventory(rec: dict) -> None:
+    """One-time: old single inventory → all fresh with one batch."""
+    if "inventory_fresh" in rec and "inventory_rotten" in rec and "inventory_error" in rec:
+        return
+    inv = int(rec.get("inventory") or 0)
+    rec["inventory_fresh"] = inv
+    rec["inventory_rotten"] = 0
+    rec["inventory_error"] = 0
+    rec["egg_batches"] = [{"amount": inv, "acquired_at": time.time()}] if inv > 0 else []
+    _sync_inventory_total(rec)
+
+
+def activity_rot_fraction(rec: dict) -> float:
+    """Share of *eligible* (72h+) fresh eggs that rot this check."""
+    last = rec.get("last_qualifying_activity_at")
+    if not last:
+        return 0.85
+    age = time.time() - float(last)
+    if age < 24 * 3600:
+        return 0.15
+    if age < 3 * 24 * 3600:
+        return 0.30
+    if age < 7 * 24 * 3600:
+        return 0.50
+    return 0.85
+
+
+def apply_egg_rot(rec: dict) -> int:
+    """Convert oldest eligible fresh eggs → rotten. Returns how many rotted."""
+    batches = rec.get("egg_batches") or []
+    if not batches and int(rec.get("inventory_fresh") or 0) > 0:
+        # Repair missing batches
+        batches = [{"amount": int(rec["inventory_fresh"]), "acquired_at": time.time()}]
+        rec["egg_batches"] = batches
+
+    now = time.time()
+    eligible = 0
+    for b in batches:
+        if now - float(b.get("acquired_at") or 0) >= ROT_AFTER_SECONDS:
+            eligible += int(b.get("amount") or 0)
+    if eligible <= 0:
+        return 0
+
+    frac = activity_rot_fraction(rec)
+    to_rot = min(eligible, int(eligible * frac + 0.999), ROT_MAX_PER_CHECK)
+    if to_rot <= 0:
+        return 0
+
+    remaining = to_rot
+    new_batches = []
+    for b in batches:
+        amt = int(b.get("amount") or 0)
+        acquired = float(b.get("acquired_at") or 0)
+        if remaining <= 0 or now - acquired < ROT_AFTER_SECONDS:
+            if amt > 0:
+                new_batches.append({"amount": amt, "acquired_at": acquired})
+            continue
+        take = min(amt, remaining)
+        amt -= take
+        remaining -= take
+        if amt > 0:
+            new_batches.append({"amount": amt, "acquired_at": acquired})
+
+    actually = to_rot - remaining
+    rec["egg_batches"] = new_batches
+    rec["inventory_fresh"] = max(0, int(rec.get("inventory_fresh") or 0) - actually)
+    rec["inventory_rotten"] = int(rec.get("inventory_rotten") or 0) + actually
+    # nest_locked cannot exceed fresh
+    locked = int(rec.get("nest_locked") or 0)
+    if locked > rec["inventory_fresh"]:
+        rec["nest_locked"] = rec["inventory_fresh"]
+    _sync_inventory_total(rec)
+    return actually
 
 
 def get_user_record(discord_id: str) -> dict:
@@ -520,16 +639,29 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("treats", 0)
     rec.setdefault("treats_given", 0)
     rec.setdefault("treats_received", 0)
-    # Cap locked to inventory in case of old bad state
-    if rec["nest_locked"] > rec.get("inventory", 0):
-        rec["nest_locked"] = rec.get("inventory", 0)
+    rec.setdefault("egg_batches", [])
+    rec.setdefault("last_qualifying_activity_at", None)
+    _migrate_egg_inventory(rec)
+    rec.setdefault("inventory_fresh", 0)
+    rec.setdefault("inventory_rotten", 0)
+    rec.setdefault("inventory_error", 0)
+    apply_egg_rot(rec)
+    # Cap locked to fresh inventory
+    if rec["nest_locked"] > int(rec.get("inventory_fresh") or 0):
+        rec["nest_locked"] = int(rec.get("inventory_fresh") or 0)
+    _sync_inventory_total(rec)
     return rec
 
 
 def donatable_egg_count(discord_id: str) -> int:
-    """Eggs that may be put into the nest (inventory minus nest-locked winnings)."""
+    """Fresh eggs that may go in the nest (fresh minus nest-locked). Rotten/error excluded."""
     rec = get_user_record(discord_id)
-    return max(0, rec.get("inventory", 0) - rec.get("nest_locked", 0))
+    return max(0, int(rec.get("inventory_fresh") or 0) - int(rec.get("nest_locked") or 0))
+
+
+def record_qualifying_activity(discord_id: str) -> None:
+    rec = get_user_record(discord_id)
+    rec["last_qualifying_activity_at"] = time.time()
 
 
 def award_karma(discord_id: str, points: int = 1):
@@ -537,7 +669,7 @@ def award_karma(discord_id: str, points: int = 1):
     rec["karma"] = rec.get("karma", 0) + points
     while rec["karma"] >= KARMA_PER_EGG:
         rec["karma"] -= KARMA_PER_EGG
-        rec["inventory"] += 1
+        add_eggs(discord_id, 1, kind="fresh")
 
 
 def remove_karma(discord_id: str, points: int = 1):
@@ -545,13 +677,22 @@ def remove_karma(discord_id: str, points: int = 1):
     rec["karma"] = max(rec.get("karma", 0) - points, 0)
 
 
-def add_eggs(discord_id: str, amount: int):
-    """For external callers (e.g. the Fortnite side rewarding weekly
-    leaderboard winners) — doesn't save on its own, caller should
-    await save_duck_state() once after making all its changes.
+def add_eggs(discord_id: str, amount: int, kind: str = "fresh"):
+    """Add eggs. kind: 'fresh' | 'rotten' | 'error'. Fresh gets a FIFO batch timestamp.
+    Does not save — caller should await save_duck_state().
     """
+    if amount <= 0:
+        return
     rec = get_user_record(discord_id)
-    rec["inventory"] += amount
+    if kind == "rotten":
+        rec["inventory_rotten"] = int(rec.get("inventory_rotten") or 0) + amount
+    elif kind == "error":
+        rec["inventory_error"] = int(rec.get("inventory_error") or 0) + amount
+    else:
+        rec["inventory_fresh"] = int(rec.get("inventory_fresh") or 0) + amount
+        batches = rec.setdefault("egg_batches", [])
+        batches.append({"amount": amount, "acquired_at": time.time()})
+    _sync_inventory_total(rec)
 
 
 # Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
@@ -596,6 +737,9 @@ async def load_duck_state():
             environment_state.setdefault("error_mode", False)
             environment_state.setdefault("purge_mode", False)
             environment_state.setdefault("halloween_mode", False)
+            environment_state.setdefault("egg_emoji_fresh", "🥚")
+            environment_state.setdefault("egg_emoji_rotten", "🦠")
+            environment_state.setdefault("egg_emoji_error", "🪲")
             print(f"[duck_db] loaded {len(duck_index)} duck(s), {len(duck_users)} user record(s), {len(pending_gifts)} pending gift(s)")
 
         # One-time migration: fix any ducks saved under the old rarity
@@ -973,23 +1117,26 @@ def get_active_error_ducks():
     return [d for d, duck in duck_index.items() if duck.get("active") and duck.get("is_error")]
 
 
-def roll_duck_id():
-    """Pick one active duck, weighted by rarity. Rarity tiers with zero
-    currently-active ducks are excluded and the remaining weights are used
-    as-is (random.choices renormalizes automatically). ERROR:404 ducks are
-    rolled against a separate hidden pool at ERROR_WEIGHT, layered on top
-    of the normal tiers rather than replacing any of them. Returns None if
-    the pool is completely empty.
+def roll_duck_id(*, rotten: bool = False, error_egg: bool = False):
+    """Pick one active duck. error_egg=True → only ERROR pool.
+    rotten=True → ROTTEN_RARITY_WEIGHTS + ERROR 0.05 (no Error Mode boost).
+    Otherwise normal weights + effective_error_weight().
     """
-    by_rarity = get_active_ducks_by_rarity()
     error_ducks = get_active_error_ducks()
+    if error_egg:
+        if not error_ducks:
+            return None
+        return random.choice(error_ducks)
 
+    by_rarity = get_active_ducks_by_rarity()
+    table = ROTTEN_RARITY_WEIGHTS if rotten else RARITY_WEIGHTS
     available_tiers = [r for r in RARITY_ORDER if by_rarity[r]]
-    weights = [RARITY_WEIGHTS[r] for r in available_tiers]
+    weights = [table[r] for r in available_tiers]
 
     if error_ducks:
         available_tiers = available_tiers + ["_error"]
-        weights = weights + [effective_error_weight()]
+        err_w = ERROR_WEIGHT_ROTTEN if rotten else effective_error_weight()
+        weights = weights + [err_w]
 
     if not available_tiers:
         return None
@@ -1000,68 +1147,119 @@ def roll_duck_id():
     return random.choice(by_rarity[chosen])
 
 
-def try_spend_eggs(discord_id: str, amount: int, *, for_nest: bool = False) -> bool:
-    """Atomically deduct eggs if the user has enough. Safe against concurrent
-    spends in the same event loop (check + subtract with no await in between).
+def _trim_fresh_batches(rec: dict, amount: int) -> None:
+    left = amount
+    new_batches = []
+    for b in rec.get("egg_batches") or []:
+        amt = int(b.get("amount") or 0)
+        if left <= 0:
+            if amt > 0:
+                new_batches.append(b)
+            continue
+        take = min(amt, left)
+        amt -= take
+        left -= take
+        if amt > 0:
+            new_batches.append({"amount": amt, "acquired_at": b.get("acquired_at")})
+    rec["egg_batches"] = new_batches
 
-    for_nest=True: only donatable (non-locked) eggs may be spent.
-    Otherwise any inventory eggs may be spent; nest_locked shrinks first so
-    nest winnings are used up by hatching/gifting instead of re-entering the nest.
-    """
+
+def try_spend_eggs(
+    discord_id: str,
+    amount: int,
+    *,
+    for_nest: bool = False,
+    for_gift: bool = False,
+) -> bool:
+    """Nest/gift: fresh only. Hatch/general: fresh → rotten → error."""
     rec = get_user_record(discord_id)
-    inv = rec.get("inventory", 0)
-    locked = rec.get("nest_locked", 0)
-    if locked > inv:
-        locked = inv
-        rec["nest_locked"] = locked
+    fresh = int(rec.get("inventory_fresh") or 0)
+    locked = int(rec.get("nest_locked") or 0)
 
-    if for_nest:
-        if inv - locked < amount:
+    if for_nest or for_gift:
+        free = max(0, fresh - locked) if for_nest else fresh
+        if free < amount:
             return False
-        rec["inventory"] = inv - amount
+        rec["inventory_fresh"] = fresh - amount
+        _trim_fresh_batches(rec, amount)
+        if locked > rec["inventory_fresh"]:
+            rec["nest_locked"] = rec["inventory_fresh"]
+        _sync_inventory_total(rec)
         return True
 
-    if inv < amount:
+    rotten = int(rec.get("inventory_rotten") or 0)
+    error = int(rec.get("inventory_error") or 0)
+    if fresh + rotten + error < amount:
         return False
-    rec["inventory"] = inv - amount
-    # Spend locked eggs first when hatching/gifting
-    rec["nest_locked"] = max(0, locked - amount)
-    return True
+
+    left = amount
+    take_f = min(fresh, left)
+    if take_f:
+        rec["inventory_fresh"] = fresh - take_f
+        _trim_fresh_batches(rec, take_f)
+        rec["nest_locked"] = max(0, locked - take_f)
+        left -= take_f
+    if left:
+        take_r = min(int(rec.get("inventory_rotten") or 0), left)
+        rec["inventory_rotten"] = int(rec.get("inventory_rotten") or 0) - take_r
+        left -= take_r
+    if left:
+        take_e = min(int(rec.get("inventory_error") or 0), left)
+        rec["inventory_error"] = int(rec.get("inventory_error") or 0) - take_e
+        left -= take_e
+    _sync_inventory_total(rec)
+    return left == 0
 
 
-def resolve_hatch(discord_id: str):
-    """Roll and apply one hatch for a user. Returns a result dict, or None
-    if the pool is currently empty. Does NOT touch inventory count — the
-    caller decides whether an egg was 'spent' (batch open) or never stored
-    (immediate hatch from a fresh drop).
+def try_spend_one_egg(discord_id: str) -> str | None:
+    """Spend one egg for hatch. Returns 'fresh'|'rotten'|'error' or None."""
+    rec = get_user_record(discord_id)
+    if int(rec.get("inventory_fresh") or 0) > 0:
+        locked = int(rec.get("nest_locked") or 0)
+        rec["inventory_fresh"] = int(rec["inventory_fresh"]) - 1
+        _trim_fresh_batches(rec, 1)
+        rec["nest_locked"] = max(0, locked - 1)
+        _sync_inventory_total(rec)
+        return "fresh"
+    if int(rec.get("inventory_rotten") or 0) > 0:
+        rec["inventory_rotten"] = int(rec["inventory_rotten"]) - 1
+        _sync_inventory_total(rec)
+        return "rotten"
+    if int(rec.get("inventory_error") or 0) > 0:
+        rec["inventory_error"] = int(rec["inventory_error"]) - 1
+        _sync_inventory_total(rec)
+        return "error"
+    return None
 
-    ERROR:404 ducks never intentionally duplicate while the user is still
-    missing one: if the rolled error duck is already owned, another unowned
-    active error duck is chosen instead. Only when every active error duck
-    is already owned does a normal duplicate (and bonus-egg chance) apply.
+
+def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
+    """Roll one hatch. egg_kind: fresh | rotten | error.
+    Does NOT spend inventory — caller spends first.
+    0.05% chance to gain an error egg into inventory after any successful hatch.
     """
-    duck_id = roll_duck_id()
+    error_egg = egg_kind == "error"
+    rotten = egg_kind == "rotten"
+    duck_id = roll_duck_id(rotten=rotten, error_egg=error_egg)
     if duck_id is None:
         return None
 
     rec = get_user_record(discord_id)
     duck = duck_index[duck_id]
 
-    # ERROR:404 — prefer an unowned error duck when possible
     if duck.get("is_error"):
         error_ids = get_active_error_ducks()
         unowned = [eid for eid in error_ids if eid not in rec["collection"]]
         if unowned:
             duck_id = random.choice(unowned)
             duck = duck_index[duck_id]
-        else:
-            # Own the full error pool — pick any active error, allow duplicate
-            duck_id = random.choice(error_ids) if error_ids else duck_id
+        elif error_ids:
+            duck_id = random.choice(error_ids)
             duck = duck_index[duck_id]
 
     is_duplicate = duck_id in rec["collection"]
     bonus_egg = False
     treat_gained = False
+    error_egg_gained = False
 
     if is_duplicate:
         if is_halloween_mode():
@@ -1070,13 +1268,17 @@ def resolve_hatch(discord_id: str):
                 rec["treats"] = treats + 1
                 treat_gained = True
             elif random.random() < DUPLICATE_BONUS_CHANCE:
-                rec["inventory"] += 1
+                add_eggs(discord_id, 1, kind="fresh")
                 bonus_egg = True
         elif random.random() < DUPLICATE_BONUS_CHANCE:
-            rec["inventory"] += 1
+            add_eggs(discord_id, 1, kind="fresh")
             bonus_egg = True
     else:
         rec["collection"].append(duck_id)
+
+    if random.random() < ERROR_EGG_GAIN_CHANCE:
+        add_eggs(discord_id, 1, kind="error")
+        error_egg_gained = True
 
     return {
         "duck_id": duck_id,
@@ -1086,6 +1288,8 @@ def resolve_hatch(discord_id: str):
         "duplicate": is_duplicate,
         "bonus_egg": bonus_egg,
         "treat_gained": treat_gained,
+        "error_egg_gained": error_egg_gained,
+        "egg_kind": egg_kind,
     }
 
 
@@ -1416,7 +1620,7 @@ class EggDropView(discord.ui.View):
             if self.purge:
                 line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
             return line
-        line = f"🥚 {mention} found {self.egg_count} {egg_word} on the ground!"
+        line = f"{egg_emoji('fresh')} {mention} found {self.egg_count} {egg_word} on the ground!"
         if self.purge:
             line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
         return line
@@ -1464,7 +1668,7 @@ class EggDropView(discord.ui.View):
         self._award_treat_received(discord_id)
 
         if self.egg_count == 1:
-            result = resolve_hatch(discord_id)
+            result = resolve_hatch(discord_id, egg_kind="fresh")
             if result is None:
                 await save_duck_state()
                 self.stop()
@@ -1480,8 +1684,10 @@ class EggDropView(discord.ui.View):
                     inv_t = get_user_record(discord_id).get("treats", 0)
                     text += f"\n🍬 Treat collected! Treats: **{inv_t}/{MAX_TREATS}**"
                 elif result["bonus_egg"]:
-                    inv = duck_users[discord_id]["inventory"]
+                    inv = get_user_record(discord_id)["inventory"]
                     text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
+                if result.get("error_egg_gained"):
+                    text += f"\n{egg_emoji('error')} An **error egg** appeared in your inventory!"
                 await self._finish_drop_message(interaction, content=text)
             else:
                 style = hype_for_hatch(result["duck_id"], result["rarity"])
@@ -1489,6 +1695,8 @@ class EggDropView(discord.ui.View):
                 banner = style["banner"].format(
                     emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
                 )
+                if result.get("error_egg_gained"):
+                    banner += f"\n{egg_emoji('error')} An **error egg** appeared in your inventory!"
                 embed = discord.Embed(description=banner, color=color)
                 await self._finish_drop_message(interaction, content=None, embed=embed)
             return
@@ -1496,13 +1704,16 @@ class EggDropView(discord.ui.View):
         pre_existing = set(get_user_record(discord_id)["collection"])
         results = []
         treats_got = 0
+        error_eggs_got = 0
         for _ in range(self.egg_count):
-            r = resolve_hatch(discord_id)
+            r = resolve_hatch(discord_id, egg_kind="fresh")
             if r is None:
                 break
             results.append(r)
             if r.get("treat_gained"):
                 treats_got += 1
+            if r.get("error_egg_gained"):
+                error_eggs_got += 1
         await save_duck_state()
         self.stop()
         if not results:
@@ -1516,7 +1727,7 @@ class EggDropView(discord.ui.View):
                 "emoji": r["emoji"], "title": r["title"], "rarity": r["rarity"], "count": 0,
             })
             g["count"] += 1
-        lines = [f"🥚 {interaction.user.mention} hatched {len(results)} egg(s):"]
+        lines = [f"{egg_emoji('fresh')} {interaction.user.mention} hatched {len(results)} egg(s):"]
         for duck_id, g in grouped.items():
             err_mark = " 💢" if duck_index.get(duck_id, {}).get("is_error") else ""
             entry = (
@@ -1541,7 +1752,7 @@ class EggDropView(discord.ui.View):
         discord_id = str(interaction.user.id)
         self._award_treat_received(discord_id)
         rec = get_user_record(discord_id)
-        rec["inventory"] += self.egg_count
+        add_eggs(discord_id, self.egg_count, kind="fresh")
         await save_duck_state()
         self.stop()
         egg_word = "egg" if self.egg_count == 1 else "eggs"
@@ -1579,7 +1790,7 @@ class EggDropView(discord.ui.View):
 
         amount = random.randint(1, 3)
         rec["treats"] = treats - 1
-        rec["inventory"] = int(rec.get("inventory") or 0) + amount
+        add_eggs(giver_id, amount, kind="fresh")
         rec["treats_given"] = int(rec.get("treats_given") or 0) + 1
         self.treat_pressers.add(interaction.user.id)
         self.treat_bonus += amount
@@ -1645,8 +1856,7 @@ class EggDropView(discord.ui.View):
             self.claimed = True
             stealer_id = str(interaction.user.id)
             # Finder didn't claim — no treats_received credit
-            rec = get_user_record(stealer_id)
-            rec["inventory"] += self.egg_count
+            add_eggs(stealer_id, self.egg_count, kind="fresh")
             await save_duck_state()
             self.stop()
             egg_word = "egg" if self.egg_count == 1 else "eggs"
@@ -2420,6 +2630,49 @@ class ErrorAdminView(discord.ui.View):
         await interaction.response.send_message(msg, ephemeral=True)
 
 
+
+class EggEmojiModal(discord.ui.Modal, title="Egg Emojis"):
+    """Set custom emojis for fresh / rotten / error eggs (one editor action)."""
+
+    fresh = discord.ui.TextInput(
+        label="Fresh egg emoji",
+        placeholder="🥚 or a custom emoji",
+        required=True,
+        max_length=80,
+    )
+    rotten = discord.ui.TextInput(
+        label="Rotten egg emoji",
+        placeholder="🦠 or a custom emoji",
+        required=True,
+        max_length=80,
+    )
+    error = discord.ui.TextInput(
+        label="Error egg emoji",
+        placeholder="🪲 or a custom emoji",
+        required=True,
+        max_length=80,
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.fresh.default = environment_state.get("egg_emoji_fresh") or "🥚"
+        self.rotten.default = environment_state.get("egg_emoji_rotten") or "🦠"
+        self.error.default = environment_state.get("egg_emoji_error") or "🪲"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        environment_state["egg_emoji_fresh"] = str(self.fresh.value).strip() or "🥚"
+        environment_state["egg_emoji_rotten"] = str(self.rotten.value).strip() or "🦠"
+        environment_state["egg_emoji_error"] = str(self.error.value).strip() or "🪲"
+        await save_duck_state()
+        await interaction.response.send_message(
+            "Egg emojis updated:\n"
+            f"{environment_state['egg_emoji_fresh']} fresh · "
+            f"{environment_state['egg_emoji_rotten']} rotten · "
+            f"{environment_state['egg_emoji_error']} error",
+            ephemeral=True,
+        )
+
+
 class HatchToggleView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -2638,7 +2891,7 @@ async def return_pending_gift(bot: commands.Bot, gift_id: str, reason: str = "de
 
     giver_id = gift["giver_id"]
     amount = gift["amount"]
-    get_user_record(giver_id)["inventory"] += amount
+    add_eggs(giver_id, amount, kind="fresh")
     await save_duck_state()
 
     try:
@@ -2709,7 +2962,7 @@ class GiftOfferView(discord.ui.View):
         lost = roll_gift_loss(amount)
         received = amount - lost
         if received > 0:
-            get_user_record(gift["target_id"])["inventory"] += received
+            add_eggs(gift["target_id"], received, kind="fresh")
         await save_duck_state()
 
         flavor = format_gift_loss_flavor(lost)
@@ -2779,9 +3032,9 @@ class GiftConfirmView(discord.ui.View):
         giver_rec = get_user_record(giver_id)
 
         # Hold eggs in pending until accept / decline / expiry
-        if not try_spend_eggs(giver_id, self.amount):
+        if not try_spend_eggs(giver_id, self.amount, for_gift=True):
             return await interaction.response.edit_message(
-                content=f"You only have **{giver_rec['inventory']}** egg(s) now — gift cancelled.",
+                content=f"You only have **{giver_rec.get('inventory_fresh', giver_rec['inventory'])}** fresh egg(s) now — gift cancelled (rotten/error can't be gifted).",
                 view=None,
             )
 
@@ -2833,7 +3086,7 @@ class GiftConfirmView(discord.ui.View):
         except Exception:
             # Can't DM target — refund immediately so eggs aren't stuck
             pending_gifts.pop(gift_id, None)
-            giver_rec["inventory"] += self.amount
+            add_eggs(giver_id, self.amount, kind="fresh")
             await save_duck_state()
             try:
                 await interaction.user.send(
@@ -3204,7 +3457,7 @@ class RedeemCodeModal(discord.ui.Modal, title="Create Redeem Code"):
 
         reward_parts = []
         if eggs_amount:
-            reward_parts.append(f"🥚 {eggs_amount} egg(s)")
+            reward_parts.append(f"{egg_emoji('fresh')} {eggs_amount} egg(s)")
         if duck_ids:
             names = ", ".join(duck_index[d]["title"] for d in duck_ids)
             reward_parts.append(f"🦆 {names}")
@@ -3248,8 +3501,8 @@ class RedeemModal(discord.ui.Modal, title="Redeem a Code"):
         gained = []
 
         if entry["eggs"]:
-            rec["inventory"] += entry["eggs"]
-            gained.append(f"🥚 {entry['eggs']} egg(s)")
+            add_eggs(discord_id, entry["eggs"], kind="fresh")
+            gained.append(f"{egg_emoji('fresh')} {entry['eggs']} egg(s)")
 
         new_ducks = []
         already_owned = []
@@ -3538,7 +3791,7 @@ def format_role_reward_line(guild: discord.Guild | None, role_id: str, reward: d
     eggs = int(reward.get("eggs") or 0)
     duck_id = reward.get("duck_id")
     if eggs > 0:
-        parts.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
+        parts.append(f"{egg_emoji('fresh')} **{eggs}** egg{'s' if eggs != 1 else ''}")
     if duck_id and duck_id in duck_index:
         d = duck_index[duck_id]
         parts.append(f"{d['emoji']} **{d['title']}**")
@@ -3567,8 +3820,8 @@ def grant_role_reward_to_user(discord_id: str, role_id_str: str, reward: dict) -
     duck_id = reward.get("duck_id")
 
     if eggs > 0:
-        rec["inventory"] += eggs
-        got.append(f"🥚 **{eggs}** egg{'s' if eggs != 1 else ''}")
+        add_eggs(discord_id, eggs, kind="fresh")
+        got.append(f"{egg_emoji('fresh')} **{eggs}** egg{'s' if eggs != 1 else ''}")
 
     if duck_id and duck_id in duck_index:
         duck = duck_index[duck_id]
@@ -4021,6 +4274,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Manage Series", value="series", emoji="📚"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
             discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
+            discord.SelectOption(label="Egg Emojis", value="egg_emojis", emoji="🎨"),
             discord.SelectOption(label="Toggle Duck Giving", value="toggle_give", emoji="🎁"),
             discord.SelectOption(label="Channel Setter", value="channels", emoji="📡"),
             discord.SelectOption(label="Block Egg-Drop Channels", value="egg_blocked_channels", emoji="🚫"),
@@ -4062,6 +4316,8 @@ class EditorView(discord.ui.View):
             await interaction.response.send_message(
                 "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
             )
+        elif choice == "egg_emojis":
+            await interaction.response.send_modal(EggEmojiModal())
         elif choice == "toggle_give":
             guild_id = str(interaction.guild.id)
             on = duck_config.get(guild_id, {}).get("duck_giving_enabled", False)
@@ -4192,7 +4448,7 @@ class DuckCog(commands.Cog):
         # --- Daily egg: silent, first message after the 00:00 UTC reset ---
         if rec.get("last_daily_egg_date") != today_str:
             rec["last_daily_egg_date"] = today_str
-            rec["inventory"] += 1
+            add_eggs(discord_id, 1, kind="fresh")
             state_changed = True
 
         # --- GM karma: once per day, "GM"/"good morning" anywhere in the message ---
@@ -4262,6 +4518,8 @@ class DuckCog(commands.Cog):
 
         if not qualifies:
             return
+
+        record_qualifying_activity(discord_id)
 
         now = time.time()
         if now - rec.get("last_roll_check_ts", 0) < DROP_COOLDOWN_SECONDS:
@@ -4778,7 +5036,7 @@ class DuckCog(commands.Cog):
 
         eggs = int(cur["eggs"])
         rec = get_user_record(uid)
-        rec["inventory"] += eggs
+        add_eggs(discord_id, eggs, kind="fresh")
 
         if filled >= slots:
             state["active"] = None
@@ -5049,7 +5307,7 @@ class DuckCog(commands.Cog):
                 if member.bot:
                     continue
                 rec = get_user_record(str(member.id))
-                rec["inventory"] += CROWN_ROLE_EGGS
+                add_eggs(str(member.id), CROWN_ROLE_EGGS, kind="fresh")
                 paid += 1
                 try:
                     await member.send(
@@ -5088,7 +5346,7 @@ class DuckCog(commands.Cog):
 
         if winner_id:
             winner_rec = get_user_record(winner_id)
-            winner_rec["inventory"] += pool_total
+            add_eggs(winner_id, pool_total, kind="fresh")
             # Nest prize eggs cannot be donated back into the nest
             winner_rec["nest_locked"] = winner_rec.get("nest_locked", 0) + pool_total
 
@@ -5180,9 +5438,11 @@ class DuckCog(commands.Cog):
 
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
-        if rec["inventory"] < amount:
+        fresh = int(rec.get("inventory_fresh") or 0)
+        if fresh < amount:
             return await interaction.response.send_message(
-                f"You only have **{rec['inventory']}** egg(s) — you can't send {amount}.", ephemeral=True
+                f"You only have **{fresh}** fresh egg(s) — rotten/error eggs can't be gifted.",
+                ephemeral=True,
             )
 
         egg_word = "egg" if amount == 1 else "eggs"
@@ -5209,7 +5469,7 @@ class DuckCog(commands.Cog):
         if is_error_mode():
             lines = [
                 "# ⚠️ Error - Connection Issues",
-                f"🥚 Drop Chance: **{chance:g}%** per check",
+                f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check",
                 f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
                 f"🪲 Admin: Error odds **{ERROR_WEIGHT} > {ERROR_WEIGHT_EVENT}**",
             ]
@@ -5223,7 +5483,7 @@ class DuckCog(commands.Cog):
         if is_purge_mode():
             lines = [
                 "# 🚨 PURGE MODE",
-                f"🥚 Drop Chance: **{chance:g}%** per check",
+                f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check",
                 f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
                 "🥷 Drops can be **stolen** (50/50) by other members",
             ]
@@ -5236,7 +5496,7 @@ class DuckCog(commands.Cog):
             label = halloween_weather_title(float(chance))
             lines = [
                 f"# {label}",
-                f"🥚 Drop Chance: **{chance}%** per check",
+                f"{egg_emoji('fresh')} Drop Chance: **{chance}%** per check",
                 f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
                 "-# 🎃 Halloween Mode — treats, themed drops, 5–10 eggs",
             ]
@@ -5256,7 +5516,7 @@ class DuckCog(commands.Cog):
 
         lines = [
             f"# {label}",
-            f"🥚 Drop Chance: **{chance}%** per check",
+            f"{egg_emoji('fresh')} Drop Chance: **{chance}%** per check",
             f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
         ]
 
@@ -5416,15 +5676,27 @@ class DuckCog(commands.Cog):
 
         locked = rec.get("nest_locked", 0)
         free = donatable_egg_count(discord_id)
+        fresh_n = int(rec.get("inventory_fresh") or 0)
+        rotten_n = int(rec.get("inventory_rotten") or 0)
+        error_n = int(rec.get("inventory_error") or 0)
+        total = rec["inventory"]
+        egg_lines = (
+            f"{egg_emoji('fresh')} **Fresh: {fresh_n}**\n"
+            f"{egg_emoji('rotten')} **Rotten: {rotten_n}**\n"
+        )
+        if error_n > 0:
+            egg_lines += f"{egg_emoji('error')} **Error: {error_n}**\n"
         if is_halloween_mode():
             description = (
-                f"## 🎃 Treat bag: **{rec['inventory']}** egg(s)\n"
+                f"## 🎃 Treat bag: **{total}** egg(s)\n"
+                f"{egg_lines}"
                 f"> **🍬 Treats: {rec.get('treats', 0)}/{MAX_TREATS}**\n"
                 f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
             )
         else:
             description = (
-                f"## 🥚 You have **{rec['inventory']}** egg(s) stored\n"
+                f"## {egg_emoji('fresh')} You have **{total}** egg(s) stored\n"
+                f"{egg_lines}"
                 f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
             )
         if locked > 0:
@@ -5529,26 +5801,29 @@ class DuckCog(commands.Cog):
 
         results = []
         treats_got = 0
+        error_eggs_got = 0
+        kinds_used = {"fresh": 0, "rotten": 0, "error": 0}
         for _ in range(hatch_count):
-            # Spend one egg only when we still have it (guards double-spend races)
-            if not try_spend_eggs(discord_id, 1):
+            kind = try_spend_one_egg(discord_id)
+            if kind is None:
                 break
-            result = resolve_hatch(discord_id)
+            result = resolve_hatch(discord_id, egg_kind=kind)
             if result is None:
-                # Pool empty — refund this egg
-                rec["inventory"] += 1
+                # Pool empty — refund this egg as the same kind
+                add_eggs(discord_id, 1, kind=kind)
                 break
             results.append(result)
+            kinds_used[kind] = kinds_used.get(kind, 0) + 1
             if result.get("treat_gained"):
                 treats_got += 1
+            if result.get("error_egg_gained"):
+                error_eggs_got += 1
 
         await save_duck_state()
 
         if not results:
             return await interaction.followup.send("The pool is currently empty — nothing could be hatched.")
 
-        # Aggregate identical ducks into one line each, in first-seen order,
-        # so a big batch doesn't turn into dozens of near-identical rows.
         grouped = {}
         for r in results:
             g = grouped.setdefault(r["duck_id"], {
@@ -5559,7 +5834,16 @@ class DuckCog(commands.Cog):
             if r["bonus_egg"]:
                 g["bonus_eggs"] += 1
 
-        lines = [f"🥚 Opened {len(results)} egg(s):"]
+        lines = [f"{egg_emoji('fresh')} Opened {len(results)} egg(s):"]
+        kind_bits = []
+        if kinds_used.get("fresh"):
+            kind_bits.append(f"{egg_emoji('fresh')} {kinds_used['fresh']} fresh")
+        if kinds_used.get("rotten"):
+            kind_bits.append(f"{egg_emoji('rotten')} {kinds_used['rotten']} rotten")
+        if kinds_used.get("error"):
+            kind_bits.append(f"{egg_emoji('error')} {kinds_used['error']} error")
+        if kind_bits:
+            lines.append("-# " + " · ".join(kind_bits))
         if capped:
             lines.append(
                 f"-# Capped at **{MAX_HATCH_PER_COMMAND}** per hatch "
@@ -5572,7 +5856,6 @@ class DuckCog(commands.Cog):
                 f"{g['emoji']} {g['title']} (x{g['count']}) — "
                 f"{RARITY_DISPLAY[g['rarity']]}{err_mark}{bonus}"
             )
-            # Already owned → -#; new to this batch → bold + (NEW)
             if duck_id in pre_existing:
                 lines.append(f"-# {entry}")
             else:
@@ -5582,6 +5865,12 @@ class DuckCog(commands.Cog):
             inv_t = get_user_record(discord_id).get("treats", 0)
             lines.append(
                 f"🍬 **{treats_got}** treat(s) collected · Treats: **{inv_t}/{MAX_TREATS}**"
+            )
+        if error_eggs_got:
+            inv_e = get_user_record(discord_id).get("inventory_error", 0)
+            lines.append(
+                f"{egg_emoji('error')} **{error_eggs_got}** error egg(s) found · "
+                f"Error eggs: **{inv_e}**"
             )
 
         await interaction.followup.send("\n".join(lines))
