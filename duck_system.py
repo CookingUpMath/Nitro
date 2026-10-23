@@ -60,8 +60,19 @@ RARITY_DISPLAY = {
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
 MAX_HATCH_PER_COMMAND = 300    # hard cap per /hatch (including "all")
 # --- Fresh / rotten / error eggs ---
-ROT_AFTER_SECONDS = 72 * 3600       # 72h before a fresh egg is eligible to rot
-ROT_MAX_PER_CHECK = 25              # cap eggs converted per user per rot pass
+ROT_AFTER_SECONDS = 72 * 3600       # base life before a fresh egg is eligible to rot
+ROT_CHECK_INTERVAL = 12 * 3600      # at most one rot pass per user per 12h
+# Each scheduled rot pass converts a random amount in this range (never more than eligible)
+ROT_PER_CHECK_MIN = 5
+ROT_PER_CHECK_MAX = 10
+# Daily qualifying-message thresholds (Eastern) → extra life that day only
+# 0–9: +0h | 10–29: +12h | 30–99: +24h | 100+: +36h
+ROT_MSG_BONUS_HOURS = [
+    (100, 36),
+    (30, 24),
+    (10, 12),
+    (0, 0),
+]
 ERROR_EGG_GAIN_CHANCE = 0.0005      # 0.05% chance to earn an error egg on any hatch
 ROTTEN_RARITY_WEIGHTS = {
     "common": 78.0,
@@ -542,6 +553,30 @@ def egg_emoji(kind: str = "fresh") -> str:
     return environment_state.get("egg_emoji_fresh") or "🥚"
 
 
+# /give transfer fortune — permanent, tied to today's weather drop %. Odds never shown.
+# (name, success_rate) ordered by rising drop-chance bands 6–15%.
+GIVE_FORTUNE_TIERS = [
+    ("Blackwater", 0.30),   # 6–7%
+    ("Low Tide", 0.40),     # 8–9%
+    ("Still Water", 0.50),  # 10–11%
+    ("Tailwind", 0.60),     # 12–13%
+    ("Golden Hour", 0.70),  # 14–15%
+]
+
+
+def give_fortune_for_drop_chance(chance: float) -> tuple[str, float]:
+    """Map today's drop % into a named fortune + success probability."""
+    if chance < 8:
+        return GIVE_FORTUNE_TIERS[0]
+    if chance < 10:
+        return GIVE_FORTUNE_TIERS[1]
+    if chance < 12:
+        return GIVE_FORTUNE_TIERS[2]
+    if chance < 14:
+        return GIVE_FORTUNE_TIERS[3]
+    return GIVE_FORTUNE_TIERS[4]
+
+
 def _sync_inventory_total(rec: dict) -> None:
     rec["inventory"] = (
         int(rec.get("inventory_fresh") or 0)
@@ -562,48 +597,57 @@ def _migrate_egg_inventory(rec: dict) -> None:
     _sync_inventory_total(rec)
 
 
-def activity_rot_fraction(rec: dict) -> float:
-    """Share of *eligible* (72h+) fresh eggs that rot this check."""
-    last = rec.get("last_qualifying_activity_at")
-    if not last:
-        return 0.85
-    age = time.time() - float(last)
-    if age < 24 * 3600:
-        return 0.15
-    if age < 3 * 24 * 3600:
-        return 0.30
-    if age < 7 * 24 * 3600:
-        return 0.50
-    return 0.85
+def _eastern_today_str() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
 
-def apply_egg_rot(rec: dict) -> int:
-    """Convert oldest eligible fresh eggs → rotten. Returns how many rotted."""
+def _rot_bonus_seconds_today(rec: dict) -> int:
+    """Extra life from today's qualifying messages (Eastern day). Not cumulative across days."""
+    if rec.get("activity_date") != _eastern_today_str():
+        return 0
+    msgs = int(rec.get("activity_msgs_today") or 0)
+    for threshold, hours in ROT_MSG_BONUS_HOURS:
+        if msgs >= threshold:
+            return hours * 3600
+    return 0
+
+
+def _batch_is_eligible(batch: dict, now: float, bonus_seconds: int) -> bool:
+    acquired = float(batch.get("acquired_at") or 0)
+    return (now - acquired) >= (ROT_AFTER_SECONDS + bonus_seconds)
+
+
+def maybe_apply_egg_rot(rec: dict) -> int:
+    """At most once per 12h: turn up to ROT_PER_CHECK oldest eligible fresh eggs rotten.
+    Never drives inventory negative — only converts min(eligible, 5).
+    """
+    now = time.time()
+    last = rec.get("last_rot_check_at")
+    if last is not None and (now - float(last)) < ROT_CHECK_INTERVAL:
+        return 0
+    rec["last_rot_check_at"] = now
+
     batches = rec.get("egg_batches") or []
     if not batches and int(rec.get("inventory_fresh") or 0) > 0:
-        # Repair missing batches
-        batches = [{"amount": int(rec["inventory_fresh"]), "acquired_at": time.time()}]
+        batches = [{"amount": int(rec["inventory_fresh"]), "acquired_at": now}]
         rec["egg_batches"] = batches
 
-    now = time.time()
-    eligible = 0
-    for b in batches:
-        if now - float(b.get("acquired_at") or 0) >= ROT_AFTER_SECONDS:
-            eligible += int(b.get("amount") or 0)
+    bonus = _rot_bonus_seconds_today(rec)
+    eligible = sum(
+        int(b.get("amount") or 0)
+        for b in batches
+        if _batch_is_eligible(b, now, bonus)
+    )
     if eligible <= 0:
         return 0
 
-    frac = activity_rot_fraction(rec)
-    to_rot = min(eligible, int(eligible * frac + 0.999), ROT_MAX_PER_CHECK)
-    if to_rot <= 0:
-        return 0
-
+    to_rot = min(eligible, random.randint(ROT_PER_CHECK_MIN, ROT_PER_CHECK_MAX))
     remaining = to_rot
     new_batches = []
     for b in batches:
         amt = int(b.get("amount") or 0)
         acquired = float(b.get("acquired_at") or 0)
-        if remaining <= 0 or now - acquired < ROT_AFTER_SECONDS:
+        if remaining <= 0 or not _batch_is_eligible(b, now, bonus):
             if amt > 0:
                 new_batches.append({"amount": amt, "acquired_at": acquired})
             continue
@@ -614,13 +658,16 @@ def apply_egg_rot(rec: dict) -> int:
             new_batches.append({"amount": amt, "acquired_at": acquired})
 
     actually = to_rot - remaining
+    if actually <= 0:
+        return 0
+
     rec["egg_batches"] = new_batches
-    rec["inventory_fresh"] = max(0, int(rec.get("inventory_fresh") or 0) - actually)
+    fresh = max(0, int(rec.get("inventory_fresh") or 0) - actually)
+    rec["inventory_fresh"] = fresh
     rec["inventory_rotten"] = int(rec.get("inventory_rotten") or 0) + actually
-    # nest_locked cannot exceed fresh
     locked = int(rec.get("nest_locked") or 0)
-    if locked > rec["inventory_fresh"]:
-        rec["nest_locked"] = rec["inventory_fresh"]
+    if locked > fresh:
+        rec["nest_locked"] = fresh
     _sync_inventory_total(rec)
     return actually
 
@@ -641,12 +688,15 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("treats_received", 0)
     rec.setdefault("egg_batches", [])
     rec.setdefault("last_qualifying_activity_at", None)
+    rec.setdefault("last_rot_check_at", None)
+    rec.setdefault("activity_date", None)
+    rec.setdefault("activity_msgs_today", 0)
     _migrate_egg_inventory(rec)
     rec.setdefault("inventory_fresh", 0)
     rec.setdefault("inventory_rotten", 0)
     rec.setdefault("inventory_error", 0)
-    apply_egg_rot(rec)
-    # Cap locked to fresh inventory
+    # Scheduled rot only (max once / 12h) — not every inventory glance
+    maybe_apply_egg_rot(rec)
     if rec["nest_locked"] > int(rec.get("inventory_fresh") or 0):
         rec["nest_locked"] = int(rec.get("inventory_fresh") or 0)
     _sync_inventory_total(rec)
@@ -660,8 +710,14 @@ def donatable_egg_count(discord_id: str) -> int:
 
 
 def record_qualifying_activity(discord_id: str) -> None:
+    """Track last activity + Eastern-day qualifying message count (for rot life bonus)."""
     rec = get_user_record(discord_id)
     rec["last_qualifying_activity_at"] = time.time()
+    today = _eastern_today_str()
+    if rec.get("activity_date") != today:
+        rec["activity_date"] = today
+        rec["activity_msgs_today"] = 0
+    rec["activity_msgs_today"] = int(rec.get("activity_msgs_today") or 0) + 1
 
 
 def award_karma(discord_id: str, points: int = 1):
@@ -2732,7 +2788,7 @@ class DuckGivingToggleView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 "Duck giving is now **On**.\n"
-                "-# `/give` — 50/50 transfer. Fail = the duck runs away (gone from the giver)."
+                "-# `/gift` duck transfers follow today's pond fortune. Fail = the duck runs away."
             ),
             view=None,
         )
@@ -4351,9 +4407,9 @@ class EditorView(discord.ui.View):
             on = duck_config.get(guild_id, {}).get("duck_giving_enabled", False)
             await interaction.response.send_message(
                 f"**Duck giving** is currently **{'ON' if on else 'OFF'}**.\n"
-                "When on, `/give` transfers a duck with a **50/50** chance. "
-                "Failure removes it from the giver (runs away).\n"
-                "Cannot give a duck the target already owns.",
+                "When on, `/gift` can send **ducks** (odds follow today's weather fortune; "
+                "fail = runs away). Eggs always work via `/gift`.\n"
+                "Cannot gift a duck the target already owns.",
                 view=DuckGivingToggleView(),
                 ephemeral=True,
             )
@@ -5447,39 +5503,121 @@ class DuckCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="gift", description="Offer eggs to another member. They must accept; some may be dropped when opened.")
-    @app_commands.describe(member="Who should receive the eggs", amount="How many eggs to send")
+    @app_commands.command(
+        name="gift",
+        description="Send fresh eggs or a duck to someone (separate odds for each).",
+    )
+    @app_commands.describe(
+        member="Who should receive the gift",
+        eggs="How many fresh eggs to send (leave empty if gifting a duck)",
+        duck="Duck to send — start typing; only ones you own (leave empty if sending eggs)",
+    )
+    @app_commands.autocomplete(duck=give_duck_autocomplete)
     async def gift_cmd(
         self,
         interaction: discord.Interaction,
         member: discord.Member,
-        amount: app_commands.Range[int, 1, 10000],
+        eggs: app_commands.Range[int, 1, 10000] = None,
+        duck: str = None,
     ):
         if member.bot:
             return await interaction.response.send_message(
-                "Bots can't receive eggs.", ephemeral=True
+                "Bots can't receive gifts.", ephemeral=True
             )
         if member.id == interaction.user.id:
             return await interaction.response.send_message(
-                "You can't send eggs to yourself.", ephemeral=True
+                "You can't gift yourself.", ephemeral=True
             )
 
-        discord_id = str(interaction.user.id)
-        rec = get_user_record(discord_id)
-        fresh = int(rec.get("inventory_fresh") or 0)
-        if fresh < amount:
+        has_eggs = eggs is not None
+        has_duck = bool(duck and duck.strip())
+        if has_eggs and has_duck:
             return await interaction.response.send_message(
-                f"You only have **{fresh}** fresh egg(s) — rotten/error eggs can't be gifted.",
+                "Pick **either** eggs **or** a duck — not both in one gift.",
+                ephemeral=True,
+            )
+        if not has_eggs and not has_duck:
+            return await interaction.response.send_message(
+                "Provide **eggs** (amount) or **duck** (name).",
                 ephemeral=True,
             )
 
-        egg_word = "egg" if amount == 1 else "eggs"
+        # ----- Eggs path (accept/decline DM + spill on open) -----
+        if has_eggs:
+            discord_id = str(interaction.user.id)
+            rec = get_user_record(discord_id)
+            fresh = int(rec.get("inventory_fresh") or 0)
+            if fresh < eggs:
+                return await interaction.response.send_message(
+                    f"You only have **{fresh}** fresh egg(s) — rotten/error eggs can't be gifted.",
+                    ephemeral=True,
+                )
+            egg_word = "egg" if eggs == 1 else "eggs"
+            return await interaction.response.send_message(
+                f"Offer **{eggs}** {egg_word} to {member.mention}?\n"
+                f"-# They get a DM to Accept or Decline. Some may spill on open "
+                f"(up to ~30%). Decline or 48h timeout returns your eggs in full.",
+                view=GiftConfirmView(interaction.user.id, member.id, eggs),
+                ephemeral=True,
+            )
+
+        # ----- Duck path (weather fortune; fail = runs away) -----
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                "Duck gifts can only be used in a server.", ephemeral=True
+            )
+        guild_id = str(interaction.guild.id)
+        if not duck_config.get(guild_id, {}).get("duck_giving_enabled", False):
+            return await interaction.response.send_message(
+                "Duck giving is currently **off**. A staff member can enable it in `/editor`.",
+                ephemeral=True,
+            )
+
+        giver_id = str(interaction.user.id)
+        target_id = str(member.id)
+        giver = get_user_record(giver_id)
+        target = get_user_record(target_id)
+
+        duck_id = slugify(duck)
+        if duck_id not in giver.get("collection", []):
+            return await interaction.response.send_message(
+                f"You don't own a duck matching **{duck}** — pick one of the suggestions as you type.",
+                ephemeral=True,
+            )
+        if duck_id in target.get("collection", []):
+            return await interaction.response.send_message(
+                f"{member.display_name} already owns that duck — no duplicates allowed.",
+                ephemeral=True,
+            )
+
+        duck_info = duck_index.get(duck_id)
+        duck_title = duck_info["title"] if duck_info else duck
+        duck_emoji = duck_info["emoji"] if duck_info else "🦆"
+
+        # Remove from giver first (and favorites)
+        giver["collection"] = [d for d in giver.get("collection", []) if d != duck_id]
+        favs = giver.get("favorites") or []
+        if duck_id in favs:
+            giver["favorites"] = [d for d in favs if d != duck_id]
+
+        env = await ensure_environment_for_today()
+        fortune_name, success_rate = give_fortune_for_drop_chance(
+            float(env.get("drop_chance_percent") or 10)
+        )
+        fortune_line = f"🧧 The pond reads: **{fortune_name}**"
+
+        if random.random() < success_rate:
+            target.setdefault("collection", []).append(duck_id)
+            await save_duck_state()
+            return await interaction.response.send_message(
+                f"{duck_emoji} **{duck_title}** made it to {member.mention}!\n-# {fortune_line}",
+            )
+
+        await save_duck_state()
         await interaction.response.send_message(
-            f"Offer **{amount}** {egg_word} to {member.mention}?\n"
-            f"-# They'll get a DM to Accept or Decline. Drop chance applies only if they accept "
-            f"(up to ~30%). Decline or 48h timeout returns your eggs in full.",
-            view=GiftConfirmView(interaction.user.id, member.id, amount),
-            ephemeral=True,
+            f"{duck_emoji} **{duck_title}** ran away and is gone… "
+            f"{interaction.user.mention} lost it, {member.mention} never got it.\n"
+            f"-# {fortune_line}",
         )
 
     # ---------- public: view pool / index / collection ----------
@@ -5494,11 +5632,17 @@ class DuckCog(commands.Cog):
         egg_count = env.get("egg_count", 1)
         egg_word = "egg" if egg_count == 1 else "eggs"
 
+        fortune_name, _ = give_fortune_for_drop_chance(float(chance))
+        fortune_line = f"🧧 The pond reads: **{fortune_name}**"
+        eggs_line = f"🪺 Eggs per Drop Today: **{egg_count}** {egg_word}"
+        drop_line = f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check"
+
         if is_error_mode():
             lines = [
                 "# ⚠️ Error - Connection Issues",
-                f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check",
-                f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
+                drop_line,
+                eggs_line,
+                fortune_line,
                 f"🪲 Admin: Error odds **{ERROR_WEIGHT} > {ERROR_WEIGHT_EVENT}**",
             ]
             if is_purge_mode():
@@ -5511,8 +5655,9 @@ class DuckCog(commands.Cog):
         if is_purge_mode():
             lines = [
                 "# 🚨 PURGE MODE",
-                f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check",
-                f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
+                drop_line,
+                eggs_line,
+                fortune_line,
                 "🥷 Drops can be **stolen** (50/50) by other members",
             ]
             embed = discord.Embed(description="\n".join(lines), color=discord.Color.red())
@@ -5524,9 +5669,12 @@ class DuckCog(commands.Cog):
             label = halloween_weather_title(float(chance))
             lines = [
                 f"# {label}",
-                f"{egg_emoji('fresh')} Drop Chance: **{chance}%** per check",
-                f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
-                "-# 🎃 Halloween Mode — treats, themed drops, 5–10 eggs",
+                drop_line,
+                eggs_line,
+                fortune_line,
+                "",
+                "🎃 Halloween Mode",
+                "-# Treats, Trick or Treat & 5-10 egg drops!",
             ]
             embed = discord.Embed(description="\n".join(lines), color=halloween_color())
             embed.set_footer(text="🍬 Leave treats on other drops · /treatboard")
@@ -5544,8 +5692,9 @@ class DuckCog(commands.Cog):
 
         lines = [
             f"# {label}",
-            f"{egg_emoji('fresh')} Drop Chance: **{chance}%** per check",
-            f"🎁 Eggs per Drop Today: **{egg_count}** {egg_word}",
+            drop_line,
+            eggs_line,
+            fortune_line,
         ]
 
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.blue())
@@ -5621,81 +5770,23 @@ class DuckCog(commands.Cog):
 
     @app_commands.command(
         name="give",
-        description="Give a duck from your collection to someone (50/50 — fail and it runs away).",
+        description="Alias of /gift — send fresh eggs or a duck.",
     )
     @app_commands.describe(
-        member="Who should receive the duck",
-        duck="Start typing — only ducks you own will show up",
+        member="Who should receive the gift",
+        eggs="Fresh eggs to send (leave empty if gifting a duck)",
+        duck="Duck to send (leave empty if sending eggs)",
     )
     @app_commands.autocomplete(duck=give_duck_autocomplete)
     async def give_cmd(
         self,
         interaction: discord.Interaction,
         member: discord.Member,
-        duck: str,
+        eggs: app_commands.Range[int, 1, 10000] = None,
+        duck: str = None,
     ):
-        if not interaction.guild:
-            return await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
-
-        guild_id = str(interaction.guild.id)
-        if not duck_config.get(guild_id, {}).get("duck_giving_enabled", False):
-            return await interaction.response.send_message(
-                "Duck giving is currently **off**. A staff member can enable it in `/editor`.",
-                ephemeral=True,
-            )
-
-        if member.bot:
-            return await interaction.response.send_message(
-                "You can't give a duck to a bot.", ephemeral=True
-            )
-        if member.id == interaction.user.id:
-            return await interaction.response.send_message(
-                "You can't give a duck to yourself.", ephemeral=True
-            )
-
-        giver_id = str(interaction.user.id)
-        target_id = str(member.id)
-        giver = get_user_record(giver_id)
-        target = get_user_record(target_id)
-
-        duck_id = slugify(duck)
-        if duck_id not in giver.get("collection", []):
-            return await interaction.response.send_message(
-                f"You don't own a duck matching **{duck}** — pick one of the suggestions as you type.",
-                ephemeral=True,
-            )
-
-        if duck_id in target.get("collection", []):
-            return await interaction.response.send_message(
-                f"{member.display_name} already owns that duck — no duplicates allowed.",
-                ephemeral=True,
-            )
-
-        duck_info = duck_index.get(duck_id)
-        duck_title = duck_info["title"] if duck_info else duck
-        duck_emoji = duck_info["emoji"] if duck_info else "🦆"
-
-        # Remove from giver first (and favorites)
-        giver["collection"] = [d for d in giver.get("collection", []) if d != duck_id]
-        favs = giver.get("favorites") or []
-        if duck_id in favs:
-            giver["favorites"] = [d for d in favs if d != duck_id]
-
-        if random.random() < 0.5:
-            target.setdefault("collection", []).append(duck_id)
-            await save_duck_state()
-            return await interaction.response.send_message(
-                f"{duck_emoji} **{duck_title}** made it to {member.mention}!",
-            )
-
-        # Fail — duck runs away (already removed from giver; not added to target)
-        await save_duck_state()
-        await interaction.response.send_message(
-            f"{duck_emoji} **{duck_title}** ran away and is gone… "
-            f"{interaction.user.mention} lost it, {member.mention} never got it.",
-        )
+        # Same handler as /gift
+        await self.gift_cmd.callback(self, interaction, member, eggs, duck)
 
     @app_commands.command(name="inventory", description="Check how many eggs you have in storage.")
     async def duckinventory_cmd(self, interaction: discord.Interaction):
