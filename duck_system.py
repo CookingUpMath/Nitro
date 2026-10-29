@@ -253,8 +253,8 @@ AIR_DROP_WARM_USERS = 2
 AIR_DROP_HOT_MSGS = 4
 AIR_DROP_HOT_USERS = 3
 AIR_DROP_EXPIRY_SECONDS = 30 * 60     # unclaimed drops expire
-AIR_DROP_TARGET_MIN = 3
-AIR_DROP_TARGET_MAX = 5
+AIR_DROP_TARGET_MIN = 2
+AIR_DROP_TARGET_MAX = 3
 AIR_DROP_EGGS_MIN = 5
 AIR_DROP_EGGS_MAX = 30
 # Winner slots per drop: 1 / 2 / 3
@@ -287,6 +287,9 @@ pending_invite_karma = {}
 # offer expires after GIFT_EXPIRY_SECONDS (full refund).
 GIFT_EXPIRY_SECONDS = 48 * 60 * 60
 pending_gifts = {}
+
+# Live ground drops eligible for ⏪ (message_id → EggDropView)
+active_egg_drops: dict[int, object] = {}
 
 # redeem_codes[code] = {
 #   "eggs": int, "duck_ids": [duck_id, ...],
@@ -361,11 +364,135 @@ environment_state = {
     "error_mode": False,
     "purge_mode": False,
     "halloween_mode": False,
+    "rewind_mode": False,  # November Rewind package (tokens, ⏪, retro weather)
     # Custom egg emojis (editor) — fresh replaces default 🥚 everywhere
     "egg_emoji_fresh": "🥚",
     "egg_emoji_rotten": "🦠",
     "egg_emoji_error": "🪲",
 }
+
+# ---------------------------------------------------------------------------
+# Rewind (event toggle) + Yearbook (separate toggle)
+# ---------------------------------------------------------------------------
+REWIND_TOKEN_CAP = 5
+REWIND_EGGS_PER_TOKEN = 100  # hatched eggs → +1 token
+REWIND_REACT = "⏪"
+
+# Dictionary-style words for reverse air drops (random pick)
+REVERSE_AIR_WORDS = [
+    "quack", "pond", "feather", "mallard", "ripple", "drift", "nest", "shell",
+    "bread", "waddle", "splash", "current", "reed", "lily", "fog", "mist",
+    "neon", "tape", "static", "synth", "pulse", "echo", "wave", "tide",
+    "storm", "cloud", "rain", "thunder", "breeze", "gust", "shine", "glow",
+    "pixel", "arcade", "cassette", "rewind", "future", "past", "clock", "tower",
+    "hover", "flux", "chrome", "violet", "indigo", "sunset", "midnight", "dawn",
+    "lucky", "clutch", "yapper", "lurker", "screenshot", "thread", "buffer", "glitch",
+    "orange", "purple", "silver", "golden", "copper", "marble", "pebble", "stream",
+]
+
+# yearbook_state is global (one pond)
+# {
+#   "enabled": bool,
+#   "channel_id": int | None,
+#   "message_id": int | None,  # editable results message
+#   "role_id": int | None,
+#   "winner_duck_id": str | None,
+#   "winner_eggs": int,
+#   "disqualified": [discord_id, ...],
+#   "week_id": "2026-W44",
+#   "nominate_titles": [ {title, line}, ... ]  # 4 this week
+#   "used_titles": [title, ...],
+#   "votes": { title: { nominee_id: { "count", "first_at", "voters": [] } } },
+#   "ballots": { discord_id: True },  # submitted this week
+#   "stats": { discord_id: { hatched, earned, karma, luck } },
+#   "last_winners": [ {kind, title, line, user_id}, ... ],
+# }
+yearbook_state: dict = {
+    "enabled": False,
+    "channel_id": None,
+    "message_id": None,
+    "role_id": None,
+    "winner_duck_id": None,
+    "winner_eggs": 500,
+    "disqualified": [],
+    "week_id": None,
+    "nominate_titles": [],
+    "used_titles": [],
+    "votes": {},
+    "ballots": {},
+    "stats": {},
+    "last_winners": [],
+}
+
+YEARBOOK_BANNER_URL = (
+    "https://cdn.discordapp.com/attachments/1055252004114546799/"
+    "1565237978677256332/POND-YEAR-BOOK-2026-10-27.png"
+    "?ex=6ae42cf6&is=6ae2db76&hm=9235bdac59d86aa947c108c9e49acb4494908f3a4d1abe617460e9242f117699&"
+)
+YEARBOOK_NOMINATE_MIN_VOTES = 3
+YEARBOOK_BALLOT_REWARD = 50
+YEARBOOK_MSG_REQUIREMENT = 50
+YEARBOOK_COMPETITIVE = [
+    ("shell_breaker", "Shell Breaker", "Accomplished the most hatches"),
+    ("pond_provider", "Pond Provider", "Earned the most eggs from drops"),
+    ("good_egg", "Good Egg", "Earned the most karma"),
+    ("lucky_duck", "Lucky Duck", "Most Secret, Quackpot & Error pulls"),
+]
+YEARBOOK_NOMINATION_POOL = [
+    ("Ghost Mallard", "Most likely to reply days later."),
+    ("Quacks-a-lot", "Most likely still up at 3am."),
+    ("Golden Egg", "Most likely to change the subject."),
+    ("Pond Weed", "Most likely watching chat quietly."),
+    ("Sitting Duck", "Most likely the joke of the day."),
+    ("Ugly Duckling", "Most likely \"new era unlocked.\""),
+    ("Mother Duck", "Most likely checking on everyone."),
+    ("Bread Duck", "Most likely repeating your own joke."),
+    ("Full Pond", "Most likely in every chat at once."),
+    ("Hatchling", "Most likely needs the backstory."),
+    ("Rare Duck", "Most likely one great line, then gone."),
+    ("Nest Egg", "Most likely always \"busy.\""),
+    ("Midnight Mallard", "Most likely funnier at night."),
+    ("Feather Cap", "Most likely shy about compliments."),
+    ("Duck Outta Water", "Most likely confused but committed."),
+    ("Plot Duck", "Most likely \"anyway…\" into a new topic."),
+    ("Teacher's Duck", "Most likely remembers the rules."),
+    ("Class Duck", "Most likely trying to organize chaos."),
+    ("Quiet Duck", "Most likely says little, hits hard."),
+    ("Online Duck", "Most likely always typed first."),
+    ("Lurker Duck", "Most likely reacts, never types."),
+    ("Yapper Duck", "Most likely writes a whole essay."),
+    ("Chaos Duck", "Most likely adds one more idea."),
+    ("Soft Duck", "Most likely big news, tiny message."),
+    ("Finale Duck", "Most likely says bye then stays."),
+    ("NPC Duck", "Most likely in the background of the story."),
+    ("Protag Duck", "Most likely somehow in every story."),
+    ("Buffer Duck", "Most likely froze at the worst time."),
+    ("Day-One Duck", "Most likely starts with \"remember when.\""),
+    ("Screenshot Duck", "Most likely already saved it."),
+    ("Lucky Duck", "Most likely wins by accident."),
+    ("Wish Duck", "Most likely jokes it into happening."),
+    ("Hoarder Duck", "Most likely keeps every link."),
+    ("Speed Duck", "Most likely sends five messages in a row."),
+    ("Overthink Duck", "Most likely \"wait, ignore that.\""),
+    ("Peace Duck", "Most likely wants everyone to get along."),
+    ("Thread Duck", "Most likely lost in replies."),
+    ("GM Duck", "Most likely says good morning and leaves."),
+    ("One-Liner Duck", "Most likely shortest message wins."),
+    ("Humble Duck", "Most likely good and won't brag."),
+    ("Flex Duck", "Most likely slipped it into chat."),
+    ("Bad Timing Duck", "Most likely right words, wrong time."),
+    ("Clutch Duck", "Most likely shows up late but useful."),
+    ("Lore Duck", "Most likely explains everything."),
+    ("Regret Duck", "Most likely wants that message back."),
+    ("Vintage Duck", "Most likely using old jokes."),
+    ("Throwback Duck", "Most likely brings back old bits."),
+    ("Glitch Duck", "Most likely misunderstood, still helped."),
+    ("Boss Duck", "Most likely ends the chat with a sticker."),
+    ("Yearbook Duck", "Most likely here for the nomination bit."),
+]
+
+# Luck tiers that score Best Luck / Lucky Duck
+LUCK_RARITIES = {"secret", "quackpot", "mythic", "error"}  # error via is_error flag too
 
 
 def _roll_egg_count() -> int:
@@ -385,6 +512,140 @@ def is_purge_mode() -> bool:
 
 def is_halloween_mode() -> bool:
     return bool(environment_state.get("halloween_mode"))
+
+
+def is_rewind_mode() -> bool:
+    return bool(environment_state.get("rewind_mode"))
+
+
+def is_yearbook_enabled() -> bool:
+    return bool(yearbook_state.get("enabled"))
+
+
+def yearbook_week_id() -> str:
+    eastern = ZoneInfo("America/New_York")
+    return datetime.now(eastern).strftime("%G-W%V")
+
+
+def _yb_stat(uid: str) -> dict:
+    stats = yearbook_state.setdefault("stats", {})
+    rec = stats.setdefault(uid, {"hatched": 0, "earned": 0, "karma": 0, "luck": 0, "msgs": 0})
+    for k in ("hatched", "earned", "karma", "luck", "msgs"):
+        rec.setdefault(k, 0)
+    return rec
+
+
+def yb_add_hatched(uid: str, n: int = 1) -> None:
+    if not is_yearbook_enabled():
+        return
+    if uid in (yearbook_state.get("disqualified") or []):
+        return
+    _yb_stat(uid)["hatched"] += n
+
+
+def yb_add_earned(uid: str, n: int) -> None:
+    """Drops + air drops only (not gifts/nest/yearbook payouts)."""
+    if not is_yearbook_enabled() or n <= 0:
+        return
+    if uid in (yearbook_state.get("disqualified") or []):
+        return
+    _yb_stat(uid)["earned"] += n
+
+
+def yb_add_karma(uid: str, n: int = 1) -> None:
+    if not is_yearbook_enabled() or n <= 0:
+        return
+    if uid in (yearbook_state.get("disqualified") or []):
+        return
+    _yb_stat(uid)["karma"] += n
+
+
+def yb_add_luck(uid: str, duck: dict | None) -> None:
+    if not is_yearbook_enabled() or not duck:
+        return
+    if uid in (yearbook_state.get("disqualified") or []):
+        return
+    rarity = (duck.get("rarity") or "").lower()
+    if duck.get("is_error") or rarity in LUCK_RARITIES:
+        _yb_stat(uid)["luck"] += 1
+
+
+def yb_add_msg(uid: str) -> None:
+    if not is_yearbook_enabled():
+        return
+    if uid in (yearbook_state.get("disqualified") or []):
+        return
+    _yb_stat(uid)["msgs"] += 1
+
+
+def grant_rewind_from_hatch(uid: str, eggs_hatched: int) -> int:
+    """Award rewind tokens from hatched eggs. Returns tokens gained."""
+    if not is_rewind_mode() or eggs_hatched <= 0:
+        return 0
+    rec = get_user_record(uid)
+    progress = int(rec.get("rewind_hatch_progress") or 0) + eggs_hatched
+    tokens = int(rec.get("rewind_tokens") or 0)
+    gained = 0
+    while progress >= REWIND_EGGS_PER_TOKEN and tokens < REWIND_TOKEN_CAP:
+        progress -= REWIND_EGGS_PER_TOKEN
+        tokens += 1
+        gained += 1
+    if tokens >= REWIND_TOKEN_CAP:
+        # Keep leftover progress only if under cap path; still store remainder
+        pass
+    rec["rewind_hatch_progress"] = progress
+    rec["rewind_tokens"] = min(tokens, REWIND_TOKEN_CAP)
+    return gained
+
+
+def try_spend_rewind_token(uid: str) -> bool:
+    if not is_rewind_mode():
+        return False
+    rec = get_user_record(uid)
+    tokens = int(rec.get("rewind_tokens") or 0)
+    if tokens < 1:
+        return False
+    rec["rewind_tokens"] = tokens - 1
+    return True
+
+
+def rewind_weather_label(chance: float) -> str:
+    if chance <= 8:
+        return "📼 Static Mist"
+    if chance <= 10:
+        return "💧 Neon Drizzle"
+    if chance <= 12:
+        return "🌆 Synthwave Skies"
+    if chance <= 13.5:
+        return "💜 Purple Haze"
+    return "📺 Static Overload"
+
+
+def pick_yearbook_titles(n: int = 4) -> list:
+    used = set(yearbook_state.get("used_titles") or [])
+    pool = [(t, line) for t, line in YEARBOOK_NOMINATION_POOL if t not in used]
+    if len(pool) < n:
+        yearbook_state["used_titles"] = []
+        pool = list(YEARBOOK_NOMINATION_POOL)
+    chosen = random.sample(pool, min(n, len(pool)))
+    yearbook_state.setdefault("used_titles", []).extend([t for t, _ in chosen])
+    return [{"title": t, "line": line} for t, line in chosen]
+
+
+def ensure_yearbook_week() -> None:
+    """Roll titles / reset counters when the ISO week changes (if enabled)."""
+    if not yearbook_state.get("enabled"):
+        return
+    wid = yearbook_week_id()
+    if yearbook_state.get("week_id") == wid:
+        if not yearbook_state.get("nominate_titles"):
+            yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+        return
+    yearbook_state["week_id"] = wid
+    yearbook_state["votes"] = {}
+    yearbook_state["ballots"] = {}
+    yearbook_state["stats"] = {}
+    yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
 
 
 def halloween_color() -> discord.Color:
@@ -686,6 +947,8 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("treats", 0)
     rec.setdefault("treats_given", 0)
     rec.setdefault("treats_received", 0)
+    rec.setdefault("rewind_tokens", 0)
+    rec.setdefault("rewind_hatch_progress", 0)
     rec.setdefault("egg_batches", [])
     rec.setdefault("last_qualifying_activity_at", None)
     rec.setdefault("last_rot_check_at", None)
@@ -718,14 +981,19 @@ def record_qualifying_activity(discord_id: str) -> None:
         rec["activity_date"] = today
         rec["activity_msgs_today"] = 0
     rec["activity_msgs_today"] = int(rec.get("activity_msgs_today") or 0) + 1
+    yb_add_msg(discord_id)
 
 
 def award_karma(discord_id: str, points: int = 1):
     rec = get_user_record(discord_id)
     rec["karma"] = rec.get("karma", 0) + points
+    if points > 0:
+        yb_add_karma(discord_id, points)
+    # Normal: 10 karma → 1 egg. Rewind mode: 10 karma → 10 eggs.
+    eggs_per_threshold = 10 if is_rewind_mode() else 1
     while rec["karma"] >= KARMA_PER_EGG:
         rec["karma"] -= KARMA_PER_EGG
-        add_eggs(discord_id, 1, kind="fresh")
+        add_eggs(discord_id, eggs_per_threshold, kind="fresh")
 
 
 def remove_karma(discord_id: str, points: int = 1):
@@ -757,7 +1025,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state
     if _pool is None:
         return
     try:
@@ -766,7 +1034,7 @@ async def load_duck_state():
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
                 "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts',"
-                "'duck_air_drop_state','duck_series')"
+                "'duck_air_drop_state','duck_series','duck_yearbook')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -779,6 +1047,9 @@ async def load_duck_state():
             pending_gifts = data.get("duck_pending_gifts", {})
             air_drop_state = data.get("duck_air_drop_state", {})
             duck_series = data.get("duck_series", {})
+            yb = data.get("duck_yearbook")
+            if isinstance(yb, dict):
+                yearbook_state.update(yb)
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -793,6 +1064,7 @@ async def load_duck_state():
             environment_state.setdefault("error_mode", False)
             environment_state.setdefault("purge_mode", False)
             environment_state.setdefault("halloween_mode", False)
+            environment_state.setdefault("rewind_mode", False)
             environment_state.setdefault("egg_emoji_fresh", "🥚")
             environment_state.setdefault("egg_emoji_rotten", "🦠")
             environment_state.setdefault("egg_emoji_error", "🪲")
@@ -838,6 +1110,7 @@ async def save_duck_state() -> bool:
                     ("duck_pending_gifts", json.dumps(pending_gifts)),
                     ("duck_air_drop_state", json.dumps(air_drop_state)),
                     ("duck_series", json.dumps(duck_series)),
+                    ("duck_yearbook", json.dumps(yearbook_state)),
                 ],
             )
         return True
@@ -974,13 +1247,16 @@ def measure_air_drop_heat(guild_id: str) -> str:
 
 def schedule_next_air_drop(guild_id: str) -> float:
     """Set next_drop_at from current chat heat. Returns that timestamp."""
-    tier = measure_air_drop_heat(guild_id)
-    if tier == "hot":
-        delay = random.randint(AIR_DROP_HOT_MIN, AIR_DROP_HOT_MAX)
-    elif tier == "warm":
-        delay = random.randint(AIR_DROP_WARM_MIN, AIR_DROP_WARM_MAX)
+    if is_rewind_mode() and random.random() < 0.10:
+        delay = 5 * 60  # 10% chance of a rapid follow-up drop
     else:
-        delay = random.randint(AIR_DROP_QUIET_MIN, AIR_DROP_QUIET_MAX)
+        tier = measure_air_drop_heat(guild_id)
+        if tier == "hot":
+            delay = random.randint(AIR_DROP_HOT_MIN, AIR_DROP_HOT_MAX)
+        elif tier == "warm":
+            delay = random.randint(AIR_DROP_WARM_MIN, AIR_DROP_WARM_MAX)
+        else:
+            delay = random.randint(AIR_DROP_QUIET_MIN, AIR_DROP_QUIET_MAX)
     when = time.time() + delay
     get_air_drop_state(guild_id)["next_drop_at"] = when
     return when
@@ -1364,6 +1640,8 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
         add_eggs(discord_id, 1, kind="error")
         error_egg_gained = True
 
+    yb_add_luck(discord_id, duck)
+
     return {
         "duck_id": duck_id,
         "title": duck["title"],
@@ -1669,6 +1947,7 @@ class EggDropView(discord.ui.View):
         self.claimed = False
         self.purge = purge
         self.halloween = halloween
+        self.rewound = False  # one ⏪ per drop
         self.treat_bonus = 0
         self.treat_uses = 0
         self.treat_pressers: set[int] = set()
@@ -1837,6 +2116,7 @@ class EggDropView(discord.ui.View):
         self._award_treat_received(discord_id)
         rec = get_user_record(discord_id)
         add_eggs(discord_id, self.egg_count, kind="fresh")
+        yb_add_earned(discord_id, self.egg_count)
         await save_duck_state()
         self.stop()
         egg_word = "egg" if self.egg_count == 1 else "eggs"
@@ -1941,6 +2221,7 @@ class EggDropView(discord.ui.View):
             stealer_id = str(interaction.user.id)
             # Finder didn't claim — no treats_received credit
             add_eggs(stealer_id, self.egg_count, kind="fresh")
+            yb_add_earned(stealer_id, self.egg_count)
             await save_duck_state()
             self.stop()
             egg_word = "egg" if self.egg_count == 1 else "eggs"
@@ -2536,6 +2817,15 @@ class ErrorAdminView(discord.ui.View):
         hallo_btn.callback = self.toggle_halloween
         self.add_item(hallo_btn)
 
+        rewind_on = is_rewind_mode()
+        rewind_btn = discord.ui.Button(
+            label="Rewind ON" if rewind_on else "Rewind",
+            style=discord.ButtonStyle.success if rewind_on else discord.ButtonStyle.secondary,
+            emoji="⏪",
+        )
+        rewind_btn.callback = self.toggle_rewind
+        self.add_item(rewind_btn)
+
     async def _edit(self, interaction: discord.Interaction):
         try:
             if not interaction.response.is_done():
@@ -2613,6 +2903,34 @@ class ErrorAdminView(discord.ui.View):
             )
         await interaction.response.send_message(msg, ephemeral=True)
         # Refresh the error panel if possible
+        try:
+            self._rebuild_items()
+            await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True)
+        except Exception:
+            pass
+
+    async def toggle_rewind(self, interaction: discord.Interaction):
+        environment_state.setdefault("rewind_mode", False)
+        turning_on = not environment_state["rewind_mode"]
+        environment_state["rewind_mode"] = turning_on
+        await save_duck_state()
+        if turning_on:
+            msg = (
+                "⏪ **Rewind Mode ON**\n"
+                f"• Tokens: **1 per {REWIND_EGGS_PER_TOKEN} hatched**, cap **{REWIND_TOKEN_CAP}**\n"
+                "• React ⏪ on drops (boost them / yourself) or air drops (exact clone)\n"
+                "• ~1/3 air drops are reverse-word challenges\n"
+                "• **10 karma → 10 eggs** (instead of 1)\n"
+                "• 25% token refund when ⏪ boosting someone else's ground drop\n"
+                "• Retro weather labels on `/weather`"
+            )
+        else:
+            msg = (
+                "✅ **Rewind Mode OFF**\n"
+                "• ⏪ reactions ignored · tokens hidden from inventory\n"
+                "• Normal weather titles · normal air-drop mix"
+            )
+        await interaction.response.send_message(msg, ephemeral=True)
         try:
             self._rebuild_items()
             await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True)
@@ -4469,6 +4787,7 @@ class DuckCog(commands.Cog):
         self.expire_pending_gifts_loop.start()
         self.crown_role_payout_loop.start()
         self.air_drop_loop.start()
+        self.yearbook_week_loop.start()
 
         # Re-register persistent gift offer buttons after restart
         for gift_id in list(pending_gifts.keys()):
@@ -4490,6 +4809,7 @@ class DuckCog(commands.Cog):
         self.nest_reset_loop.cancel()
         self.expire_pending_gifts_loop.cancel()
         self.crown_role_payout_loop.cancel()
+        self.yearbook_week_loop.cancel()
         self.air_drop_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -4624,6 +4944,7 @@ class DuckCog(commands.Cog):
         try:
             sent = await message.channel.send(content=drop_text, view=view)
             view.message = sent
+            active_egg_drops[sent.id] = view
             duck_stats["total_dropped"] = duck_stats.get("total_dropped", 0) + egg_count
             await save_duck_state()
         except Exception as e:
@@ -4701,6 +5022,12 @@ class DuckCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        # Rewind ⏪ on ground drops / air drops
+        try:
+            await self._process_rewind_reaction(payload)
+        except Exception as e:
+            print(f"[rewind] reaction handle failed: {e}")
+
         # Air-drop reaction challenges (unicode emoji, first correct react wins)
         try:
             await self._process_air_drop_reaction(payload)
@@ -5098,8 +5425,14 @@ class DuckCog(commands.Cog):
     ):
         """Award eggs for one winner slot. Clears the drop only when all slots are filled."""
         state = get_air_drop_state(guild_id)
-        cur = state.get("active")
-        if not cur or cur.get("message_id") != active.get("message_id"):
+        slot_key = None
+        cur = None
+        for key in ("active", "secondary"):
+            cand = state.get(key)
+            if cand and cand.get("message_id") == active.get("message_id"):
+                slot_key, cur = key, cand
+                break
+        if not cur:
             return  # already finished / expired
 
         uid = str(winner.id)
@@ -5120,12 +5453,22 @@ class DuckCog(commands.Cog):
 
         eggs = int(cur["eggs"])
         add_eggs(uid, eggs, kind="fresh")
+        yb_add_earned(uid, eggs)
         rec = get_user_record(uid)
 
         if filled >= slots:
-            state["active"] = None
-            state["last_drop_ended_at"] = time.time()
-            schedule_next_air_drop(guild_id)
+            state[slot_key] = None
+            # Only schedule the next natural drop when the *primary* finishes
+            if slot_key == "active" and not state.get("secondary"):
+                state["last_drop_ended_at"] = time.time()
+                schedule_next_air_drop(guild_id)
+            elif slot_key == "active" and state.get("secondary"):
+                # Promote secondary to primary so lifecycle stays simple
+                state["active"] = state["secondary"]
+                state["secondary"] = None
+            elif slot_key == "secondary" and not state.get("active"):
+                state["last_drop_ended_at"] = time.time()
+                schedule_next_air_drop(guild_id)
 
         await save_duck_state()
 
@@ -5141,8 +5484,15 @@ class DuckCog(commands.Cog):
         except Exception as e:
             print(f"[air_drop] claim announce failed: {e}")
 
+    def _iter_air_drop_actives(self, guild_id: str):
+        state = get_air_drop_state(guild_id)
+        for key in ("active", "secondary"):
+            a = state.get(key)
+            if a:
+                yield key, a
+
     async def _process_air_drop_message(self, message: discord.Message):
-        """Count a qualifying message toward a message-type air drop."""
+        """Count a qualifying message toward a message-type air drop, or reverse-word claim."""
         guild_id = str(message.guild.id)
         cfg = duck_config.get(guild_id, {})
         if not cfg.get("air_drops_enabled", True):
@@ -5151,30 +5501,120 @@ class DuckCog(commands.Cog):
         if not channel_id or message.channel.id != int(channel_id):
             return
 
+        uid = str(message.author.id)
+        for _key, active in self._iter_air_drop_actives(guild_id):
+            if int(active.get("channel_id", 0)) != message.channel.id:
+                continue
+            if message.created_at.timestamp() < float(active.get("created_at", 0)):
+                continue
+            if uid in (active.get("winners") or []):
+                continue
+
+            kind = active.get("kind", "messages")
+            if kind == "reverse":
+                content = (message.content or "").strip().lower()
+                if content == (active.get("answer") or ""):
+                    await self._complete_air_drop(guild_id, message.channel, message.author, active)
+                continue
+
+            if kind != "messages":
+                continue
+
+            progress = active.setdefault("progress", {})
+            progress[uid] = progress.get(uid, 0) + 1
+            target = int(active["target"])
+
+            if progress[uid] < target:
+                await save_duck_state()
+                continue
+
+            await self._complete_air_drop(guild_id, message.channel, message.author, active)
+
+    async def _process_rewind_reaction(self, payload: discord.RawReactionActionEvent):
+        """Spend a rewind token to double a live drop or stack a second air drop."""
+        if not is_rewind_mode():
+            return
+        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+            return
+        if payload.emoji.id is not None:
+            return
+        if payload.emoji.name != REWIND_REACT:
+            return
+        if is_purge_mode():
+            return
+
+        uid = str(payload.user_id)
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        member = guild.get_member(payload.user_id) or payload.member
+        if member is None or member.bot:
+            return
+
+        # Ground drop?
+        view = active_egg_drops.get(payload.message_id)
+        if view is not None:
+            if getattr(view, "claimed", False) or getattr(view, "rewound", False):
+                return
+            if not try_spend_rewind_token(uid):
+                return
+            view.rewound = True
+            eggs = int(getattr(view, "egg_count", 1) or 1)
+            # Own drop → you; someone else's → they get the eggs
+            target_id = str(view.owner_id)
+            add_eggs(target_id, eggs, kind="fresh")
+            yb_add_earned(target_id, eggs)
+            # 25% token refund only when boosting someone else's ground drop
+            refunded = False
+            if target_id != uid and random.random() < 0.25:
+                rec = get_user_record(uid)
+                tokens = int(rec.get("rewind_tokens") or 0)
+                if tokens < REWIND_TOKEN_CAP:
+                    rec["rewind_tokens"] = tokens + 1
+                    refunded = True
+            await save_duck_state()
+            channel = self.bot.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    if str(view.owner_id) == uid:
+                        who = "their own"
+                    else:
+                        who = f"<@{view.owner_id}>'s"
+                    extra = " · ⏪ token refunded!" if refunded else ""
+                    await channel.send(
+                        f"⏪ {member.mention} rewound {who} drop — "
+                        f"**+{eggs}** eggs to <@{view.owner_id}>!{extra}",
+                        delete_after=20,
+                    )
+                except Exception:
+                    pass
+            return
+
+        # Air drop active message? (primary or secondary clone)
+        guild_id = str(payload.guild_id)
         state = get_air_drop_state(guild_id)
         active = state.get("active")
-        if not active:
+        secondary = state.get("secondary")
+        target_active = None
+        if active and int(active.get("message_id") or 0) == payload.message_id:
+            target_active = active
+        elif secondary and int(secondary.get("message_id") or 0) == payload.message_id:
+            target_active = secondary
+        if not target_active:
             return
-        if active.get("kind", "messages") != "messages":
+        if target_active.get("rewound"):
             return
-        if int(active.get("channel_id", 0)) != message.channel.id:
+        if state.get("secondary"):
+            # Only one clone chain at a time
             return
-        if message.created_at.timestamp() < float(active.get("created_at", 0)):
+        if not try_spend_rewind_token(uid):
             return
-
-        uid = str(message.author.id)
-        if uid in (active.get("winners") or []):
-            return  # already won a slot — don't farm another
-
-        progress = active.setdefault("progress", {})
-        progress[uid] = progress.get(uid, 0) + 1
-        target = int(active["target"])
-
-        if progress[uid] < target:
-            await save_duck_state()
-            return
-
-        await self._complete_air_drop(guild_id, message.channel, message.author, active)
+        target_active["rewound"] = True
+        await save_duck_state()
+        channel = self.bot.get_channel(payload.channel_id)
+        if channel and isinstance(channel, discord.TextChannel):
+            # Stack an exact clone of this air drop
+            await self._post_air_drop_clone(guild, guild_id, channel, target_active)
 
     async def _process_air_drop_reaction(self, payload: discord.RawReactionActionEvent):
         """Correct emoji reaction claims one winner slot on a reaction-type air drop."""
@@ -5185,18 +5625,22 @@ class DuckCog(commands.Cog):
         if not cfg.get("air_drops_enabled", True):
             return
 
-        state = get_air_drop_state(guild_id)
-        active = state.get("active")
-        if not active or active.get("kind") != "reaction":
-            return
-        if int(active.get("message_id", 0)) != payload.message_id:
-            return
-        if int(active.get("channel_id", 0)) != payload.channel_id:
-            return
-
         if payload.emoji.id is not None:
             return  # custom emoji
-        if payload.emoji.name != active.get("emoji"):
+
+        active = None
+        for _key, cand in self._iter_air_drop_actives(guild_id):
+            if cand.get("kind") != "reaction":
+                continue
+            if int(cand.get("message_id", 0)) != payload.message_id:
+                continue
+            if int(cand.get("channel_id", 0)) != payload.channel_id:
+                continue
+            if payload.emoji.name != cand.get("emoji"):
+                continue
+            active = cand
+            break
+        if not active:
             return
 
         uid = str(payload.user_id)
@@ -5219,10 +5663,125 @@ class DuckCog(commands.Cog):
 
         await self._complete_air_drop(guild_id, channel, member, active)
 
+    async def _post_air_drop_clone(
+        self,
+        guild: discord.Guild,
+        guild_id: str,
+        channel: discord.TextChannel,
+        source: dict,
+    ):
+        """Exact clone of an air drop (same kind, eggs, target/emoji/word/answer, slots)."""
+        eggs = int(source.get("eggs") or AIR_DROP_EGGS_MIN)
+        kind = source.get("kind") or "messages"
+        slots = max(1, int(source.get("slots") or 1))
+        view = None
+
+        if kind == "trick_or_treat":
+            answer = source.get("answer") or random.choice(["trick", "treat"])
+            embed = build_air_drop_announce_embed(eggs, kind="trick_or_treat", slots=slots)
+            active = {
+                "kind": "trick_or_treat",
+                "channel_id": channel.id,
+                "message_id": None,
+                "answer": answer,
+                "eggs": eggs,
+                "slots": slots,
+                "winners": [],
+                "locked_out": [],
+                "created_at": time.time(),
+                "progress": {},
+                "rewound": True,  # clones can't be rewound again
+            }
+            view = AirDropTrickTreatView(guild_id)
+        elif kind == "reaction":
+            emoji = source.get("emoji") or random.choice(AIR_DROP_REACTION_EMOJIS)
+            embed = build_air_drop_announce_embed(
+                eggs, kind="reaction", emoji=emoji, slots=slots
+            )
+            active = {
+                "kind": "reaction",
+                "channel_id": channel.id,
+                "message_id": None,
+                "emoji": emoji,
+                "eggs": eggs,
+                "slots": slots,
+                "winners": [],
+                "created_at": time.time(),
+                "progress": {},
+                "rewound": True,
+            }
+        elif kind == "reverse":
+            word = source.get("word") or random.choice(REVERSE_AIR_WORDS)
+            answer = source.get("answer") or word[::-1].lower()
+            embed = discord.Embed(
+                description=(
+                    f"# ⏪ Reverse Drop\n"
+                    f"Type **`{word}`** **backwards** to claim!\n"
+                    f"-# First to type it correctly · **{eggs}** eggs"
+                    + (f" · **{slots}** winners" if slots > 1 else "")
+                ),
+                color=discord.Color.purple(),
+            )
+            try:
+                embed.set_image(url=AIR_DROP_IMAGE_URL)
+            except Exception:
+                pass
+            active = {
+                "kind": "reverse",
+                "channel_id": channel.id,
+                "message_id": None,
+                "word": word,
+                "answer": answer,
+                "eggs": eggs,
+                "slots": slots,
+                "winners": [],
+                "created_at": time.time(),
+                "progress": {},
+                "rewound": True,
+            }
+        else:
+            target = int(source.get("target") or random.randint(AIR_DROP_TARGET_MIN, AIR_DROP_TARGET_MAX))
+            embed = build_air_drop_announce_embed(
+                eggs, kind="messages", target=target, slots=slots
+            )
+            active = {
+                "kind": "messages",
+                "channel_id": channel.id,
+                "message_id": None,
+                "target": target,
+                "eggs": eggs,
+                "slots": slots,
+                "winners": [],
+                "created_at": time.time(),
+                "progress": {},
+                "rewound": True,
+            }
+
+        # Mark as clone in the embed footer/header
+        try:
+            if embed.description:
+                embed.description = embed.description + "\n-# ⏪ Rewind clone"
+        except Exception:
+            pass
+
+        try:
+            sent = await channel.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[air_drop] clone post failed in {guild.name}: {e}")
+            return
+
+        active["message_id"] = sent.id
+        state = get_air_drop_state(guild_id)
+        state["secondary"] = active
+        await save_duck_state()
+
     async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
         eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
         if is_halloween_mode():
             kind = random.choice(["messages", "reaction", "trick_or_treat"])
+        elif is_rewind_mode():
+            # ~1/3 reverse-word, rest normal
+            kind = random.choice(["messages", "reaction", "reverse"])
         else:
             kind = random.choice(["messages", "reaction"])
         slots = roll_air_drop_slots()
@@ -5254,6 +5813,34 @@ class DuckCog(commands.Cog):
                 "channel_id": channel.id,
                 "message_id": None,
                 "emoji": emoji,
+                "eggs": eggs,
+                "slots": slots,
+                "winners": [],
+                "created_at": time.time(),
+                "progress": {},
+            }
+        elif kind == "reverse":
+            word = random.choice(REVERSE_AIR_WORDS)
+            answer = word[::-1].lower()
+            embed = discord.Embed(
+                description=(
+                    f"# ⏪ Reverse Drop\n"
+                    f"Type **`{word}`** **backwards** to claim!\n"
+                    f"-# First to type it correctly · **{eggs}** eggs"
+                    + (f" · **{slots}** winners" if slots > 1 else "")
+                ),
+                color=discord.Color.purple(),
+            )
+            try:
+                embed.set_image(url=AIR_DROP_IMAGE_URL)
+            except Exception:
+                pass
+            active = {
+                "kind": "reverse",
+                "channel_id": channel.id,
+                "message_id": None,
+                "word": word,
+                "answer": answer,
                 "eggs": eggs,
                 "slots": slots,
                 "winners": [],
@@ -5411,6 +5998,154 @@ class DuckCog(commands.Cog):
 
     @crown_role_payout_loop.before_loop
     async def before_crown_role_payout_loop(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def yearbook_week_loop(self):
+        """Monday 00:05 Eastern: pay winners, refresh board, roll new week."""
+        if not is_yearbook_enabled():
+            return
+        try:
+            eastern = ZoneInfo("America/New_York")
+        except Exception:
+            return
+        now = datetime.now(eastern)
+        # Monday hour 0, minute >= 5; run once per week_id
+        if now.weekday() != 0 or now.hour != 0 or now.minute < 5:
+            return
+        ensure_yearbook_week()
+        wid = yearbook_week_id()
+        if yearbook_state.get("last_resolved_week") == wid:
+            return
+        # Close was 1h earlier — we resolve Monday 00:05
+        winners = []
+        # Competitive
+        key_map = {
+            "shell_breaker": "hatched",
+            "pond_provider": "earned",
+            "good_egg": "karma",
+            "lucky_duck": "luck",
+        }
+        for key, title, desc in YEARBOOK_COMPETITIVE:
+            best_uid, best_n, best_first = None, -1, None
+            for uid, st in (yearbook_state.get("stats") or {}).items():
+                if uid in (yearbook_state.get("disqualified") or []):
+                    continue
+                n = int(st.get(key_map[key]) or 0)
+                if n > best_n:
+                    best_n, best_uid = n, uid
+            if best_uid and best_n > 0:
+                winners.append({"kind": "comp", "title": title, "line": desc, "user_id": best_uid, "score": best_n})
+        # Nominations
+        for t in (yearbook_state.get("nominate_titles") or []):
+            title = t["title"]
+            seat = (yearbook_state.get("votes") or {}).get(title) or {}
+            best_uid, best_n, best_at = None, 0, None
+            for nid, entry in seat.items():
+                if nid in (yearbook_state.get("disqualified") or []):
+                    continue
+                c = int(entry.get("count") or 0)
+                fa = float(entry.get("first_at") or 0)
+                if c < YEARBOOK_NOMINATE_MIN_VOTES:
+                    continue
+                if c > best_n or (c == best_n and (best_at is None or fa < best_at)):
+                    best_n, best_uid, best_at = c, nid, fa
+            if best_uid:
+                winners.append({
+                    "kind": "nom", "title": title, "line": t.get("line") or "",
+                    "user_id": best_uid, "score": best_n,
+                })
+
+        eggs_amt = int(yearbook_state.get("winner_eggs") or 500)
+        duck_id = yearbook_state.get("winner_duck_id")
+        role_id = yearbook_state.get("role_id")
+
+        for w in winners:
+            uid = w["user_id"]
+            add_eggs(uid, eggs_amt, kind="fresh")  # does not count as earned
+            rec = get_user_record(uid)
+            if duck_id and duck_id not in rec.get("collection", []):
+                rec.setdefault("collection", []).append(duck_id)
+                w["duck_given"] = True
+            else:
+                w["duck_given"] = False
+
+        yearbook_state["last_winners"] = winners
+        yearbook_state["last_resolved_week"] = wid
+        # Roll next week clean
+        yearbook_state["votes"] = {}
+        yearbook_state["ballots"] = {}
+        yearbook_state["stats"] = {}
+        yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+        await save_duck_state()
+
+        # Roles + DMs + channel edit
+        for guild in self.bot.guilds:
+            role = guild.get_role(int(role_id)) if role_id else None
+            for w in winners:
+                member = guild.get_member(int(w["user_id"]))
+                if member and role and role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Yearbook winner")
+                    except Exception:
+                        pass
+                if member:
+                    try:
+                        duck_line = ""
+                        if w.get("duck_given") and duck_id and duck_id in duck_index:
+                            d = duck_index[duck_id]
+                            duck_line = f"\n{d['emoji']} **{d['title']}** added to your collection!"
+                        elif duck_id:
+                            duck_line = "\n-# Winner duck already owned (no duplicate)."
+                        await member.send(
+                            f"📖 You won **{w['title']}** in the Pond Yearbook!\n"
+                            f"**+{eggs_amt}** eggs.{duck_line}"
+                        )
+                    except Exception:
+                        pass
+
+            ch_id = yearbook_state.get("channel_id")
+            msg_id = yearbook_state.get("message_id")
+            if not ch_id or not msg_id:
+                continue
+            channel = guild.get_channel(int(ch_id))
+            if channel is None:
+                continue
+            embeds = []
+            for w in winners:
+                member = guild.get_member(int(w["user_id"]))
+                av = member.display_avatar.url if member else None
+                emb = discord.Embed(
+                    description=(
+                        f"# {w['title']}\n"
+                        f"## <@{w['user_id']}>\n"
+                        f"-# {w['line']}"
+                    ),
+                    color=discord.Color.purple(),
+                )
+                if av:
+                    emb.set_thumbnail(url=av)
+                embeds.append(emb)
+            if not embeds:
+                embeds = [discord.Embed(
+                    description="# Pond Yearbook\n## No winners this week\n-# Awaiting next week",
+                    color=discord.Color.dark_grey(),
+                )]
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.edit(content=None, embeds=embeds[:10])
+            except Exception as e:
+                print(f"[yearbook] results edit failed: {e}")
+                try:
+                    await channel.send(YEARBOOK_BANNER_URL)
+                    sent = await channel.send(embeds=embeds[:10])
+                    yearbook_state["message_id"] = sent.id
+                    await save_duck_state()
+                except Exception as e2:
+                    print(f"[yearbook] results repost failed: {e2}")
+
+    @yearbook_week_loop.before_loop
+    async def before_yearbook_week_loop(self):
         await self.bot.wait_until_ready()
 
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
@@ -5681,6 +6416,22 @@ class DuckCog(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
+        if is_rewind_mode():
+            label = rewind_weather_label(float(chance))
+            lines = [
+                f"# {label}",
+                drop_line,
+                eggs_line,
+                fortune_line,
+                "",
+                "⏪ Rewind Mode",
+                "-# Spend ⏪ tokens on drops · reverse-word air drops · retro skies",
+            ]
+            embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
+            embed.set_footer(text="⏪ Tokens from hatching · /inventory")
+            await interaction.followup.send(embed=embed)
+            return
+
         if chance <= 8:
             label = "🌦️ Calm"
         elif chance <= 11:
@@ -5818,6 +6569,10 @@ class DuckCog(commands.Cog):
                 f"{egg_lines}"
                 f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
             )
+        if is_rewind_mode():
+            description += (
+                f"> **⏪ Rewind tokens: {int(rec.get('rewind_tokens') or 0)}/{REWIND_TOKEN_CAP}**\n"
+            )
         if locked > 0:
             description += (
                 f"> -# 🔒 **{locked}** from nest wins (hatch/gift only · "
@@ -5954,6 +6709,10 @@ class DuckCog(commands.Cog):
             if result.get("error_egg_gained"):
                 error_eggs_got += 1
 
+        if results:
+            yb_add_hatched(discord_id, len(results))
+            grant_rewind_from_hatch(discord_id, len(results))
+
         await save_duck_state()
 
         if not results:
@@ -6009,5 +6768,338 @@ class DuckCog(commands.Cog):
         await interaction.followup.send("\n".join(lines))
 
 
+    # ---------- Yearbook + Rewind public/staff commands ----------
+
+    @app_commands.command(name="ybe", description="Staff: configure Yearbook (works while disabled).")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def ybe_cmd(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("Server only.", ephemeral=True)
+        view = YearbookAdminView(interaction.guild)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
+        )
+
+    @app_commands.command(name="yearbook", description="View live competitive Yearbook standings.")
+    async def yearbook_cmd(self, interaction: discord.Interaction):
+        if not is_yearbook_enabled():
+            return await interaction.response.send_message(
+                "Yearbook isn't running right now.", ephemeral=True
+            )
+        ensure_yearbook_week()
+        lines = ["# 📖 Pond Yearbook · This week", ""]
+        for key, title, desc in YEARBOOK_COMPETITIVE:
+            best_uid, best_n = None, -1
+            for uid, st in (yearbook_state.get("stats") or {}).items():
+                if uid in (yearbook_state.get("disqualified") or []):
+                    continue
+                n = int(st.get({"shell_breaker": "hatched", "pond_provider": "earned",
+                                "good_egg": "karma", "lucky_duck": "luck"}[key]) or 0)
+                if n > best_n:
+                    best_n, best_uid = n, uid
+            if best_uid and best_n > 0:
+                lines.append(f"**{title}** — <@{best_uid}> · **{best_n}**")
+            else:
+                lines.append(f"**{title}** — —")
+            lines.append(f"-# {desc}")
+        lines.append("")
+        lines.append("## Nomination categories this week")
+        titles = yearbook_state.get("nominate_titles") or []
+        if not titles:
+            lines.append("-# Rolling… try again in a moment.")
+        else:
+            for t in titles:
+                lines.append(f"**{t['title']}**")
+                lines.append(f"-# {t['line']}")
+        lines.append("")
+        lines.append("-# Use `/nominate` to cast your ballot (standings stay secret until results).")
+        embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="nominate", description="Cast your weekly Yearbook ballot (4 nominees).")
+    async def nominate_cmd(self, interaction: discord.Interaction):
+        if not is_yearbook_enabled():
+            return await interaction.response.send_message(
+                "Yearbook isn't running right now.", ephemeral=True
+            )
+        if not interaction.guild:
+            return await interaction.response.send_message("Server only.", ephemeral=True)
+        ensure_yearbook_week()
+        uid = str(interaction.user.id)
+        if uid in (yearbook_state.get("disqualified") or []):
+            return await interaction.response.send_message(
+                "You're disqualified from Yearbook participation.", ephemeral=True
+            )
+        if (yearbook_state.get("ballots") or {}).get(uid):
+            return await interaction.response.send_message(
+                "You already submitted a ballot this week.", ephemeral=True
+            )
+        msgs = int(_yb_stat(uid).get("msgs") or 0)
+        if msgs < YEARBOOK_MSG_REQUIREMENT:
+            return await interaction.response.send_message(
+                f"You need **{YEARBOOK_MSG_REQUIREMENT}** qualifying messages this week to nominate.\n"
+                f"**{msgs}/{YEARBOOK_MSG_REQUIREMENT}** so far.",
+                ephemeral=True,
+            )
+        titles = yearbook_state.get("nominate_titles") or []
+        if len(titles) < 4:
+            yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+            titles = yearbook_state["nominate_titles"]
+        await interaction.response.send_message(
+            "Pick **4 different members** — one for each category.\n"
+            "-# No self-nominations. One ballot per week.",
+            view=NominateBallotView(interaction.user.id, titles),
+            ephemeral=True,
+        )
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(DuckCog(bot))
+
+
+# ---- Yearbook UI helpers (admin + nominate ballot) ----
+
+class NominateBallotView(discord.ui.View):
+    def __init__(self, owner_id: int, titles: list):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.titles = titles[:4]
+        self.picks: dict[str, int] = {}  # title -> user_id
+
+        for i, t in enumerate(self.titles):
+            sel = discord.ui.UserSelect(
+                placeholder=f"{t['title'][:80]}",
+                min_values=1,
+                max_values=1,
+                row=i,
+                custom_id=f"yb_nom_{i}",
+            )
+            sel.callback = self._make_cb(t["title"])
+            self.add_item(sel)
+
+        done = discord.ui.Button(label="Submit ballot", style=discord.ButtonStyle.success, row=4)
+        done.callback = self.submit
+        self.add_item(done)
+
+    def _make_cb(self, title: str):
+        async def cb(interaction: discord.Interaction):
+            if interaction.user.id != self.owner_id:
+                return await interaction.response.send_message("Not your ballot.", ephemeral=True)
+            uid = int(interaction.data["values"][0])
+            self.picks[title] = uid
+            await interaction.response.defer()
+        return cb
+
+    async def submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("Not your ballot.", ephemeral=True)
+        if len(self.picks) < len(self.titles):
+            return await interaction.response.send_message(
+                "Pick someone for every category first.", ephemeral=True
+            )
+        vals = list(self.picks.values())
+        if len(set(vals)) != len(vals):
+            return await interaction.response.send_message(
+                "You can't nominate the same person for multiple categories.", ephemeral=True
+            )
+        if interaction.user.id in vals:
+            return await interaction.response.send_message(
+                "You can't nominate yourself.", ephemeral=True
+            )
+        uid = str(interaction.user.id)
+        if (yearbook_state.get("ballots") or {}).get(uid):
+            return await interaction.response.send_message(
+                "You already submitted this week.", ephemeral=True
+            )
+        votes = yearbook_state.setdefault("votes", {})
+        now = time.time()
+        for title, nominee in self.picks.items():
+            nid = str(nominee)
+            if nid in (yearbook_state.get("disqualified") or []):
+                continue
+            seat = votes.setdefault(title, {})
+            entry = seat.setdefault(nid, {"count": 0, "first_at": now, "voters": []})
+            if uid in entry["voters"]:
+                continue
+            entry["voters"].append(uid)
+            entry["count"] = int(entry["count"]) + 1
+            if entry["count"] == 1:
+                entry["first_at"] = now
+        yearbook_state.setdefault("ballots", {})[uid] = True
+        add_eggs(uid, YEARBOOK_BALLOT_REWARD, kind="fresh")
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=f"✅ Ballot in! **+{YEARBOOK_BALLOT_REWARD}** eggs for voting.",
+            view=None,
+        )
+
+
+class YearbookAdminView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.guild = guild
+
+    def build_embed(self) -> discord.Embed:
+        yb = yearbook_state
+        duck = duck_index.get(yb.get("winner_duck_id") or "")
+        duck_s = f"{duck['emoji']} {duck['title']}" if duck else "— not set —"
+        lines = [
+            f"# 📖 Yearbook config",
+            f"**Enabled:** {'Yes' if yb.get('enabled') else 'No (commands hidden from members when off)'}",
+            f"**Channel:** {('<#' + str(yb['channel_id']) + '>') if yb.get('channel_id') else '— not set —'}",
+            f"**Role:** {('<@&' + str(yb['role_id']) + '>') if yb.get('role_id') else '— not set —'}",
+            f"**Winner duck:** {duck_s}",
+            f"**Eggs per seat:** **{int(yb.get('winner_eggs') or 500)}**",
+            f"**Disqualified:** {len(yb.get('disqualified') or [])}",
+            f"**Week:** `{yb.get('week_id') or '—'}`",
+        ]
+        return discord.Embed(description="\n".join(lines), color=discord.Color.purple())
+
+    @discord.ui.button(label="Toggle ON/OFF", style=discord.ButtonStyle.primary, emoji="📖")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        yearbook_state["enabled"] = not bool(yearbook_state.get("enabled"))
+        if yearbook_state["enabled"]:
+            ensure_yearbook_week()
+        else:
+            # Reset used-title history on disable
+            yearbook_state["used_titles"] = []
+            yearbook_state["nominate_titles"] = []
+            yearbook_state["votes"] = {}
+            yearbook_state["ballots"] = {}
+            yearbook_state["stats"] = {}
+            yearbook_state["week_id"] = None
+        await save_duck_state()
+        # Re-sync slash visibility: members only see nominate/yearbook when on
+        try:
+            if interaction.guild:
+                await interaction.client.tree.sync(guild=interaction.guild)
+        except Exception as e:
+            print(f"[yearbook] tree sync: {e}")
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.followup.send(
+            f"Yearbook is now **{'ON' if yearbook_state['enabled'] else 'OFF'}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set channel", style=discord.ButtonStyle.secondary)
+    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Pick the yearbook channel:",
+            view=YearbookChannelPickView(self),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set role", style=discord.ButtonStyle.secondary)
+    async def set_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(YearbookRoleModal(self))
+
+    @discord.ui.button(label="Set winner duck", style=discord.ButtonStyle.secondary)
+    async def set_duck(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(YearbookDuckModal(self))
+
+    @discord.ui.button(label="Disqualify member", style=discord.ButtonStyle.danger, row=1)
+    async def dq(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(YearbookDQModal(self))
+
+
+class YearbookChannelPickView(discord.ui.View):
+    def __init__(self, parent: YearbookAdminView):
+        super().__init__(timeout=60)
+        self.parent = parent
+        sel = discord.ui.ChannelSelect(
+            placeholder="Yearbook results channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        sel.callback = self.picked
+        self.add_item(sel)
+
+    async def picked(self, interaction: discord.Interaction):
+        ch_id = int(interaction.data["values"][0])
+        yearbook_state["channel_id"] = ch_id
+        channel = interaction.guild.get_channel(ch_id)
+        # Post placeholder banner + awaiting message
+        try:
+            await channel.send(YEARBOOK_BANNER_URL)
+            embeds = [
+                discord.Embed(
+                    description=(
+                        f"# {title}\n"
+                        f"## Awaiting winners\n"
+                        f"-# {desc}"
+                    ),
+                    color=discord.Color.dark_grey(),
+                )
+                for _, title, desc in YEARBOOK_COMPETITIVE
+            ]
+            for t in (yearbook_state.get("nominate_titles") or [])[:4]:
+                embeds.append(discord.Embed(
+                    description=f"# {t['title']}\n## Awaiting winners\n-# {t['line']}",
+                    color=discord.Color.dark_grey(),
+                ))
+            msg = await channel.send(embeds=embeds[:10])
+            yearbook_state["message_id"] = msg.id
+        except Exception as e:
+            print(f"[yearbook] channel setup post failed: {e}")
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=f"Yearbook channel set to <#{ch_id}> (placeholder posted).",
+            view=None,
+        )
+
+
+class YearbookRoleModal(discord.ui.Modal, title="Yearbook winner role"):
+    role_id = discord.ui.TextInput(label="Role ID", placeholder="Numeric role id")
+
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            yearbook_state["role_id"] = int(str(self.role_id.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("Invalid role id.", ephemeral=True)
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"Winner role set to <@&{yearbook_state['role_id']}>.", ephemeral=True
+        )
+
+
+class YearbookDuckModal(discord.ui.Modal, title="Yearbook winner duck"):
+    duck_name = discord.ui.TextInput(label="Duck name / id", placeholder="As in activate")
+
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        did = slugify(str(self.duck_name.value))
+        if did not in duck_index:
+            return await interaction.response.send_message("Duck not found.", ephemeral=True)
+        yearbook_state["winner_duck_id"] = did
+        await save_duck_state()
+        d = duck_index[did]
+        await interaction.response.send_message(
+            f"Winner duck: {d['emoji']} **{d['title']}**", ephemeral=True
+        )
+
+
+class YearbookDQModal(discord.ui.Modal, title="Disqualify member"):
+    user_id = discord.ui.TextInput(label="User ID", placeholder="Discord user id")
+
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = str(self.user_id.value).strip()
+        dq = yearbook_state.setdefault("disqualified", [])
+        if uid not in dq:
+            dq.append(uid)
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"Disqualified <@{uid}> from all Yearbook participation.", ephemeral=True
+        )
