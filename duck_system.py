@@ -455,19 +455,21 @@ def build_yearbook_seat_embed(
     if user_id:
         body = (
             f"# ⭐️ {title}\n"
-            f"## Awarded to: <@{user_id}>\n"
-            f"-# 👏 {line}"
+            f"## <@{user_id}>\n"
+            f"-# ❝{line}❞"
         )
     else:
         body = (
             f"# ⭐️ {title}\n"
-            f"## Awarded to: Awaiting winners\n"
-            f"-# 👏 {line}"
+            f"## Awaiting winners\n"
+            f"-# ❝{line}❞"
         )
     emb = discord.Embed(description=body, color=color)
     if avatar_url:
         emb.set_thumbnail(url=avatar_url)
     return emb
+
+
 YEARBOOK_NOMINATE_MIN_VOTES = 3
 YEARBOOK_BALLOT_REWARD = 50
 YEARBOOK_MSG_REQUIREMENT = 50
