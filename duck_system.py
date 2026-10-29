@@ -429,6 +429,45 @@ YEARBOOK_BANNER_URL = (
     "1565237978677256332/POND-YEAR-BOOK-2026-10-27.png"
     "?ex=6ae42cf6&is=6ae2db76&hm=9235bdac59d86aa947c108c9e49acb4494908f3a4d1abe617460e9242f117699&"
 )
+YEARBOOK_EMBED_COLORS = [0xF02AE0, 0x169EFC, 0xF4F4F4]
+
+
+def yearbook_color_sequence(n: int) -> list[int]:
+    """Rotate F02AE0 / 169EFC / F4F4F4 with no same color back-to-back."""
+    if n <= 0:
+        return []
+    colors = list(YEARBOOK_EMBED_COLORS)
+    out = [random.choice(colors)]
+    for _ in range(1, n):
+        choices = [c for c in colors if c != out[-1]]
+        out.append(random.choice(choices))
+    return out
+
+
+def build_yearbook_seat_embed(
+    title: str,
+    line: str,
+    *,
+    user_id: str | None = None,
+    color: int = 0xF02AE0,
+    avatar_url: str | None = None,
+) -> discord.Embed:
+    if user_id:
+        body = (
+            f"# ⭐️ {title}\n"
+            f"## Awarded to: <@{user_id}>\n"
+            f"-# 👏 {line}"
+        )
+    else:
+        body = (
+            f"# ⭐️ {title}\n"
+            f"## Awarded to: Awaiting winners\n"
+            f"-# 👏 {line}"
+        )
+    emb = discord.Embed(description=body, color=color)
+    if avatar_url:
+        emb.set_thumbnail(url=avatar_url)
+    return emb
 YEARBOOK_NOMINATE_MIN_VOTES = 3
 YEARBOOK_BALLOT_REWARD = 50
 YEARBOOK_MSG_REQUIREMENT = 50
@@ -6112,24 +6151,22 @@ class DuckCog(commands.Cog):
             if channel is None:
                 continue
             embeds = []
-            for w in winners:
+            colors = yearbook_color_sequence(len(winners) or 1)
+            for i, w in enumerate(winners):
                 member = guild.get_member(int(w["user_id"]))
                 av = member.display_avatar.url if member else None
-                emb = discord.Embed(
-                    description=(
-                        f"# {w['title']}\n"
-                        f"## <@{w['user_id']}>\n"
-                        f"-# {w['line']}"
-                    ),
-                    color=discord.Color.purple(),
-                )
-                if av:
-                    emb.set_thumbnail(url=av)
-                embeds.append(emb)
+                embeds.append(build_yearbook_seat_embed(
+                    w["title"],
+                    w.get("line") or "",
+                    user_id=w["user_id"],
+                    color=colors[i],
+                    avatar_url=av,
+                ))
             if not embeds:
-                embeds = [discord.Embed(
-                    description="# Pond Yearbook\n## No winners this week\n-# Awaiting next week",
-                    color=discord.Color.dark_grey(),
+                embeds = [build_yearbook_seat_embed(
+                    "Pond Yearbook",
+                    "Awaiting next week",
+                    color=YEARBOOK_EMBED_COLORS[0],
                 )]
             try:
                 msg = await channel.fetch_message(int(msg_id))
@@ -7023,22 +7060,17 @@ class YearbookChannelPickView(discord.ui.View):
         # Post placeholder banner + awaiting message
         try:
             await channel.send(YEARBOOK_BANNER_URL)
-            embeds = [
-                discord.Embed(
-                    description=(
-                        f"# {title}\n"
-                        f"## Awaiting winners\n"
-                        f"-# {desc}"
-                    ),
-                    color=discord.Color.dark_grey(),
-                )
-                for _, title, desc in YEARBOOK_COMPETITIVE
+            seats = [
+                (title, desc) for _, title, desc in YEARBOOK_COMPETITIVE
+            ] + [
+                (t["title"], t.get("line") or "")
+                for t in (yearbook_state.get("nominate_titles") or [])[:4]
             ]
-            for t in (yearbook_state.get("nominate_titles") or [])[:4]:
-                embeds.append(discord.Embed(
-                    description=f"# {t['title']}\n## Awaiting winners\n-# {t['line']}",
-                    color=discord.Color.dark_grey(),
-                ))
+            colors = yearbook_color_sequence(len(seats) or 1)
+            embeds = [
+                build_yearbook_seat_embed(title, line, color=colors[i])
+                for i, (title, line) in enumerate(seats)
+            ]
             msg = await channel.send(embeds=embeds[:10])
             yearbook_state["message_id"] = msg.id
         except Exception as e:
