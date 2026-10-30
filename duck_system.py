@@ -1987,6 +1987,9 @@ def format_series_archive_page(
             space = max(1, ARCHIVE_PAGE_SIZE - ducks_on_page)
             chunk = remaining[:space]
             remaining = remaining[space:]
+            # Blank line between rarity tiers (not before the first block on a page)
+            if current:
+                current.append("")
             current.append(header)
             current.extend(chunk)
             ducks_on_page += len(chunk)
