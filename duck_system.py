@@ -1206,6 +1206,7 @@ def toggle_duck_in_series(series_name: str, duck_id: str) -> str:
             "name": series_name.strip(),
             "duck_ids": [duck_id],
             "created_at": time.time(),
+            "hidden_from_archive": False,
         }
         return "added"
 
@@ -1903,6 +1904,121 @@ def format_grouped_plain(active_ids, owned_ids: set | None = None) -> str:
                 lines.append(f"**{entry}**")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+ARCHIVE_PAGE_SIZE = 20  # duck rows per archive page (rarity headers don't count)
+
+
+def series_archive_rows(series_entry: dict, owned_ids: set) -> tuple[list[str], int, int]:
+    """Ordered display rows for a series. Returns (rows, owned_count, total)."""
+    ids = [d for d in (series_entry.get("duck_ids") or []) if d in duck_index]
+    if not ids:
+        return [], 0, 0
+
+    grouped = {r: [] for r in RARITY_ORDER}
+    for duck_id in ids:
+        duck = duck_index[duck_id]
+        r = duck.get("rarity") or "common"
+        grouped.setdefault(r, []).append(duck_id)
+
+    rows = []
+    for r in RARITY_ORDER:
+        bucket = grouped.get(r) or []
+        if not bucket:
+            continue
+        icon = RARITY_SUMMARY_ICONS.get(r, "🦆")
+        rows.append(("header", f"**`{icon}` {rarity_header(r)}**"))
+        for duck_id in bucket:
+            duck = duck_index[duck_id]
+            entry = f"{duck['emoji']} {duck['title']}"
+            if duck.get("is_error"):
+                entry += " 💢"
+            if duck_id in owned_ids:
+                rows.append(("duck", f"-# {entry}"))
+            else:
+                rows.append(("duck", f"**{entry}**"))
+    owned_n = sum(1 for d in ids if d in owned_ids)
+    return rows, owned_n, len(ids)
+
+
+def format_series_archive_page(
+    series_entry: dict, owned_ids: set, page: int = 0
+) -> tuple[str, int, int]:
+    """One page of archive text. Returns (body, page_index, page_count).
+
+    Sorted by rarity. Groups stay together when they fit. If a single tier
+    is larger than ARCHIVE_PAGE_SIZE it can span pages, but the rarity
+    header is repeated so a page never starts with orphan ducks.
+    """
+    rows, owned_n, total = series_archive_rows(series_entry, owned_ids)
+    if total == 0:
+        return "This series is empty.", 0, 1
+
+    groups: list[tuple[str, list[str]]] = []
+    header = None
+    ducks: list[str] = []
+    for kind, text in rows:
+        if kind == "header":
+            if header is not None:
+                groups.append((header, ducks))
+            header = text
+            ducks = []
+        else:
+            ducks.append(text)
+    if header is not None:
+        groups.append((header, ducks))
+
+    pages: list[list[str]] = []
+    current: list[str] = []
+    ducks_on_page = 0
+
+    for header, duck_lines in groups:
+        remaining = list(duck_lines)
+        while remaining:
+            # New page if this tier won't fit on the current one (and page isn't empty)
+            need = len(remaining)
+            if ducks_on_page > 0 and (ducks_on_page >= ARCHIVE_PAGE_SIZE or need > (ARCHIVE_PAGE_SIZE - ducks_on_page)):
+                # Prefer moving the whole remaining tier to the next page when possible
+                if need <= ARCHIVE_PAGE_SIZE or ducks_on_page > 0:
+                    pages.append(current)
+                    current = []
+                    ducks_on_page = 0
+
+            space = max(1, ARCHIVE_PAGE_SIZE - ducks_on_page)
+            chunk = remaining[:space]
+            remaining = remaining[space:]
+            current.append(header)
+            current.extend(chunk)
+            ducks_on_page += len(chunk)
+
+            if remaining:
+                pages.append(current)
+                current = []
+                ducks_on_page = 0
+
+    if current:
+        pages.append(current)
+    if not pages:
+        pages = [[]]
+
+    page = max(0, min(page, len(pages) - 1))
+    body_lines = [f"-# **{owned_n}/{total}** owned · page **{page + 1}/{len(pages)}**", ""]
+    body_lines.extend(pages[page])
+    return "\n".join(body_lines).strip(), page, len(pages)
+
+
+def archive_visible_series_keys() -> list[str]:
+    """Series shown in /archive (not hidden, has at least one duck). Newest first."""
+    keys = []
+    for key, entry in duck_series.items():
+        if entry.get("hidden_from_archive"):
+            continue
+        ids = [d for d in (entry.get("duck_ids") or []) if d in duck_index]
+        if not ids:
+            continue
+        keys.append(key)
+    keys.sort(key=lambda k: -float((duck_series.get(k) or {}).get("created_at") or 0))
+    return keys
 
 
 def format_egg_channel_name(count: int) -> str:
@@ -2624,6 +2740,132 @@ class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
         if missing:
             lines.append("⚠️ Not found in the index: " + ", ".join(missing))
         await interaction.response.send_message("\n".join(lines) or "Nothing to do.", ephemeral=True)
+
+
+class SeriesHubView(discord.ui.View):
+    """Editor → Manage Series: pick Manage ducks or Hide/Unhide for archive."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Manage ducks", style=discord.ButtonStyle.primary, emoji="📚")
+    async def manage_ducks(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SeriesToggleModal())
+
+    @discord.ui.button(label="Hide", style=discord.ButtonStyle.secondary, emoji="🙈")
+    async def hide_series(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SeriesHideModal())
+
+
+class ArchiveBrowserView(discord.ui.View):
+    """Member /archive — series select + paginated hatchpool-style list (ephemeral)."""
+
+    def __init__(self, user_id: int, series_keys: list[str]):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.series_keys = series_keys
+        self.page_key = series_keys[0]
+        self.page = 0
+        self.page_count = 1
+        entry = duck_series.get(self.page_key) or {}
+        owned = set(get_user_record(str(user_id)).get("collection", []))
+        _, _, self.page_count = format_series_archive_page(entry, owned, 0)
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_items()
+        opts = []
+        for key in self.series_keys[:25]:
+            entry = duck_series.get(key) or {}
+            name = (entry.get("name") or key)[:100]
+            opts.append(discord.SelectOption(
+                label=name,
+                value=key,
+                default=(key == self.page_key),
+            ))
+        select = discord.ui.Select(placeholder="Choose a series", options=opts)
+        select.callback = self.on_select
+        self.add_item(select)
+
+        prev_btn = discord.ui.Button(
+            label="Prev", style=discord.ButtonStyle.secondary, emoji="◀️",
+            disabled=(self.page <= 0),
+        )
+        next_btn = discord.ui.Button(
+            label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+            disabled=(self.page >= self.page_count - 1),
+        )
+        prev_btn.callback = self.on_prev
+        next_btn.callback = self.on_next
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+    def build_embed(self) -> discord.Embed:
+        entry = duck_series.get(self.page_key) or {}
+        name = entry.get("name") or self.page_key
+        owned = set(get_user_record(str(self.user_id)).get("collection", []))
+        body, self.page, self.page_count = format_series_archive_page(
+            entry, owned, self.page
+        )
+        embed = discord.Embed(
+            title=f"📚 {name}",
+            description=body,
+            color=discord.Color.teal(),
+        )
+        embed.set_footer(text="Bold = missing · fine print = owned · 💢 = error · private")
+        return embed
+
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not your archive.", ephemeral=True)
+        self.page_key = interaction.data["values"][0]
+        self.page = 0
+        # build_embed updates page_count
+        embed = self.build_embed()
+        self._rebuild()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_prev(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not your archive.", ephemeral=True)
+        self.page = max(0, self.page - 1)
+        embed = self.build_embed()
+        self._rebuild()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not your archive.", ephemeral=True)
+        self.page = min(self.page_count - 1, self.page + 1)
+        embed = self.build_embed()
+        self._rebuild()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+class SeriesHideModal(discord.ui.Modal, title="Hide / Unhide Series"):
+    """Toggle whether a series appears in /archive."""
+    series_name = discord.ui.TextInput(
+        label="Series Name",
+        max_length=100,
+        placeholder="Exact series name",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = str(self.series_name).strip()
+        key = series_key(name)
+        entry = duck_series.get(key)
+        if not entry:
+            return await interaction.response.send_message(
+                f"❌ No series named **{name}**.", ephemeral=True
+            )
+        entry["hidden_from_archive"] = not bool(entry.get("hidden_from_archive"))
+        await save_duck_state()
+        display = entry.get("name") or name
+        if entry["hidden_from_archive"]:
+            msg = f"🙈 **{display}** is now **hidden** from `/archive`."
+        else:
+            msg = f"👁️ **{display}** is now **visible** in `/archive`."
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 class SeriesToggleModal(discord.ui.Modal, title="Manage Series"):
@@ -4748,7 +4990,13 @@ class EditorView(discord.ui.View):
         elif choice == "toggle_active":
             await interaction.response.send_modal(DuckToggleActiveModal())
         elif choice == "series":
-            await interaction.response.send_modal(SeriesToggleModal())
+            await interaction.response.send_message(
+                "**📚 Series**\n"
+                "• **Manage ducks** — add/remove ducks in a series\n"
+                "• **Hide** — toggle whether a series shows in `/archive`",
+                view=SeriesHubView(),
+                ephemeral=True,
+            )
         elif choice == "clear_pool":
             await interaction.response.send_message(
                 "Deactivate every currently active duck? They stay in the index, just leave the earnable pool.",
@@ -6497,6 +6745,19 @@ class DuckCog(commands.Cog):
         content = format_grouped_plain(active_ids, owned_ids) or "The pool is currently empty."
         embed = discord.Embed(description=content, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="archive", description="Browse past series and see which ducks you're missing.")
+    async def archive_cmd(self, interaction: discord.Interaction):
+        keys = archive_visible_series_keys()
+        if not keys:
+            return await interaction.response.send_message(
+                "No series are in the archive yet.",
+                ephemeral=True,
+            )
+        view = ArchiveBrowserView(interaction.user.id, keys)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
+        )
 
     @app_commands.command(name="index", description="Staff: browse ducks by series / sorting tray.")
     @app_commands.default_permissions(manage_guild=True)
