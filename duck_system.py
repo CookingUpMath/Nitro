@@ -6806,9 +6806,17 @@ class DuckCog(commands.Cog):
         if len(titles) < 4:
             yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
             titles = yearbook_state["nominate_titles"]
-        await interaction.response.send_message(
+        cat_lines = []
+        for t in titles[:4]:
+            cat_lines.append(f"## {t['title']}")
+            cat_lines.append(f"-# {t.get('line') or ''}")
+        body = (
             "Pick **4 different members** — one for each category.\n"
-            "-# No self-nominations. One ballot per week.",
+            "-# No self-nominations. One ballot per week.\n\n"
+            + "\n".join(cat_lines)
+        )
+        await interaction.response.send_message(
+            body,
             view=NominateBallotView(interaction.user.id, titles),
             ephemeral=True,
         )
