@@ -561,15 +561,36 @@ def yearbook_week_id() -> str:
 
 
 def yearbook_week_range_footer() -> str:
-    """Compact Mon–Sun range for the current Eastern ISO week, e.g. 'Nov 3 – 9'."""
+    """Compact start–end for the active Yearbook cycle.
+
+    If carry_next_monday is set (enabled mid-week), the cycle runs through the
+    *next* full week so the first Monday is skipped and progress isn't cut short.
+    """
     eastern = ZoneInfo("America/New_York")
     now = datetime.now(eastern)
-    start = now - timedelta(days=now.weekday())  # Monday
-    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=6)  # Sunday
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    start = week_start
+    enabled_at = yearbook_state.get("enabled_at")
+    if enabled_at:
+        try:
+            start = datetime.fromtimestamp(float(enabled_at), tz=eastern).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        except (TypeError, ValueError, OSError):
+            pass
+
+    end = week_start + timedelta(days=6)  # Sunday of current ISO week
+    if yearbook_state.get("carry_next_monday"):
+        end = end + timedelta(days=7)  # through next Sunday
+
     if start.month == end.month:
-        return f"{start.strftime('%b')} {start.day} – {end.day}"
-    return f"{start.strftime('%b')} {start.day} – {end.strftime('%b')} {end.day}"
+        span = f"{start.strftime('%b')} {start.day} – {end.day}"
+    else:
+        span = f"{start.strftime('%b')} {start.day} – {end.strftime('%b')} {end.day}"
+    return f"{span} · results Mon"
 
 
 def _yb_stat(uid: str) -> dict:
@@ -6753,7 +6774,7 @@ class DuckCog(commands.Cog):
         lines.append("")
         lines.append("-# Use `/nominate` to cast your ballot (standings stay secret until results).")
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
-        embed.set_footer(text=f"{yearbook_week_range_footer()} · results Mon")
+        embed.set_footer(text=yearbook_week_range_footer())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="nominate", description="Cast your weekly Yearbook ballot (4 nominees).")
@@ -6901,6 +6922,7 @@ class YearbookAdminView(discord.ui.View):
         if yearbook_state["enabled"]:
             # Fold any partial week into the next full Monday cycle
             yearbook_state["carry_next_monday"] = True
+            yearbook_state["enabled_at"] = time.time()
             ensure_yearbook_week()
         else:
             # Reset used-title history on disable
@@ -6911,6 +6933,7 @@ class YearbookAdminView(discord.ui.View):
             yearbook_state["stats"] = {}
             yearbook_state["week_id"] = None
             yearbook_state["carry_next_monday"] = False
+            yearbook_state["enabled_at"] = None
         await save_duck_state()
         # Re-sync slash visibility: members only see nominate/yearbook when on
         try:
