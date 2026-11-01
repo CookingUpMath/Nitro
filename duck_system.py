@@ -379,15 +379,45 @@ REWIND_REACT = "⏪"
 
 # Dictionary-style words for reverse air drops (random pick)
 REVERSE_AIR_WORDS = [
+    # pond / duck
     "quack", "pond", "feather", "mallard", "ripple", "drift", "nest", "shell",
     "bread", "waddle", "splash", "current", "reed", "lily", "fog", "mist",
-    "neon", "tape", "static", "synth", "pulse", "echo", "wave", "tide",
+    "drake", "duckling", "paddle", "float", "bank", "shore", "marsh", "swamp",
+    "creek", "brook", "river", "lake", "pool", "dock", "pier", "boat",
+    "anchor", "buoy", "kelp", "algae", "moss", "willow", "birch", "oak",
+    # weather / sky
     "storm", "cloud", "rain", "thunder", "breeze", "gust", "shine", "glow",
+    "sunrise", "sunset", "midnight", "dawn", "dusk", "moon", "star", "comet",
+    "frost", "snow", "hail", "drizzle", "humid", "chilly", "balmy", "crisp",
+    # retro / rewind vibe
+    "neon", "tape", "static", "synth", "pulse", "echo", "wave", "tide",
     "pixel", "arcade", "cassette", "rewind", "future", "past", "clock", "tower",
-    "hover", "flux", "chrome", "violet", "indigo", "sunset", "midnight", "dawn",
+    "hover", "flux", "chrome", "violet", "indigo", "laser", "radar", "signal",
+    "modem", "floppy", "beep", "boop", "retro", "vhs", "walkman", "pager",
+    # server / chat energy
     "lucky", "clutch", "yapper", "lurker", "screenshot", "thread", "buffer", "glitch",
-    "orange", "purple", "silver", "golden", "copper", "marble", "pebble", "stream",
+    "ping", "reply", "scroll", "emoji", "sticker", "react", "voice", "stream",
+    "queue", "lag", "crash", "update", "patch", "bug", "feature", "bot",
+    # colors / materials
+    "orange", "purple", "silver", "golden", "copper", "marble", "pebble", "stone",
+    "amber", "coral", "teal", "mint", "ivory", "onyx", "ruby", "pearl",
+    # everyday short words (good for reverse puzzles)
+    "apple", "banana", "orange", "grape", "lemon", "mango", "peach", "berry",
+    "table", "chair", "window", "door", "light", "shadow", "mirror", "frame",
+    "music", "dance", "sing", "laugh", "smile", "sleep", "dream", "wake",
+    "coffee", "sugar", "honey", "spice", "bread", "toast", "butter", "cheese",
+    "tiger", "panda", "eagle", "whale", "shark", "otter", "fox", "wolf",
+    "rocket", "planet", "orbit", "space", "alien", "robot", "laser", "beam",
+    "magic", "spell", "wizard", "dragon", "knight", "castle", "quest", "map",
+    "candy", "cookie", "cake", "pie", "fudge", "syrup", "cream", "soda",
+    "jacket", "hoodie", "boots", "gloves", "scarf", "hat", "socks", "belt",
+    "garden", "flower", "petal", "seed", "sprout", "bloom", "vine", "thorn",
+    "puzzle", "riddle", "secret", "clue", "code", "cipher", "lock", "key",
+    "hammer", "wrench", "drill", "nail", "screw", "wire", "spark", "flame",
 ]
+# de-dupe while keeping order
+_seen = set()
+REVERSE_AIR_WORDS = [w for w in REVERSE_AIR_WORDS if not (w in _seen or _seen.add(w))]
 
 # yearbook_state is global (one pond)
 # {
@@ -6166,6 +6196,8 @@ class DuckCog(commands.Cog):
             uid = w["user_id"]
             add_eggs(uid, eggs_amt, kind="fresh")  # does not count as earned
             rec = get_user_record(uid)
+            # Same as nest wins — cannot be donated back into the nest
+            rec["nest_locked"] = int(rec.get("nest_locked") or 0) + eggs_amt
             if duck_id and duck_id not in rec.get("collection", []):
                 rec.setdefault("collection", []).append(duck_id)
                 w["duck_given"] = True
@@ -6981,6 +7013,25 @@ class NominateBallotView(discord.ui.View):
             content=f"✅ Ballot in! **+{YEARBOOK_BALLOT_REWARD}** eggs for voting.",
             view=None,
         )
+        # Personal log DM
+        try:
+            log_lines = ["# 📖 Your Yearbook ballot", ""]
+            for t in self.titles:
+                title = t["title"]
+                nominee = self.picks.get(title)
+                if nominee:
+                    log_lines.append(f"**{title}** → <@{nominee}>")
+                    if t.get("line"):
+                        log_lines.append(f"-# {t['line']}")
+            log_lines.append("")
+            log_lines.append(f"-# +{YEARBOOK_BALLOT_REWARD} eggs · one ballot per week")
+            emb = discord.Embed(
+                description="\n".join(log_lines),
+                color=discord.Color.purple(),
+            )
+            await interaction.user.send(embed=emb)
+        except Exception:
+            pass
 
 
 class YearbookAdminView(discord.ui.View):
