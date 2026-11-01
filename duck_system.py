@@ -4981,7 +4981,8 @@ class DuckCog(commands.Cog):
                 await save_duck_state()
 
         # --- Air drop challenge progress (same channel only, while a drop is active) ---
-        if qualifies:
+        # Reverse-word claims bypass the 8-char spam gate (answers are short on purpose)
+        if qualifies or self._message_is_reverse_air_answer(message):
             await self._process_air_drop_message(message)
 
         # --- Passive egg drop (separate toggle: /editor → Toggle Egg Drops) ---
@@ -5571,6 +5572,23 @@ class DuckCog(commands.Cog):
             if a:
                 yield key, a
 
+    def _message_is_reverse_air_answer(self, message: discord.Message) -> bool:
+        """True if this message matches any live reverse air-drop answer in this channel."""
+        if not message.guild:
+            return False
+        guild_id = str(message.guild.id)
+        content = (message.content or "").strip().lower()
+        if not content:
+            return False
+        for _key, active in self._iter_air_drop_actives(guild_id):
+            if active.get("kind") != "reverse":
+                continue
+            if int(active.get("channel_id", 0)) != message.channel.id:
+                continue
+            if content == (active.get("answer") or ""):
+                return True
+        return False
+
     async def _process_air_drop_message(self, message: discord.Message):
         """Count a qualifying message toward a message-type air drop, or reverse-word claim."""
         guild_id = str(message.guild.id)
@@ -5808,7 +5826,7 @@ class DuckCog(commands.Cog):
                 color=discord.Color.purple(),
             )
             try:
-                embed.set_image(url=AIR_DROP_IMAGE_URL)
+                embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
             except Exception:
                 pass
             active = {
@@ -5899,7 +5917,7 @@ class DuckCog(commands.Cog):
                 color=discord.Color.purple(),
             )
             try:
-                embed.set_image(url=AIR_DROP_IMAGE_URL)
+                embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
             except Exception:
                 pass
             active = {
