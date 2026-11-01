@@ -2898,6 +2898,23 @@ class ErrorAdminView(discord.ui.View):
         toggle_btn.callback = self.toggle
         self.add_item(toggle_btn)
 
+        err_on = is_error_mode()
+        err_mode = discord.ui.Button(
+            label="Error Mode ON" if err_on else "Error Mode",
+            style=discord.ButtonStyle.success if err_on else discord.ButtonStyle.secondary,
+            emoji="⚠️",
+        )
+        err_mode.callback = self.toggle_error_mode
+        self.add_item(err_mode)
+
+        purge_on = is_purge_mode()
+        purge_mode = discord.ui.Button(
+            label="Purge Mode ON" if purge_on else "Purge Mode",
+            style=discord.ButtonStyle.danger if purge_on else discord.ButtonStyle.secondary,
+            emoji="🚨",
+        )
+        purge_mode.callback = self.toggle_purge_mode
+        self.add_item(purge_mode)
 
         rewind_on = is_rewind_mode()
         rewind_btn = discord.ui.Button(
