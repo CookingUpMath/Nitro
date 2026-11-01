@@ -258,8 +258,29 @@ AIR_DROP_EGGS_MAX = 30
 AIR_DROP_SLOT_WEIGHTS = [(1, 50), (2, 35), (3, 15)]
 # Unicode-only emojis for reaction air drops (no custom server emojis)
 AIR_DROP_REACTION_EMOJIS = [
+    # original set
     "🥚", "🎯", "🪂", "🦆", "⭐", "🔥", "💫", "🎉", "🍀", "💎",
     "⚡", "🌟", "🎁", "🏆", "✨", "🎈", "🔔", "🌙", "☀️", "🌈",
+    # nature / weather
+    "🌊", "🌸", "🌿", "🍂", "🍁", "🌻", "🌼", "🌺", "🌴",
+    "🌵", "🍄", "🌍", "🪐", "☄️", "❄️", "💧", "🌪️", "⛅", "🌤️",
+    # animals
+    "🐸", "🦊", "🐺", "🐯", "🦁", "🐼", "🐨", "🐰", "🦉", "🐧",
+    "🐢", "🐙", "🦋", "🐝", "🐞", "🐠", "🐡", "🦈", "🦢", "🦩",
+    # food
+    "🍎", "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🍒", "🍑", "🥭",
+    "🍕", "🍔", "🌮", "🍣", "🍩", "🍪", "🎂", "🧁", "🍫", "🍿",
+    # objects / symbols
+    "🎵", "🎮", "🎲", "🧩", "🎨", "🎭", "🎬", "🎤", "🎧", "🎷",
+    "🚀", "✈️", "🚗", "⛵", "🏠", "🏰", "⛺", "🗼", "🗽", "🌋",
+    "💡", "🔑", "🧲", "🧰", "⚙️", "🛡️", "🗡️", "🏹", "💣", "🔮",
+    # faces / hands
+    "😎", "🤠", "🥳", "😇", "🤓", "👻", "🤖", "👽", "🎃", "💀",
+    "👍", "👏", "🙌", "🤝", "💪", "👀", "🧠", "💥", "💢", "💯",
+]
+_emoji_seen = set()
+AIR_DROP_REACTION_EMOJIS = [
+    e for e in AIR_DROP_REACTION_EMOJIS if not (e in _emoji_seen or _emoji_seen.add(e))
 ]
 # Back-compat aliases used by older comments / any stragglers
 AIR_DROP_MIN_INTERVAL = AIR_DROP_QUIET_MIN
