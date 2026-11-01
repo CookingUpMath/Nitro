@@ -287,6 +287,9 @@ pending_gifts = {}
 
 # Live ground drops eligible for ⏪ (message_id → EggDropView)
 active_egg_drops: dict[int, object] = {}
+# Recently finished air drops still within expiry window for ⏪ clone
+# message_id -> snapshot dict (same fields as an active air drop)
+recent_air_drops: dict[int, dict] = {}
 
 # redeem_codes[code] = {
 #   "eggs": int, "duck_ids": [duck_id, ...],
@@ -2032,6 +2035,7 @@ class EggDropView(discord.ui.View):
         self.claimed = False
         self.purge = purge
         self.rewound = False  # one ⏪ per drop
+        self.created_at = time.time()  # ⏪ allowed until CLAIM_TIMEOUT_SECONDS
         self._public_edit_task: asyncio.Task | None = None
         self._last_public_edit_at: float = 0.0
 
@@ -5524,6 +5528,15 @@ class DuckCog(commands.Cog):
         rec = get_user_record(uid)
 
         if filled >= slots:
+            # Keep a snapshot so ⏪ still works until AIR_DROP_EXPIRY_SECONDS
+            try:
+                mid = int(cur.get("message_id") or 0)
+                if mid:
+                    snap = dict(cur)
+                    snap["completed_at"] = time.time()
+                    recent_air_drops[mid] = snap
+            except Exception:
+                pass
             state[slot_key] = None
             # Only schedule the next natural drop when the *primary* finishes
             if slot_key == "active" and not state.get("secondary"):
@@ -5618,10 +5631,14 @@ class DuckCog(commands.Cog):
         if member is None or member.bot:
             return
 
-        # Ground drop?
+        # Ground drop? (works after claim until claim timeout expires)
         view = active_egg_drops.get(payload.message_id)
         if view is not None:
-            if getattr(view, "claimed", False) or getattr(view, "rewound", False):
+            if getattr(view, "rewound", False):
+                return
+            created = float(getattr(view, "created_at", 0) or 0)
+            if created and (time.time() - created) > CLAIM_TIMEOUT_SECONDS:
+                active_egg_drops.pop(payload.message_id, None)
                 return
             if not try_spend_rewind_token(uid):
                 return
@@ -5657,7 +5674,7 @@ class DuckCog(commands.Cog):
                     pass
             return
 
-        # Air drop active message? (primary or secondary clone)
+        # Air drop (active, secondary, or recently claimed — until expiry window)
         guild_id = str(payload.guild_id)
         state = get_air_drop_state(guild_id)
         active = state.get("active")
@@ -5667,20 +5684,38 @@ class DuckCog(commands.Cog):
             target_active = active
         elif secondary and int(secondary.get("message_id") or 0) == payload.message_id:
             target_active = secondary
+        else:
+            # Prune expired recent air drops
+            now = time.time()
+            expired = [
+                mid for mid, snap in recent_air_drops.items()
+                if now - float(snap.get("created_at") or 0) > AIR_DROP_EXPIRY_SECONDS
+            ]
+            for mid in expired:
+                recent_air_drops.pop(mid, None)
+            target_active = recent_air_drops.get(payload.message_id)
+
         if not target_active:
             return
         if target_active.get("rewound"):
             return
-        if state.get("secondary"):
-            # Only one clone chain at a time
+        created = float(target_active.get("created_at") or 0)
+        if created and (time.time() - created) > AIR_DROP_EXPIRY_SECONDS:
+            recent_air_drops.pop(payload.message_id, None)
+            return
+        # Only one live secondary clone at a time
+        if state.get("secondary") and target_active is not secondary:
+            # Allow rewind of a finished primary while secondary is up? User said clone still
+            # works after claim — if a secondary is already open, skip stacking another.
             return
         if not try_spend_rewind_token(uid):
             return
         target_active["rewound"] = True
+        if payload.message_id in recent_air_drops:
+            recent_air_drops[payload.message_id]["rewound"] = True
         await save_duck_state()
         channel = self.bot.get_channel(payload.channel_id)
         if channel and isinstance(channel, discord.TextChannel):
-            # Stack an exact clone of this air drop
             await self._post_air_drop_clone(guild, guild_id, channel, target_active)
 
     async def _process_air_drop_reaction(self, payload: discord.RawReactionActionEvent):
