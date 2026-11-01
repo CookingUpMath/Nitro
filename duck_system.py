@@ -108,9 +108,8 @@ EGG_COUNT_WEIGHTS = [
     (5, 1.5),    # rare high day
 ]
 
-# --- Halloween Mode (self-contained; safe to delete this whole block later) ---
-# Toggle via /error → Halloween. Does NOT change drop % or ERROR weight.
-HALLOWEEN_EGG_COUNT_WEIGHTS = [
+# Elevated egg-count table used while Rewind mode is on (5–10)
+REWIND_EGG_COUNT_WEIGHTS = [
     (5, 50.0),
     (6, 25.0),
     (7, 12.0),
@@ -118,8 +117,6 @@ HALLOWEEN_EGG_COUNT_WEIGHTS = [
     (9, 4.0),
     (10, 2.0),
 ]
-HALLOWEEN_EMBED_COLORS = (0x000000, 0xFF8C00, 0x9B59B6)  # black, orange, purple
-MAX_TREATS = 10
 
 # --- Karma ---
 HEART_EMOJI_ID = 1295255068483784786  # <:D_ZLove:...>
@@ -363,7 +360,6 @@ environment_state = {
     "egg_count": 1,
     "error_mode": False,
     "purge_mode": False,
-    "halloween_mode": False,
     "rewind_mode": False,  # November Rewind package (tokens, ⏪, retro weather)
     # Custom egg emojis (editor) — fresh replaces default 🥚 everywhere
     "egg_emoji_fresh": "🥚",
@@ -537,7 +533,7 @@ LUCK_RARITIES = {"secret", "quackpot", "mythic", "error"}  # error via is_error 
 
 
 def _roll_egg_count() -> int:
-    table = HALLOWEEN_EGG_COUNT_WEIGHTS if environment_state.get("halloween_mode") else EGG_COUNT_WEIGHTS
+    table = REWIND_EGG_COUNT_WEIGHTS if environment_state.get("rewind_mode") else EGG_COUNT_WEIGHTS
     counts = [c for c, _ in table]
     weights = [w for _, w in table]
     return random.choices(counts, weights=weights, k=1)[0]
@@ -549,10 +545,6 @@ def is_error_mode() -> bool:
 
 def is_purge_mode() -> bool:
     return bool(environment_state.get("purge_mode"))
-
-
-def is_halloween_mode() -> bool:
-    return bool(environment_state.get("halloween_mode"))
 
 
 def is_rewind_mode() -> bool:
@@ -674,7 +666,12 @@ def pick_yearbook_titles(n: int = 4) -> list:
 
 
 def ensure_yearbook_week() -> None:
-    """Roll titles / reset counters when the ISO week changes (if enabled)."""
+    """Roll titles / reset counters when the ISO week changes (if enabled).
+
+    If carry_next_monday is set (enabled mid-week), the week id advances but
+    stats, votes, ballots, and nominate titles are kept so progress folds into
+    the following full week instead of being wiped or paid early.
+    """
     if not yearbook_state.get("enabled"):
         return
     wid = yearbook_week_id()
@@ -683,36 +680,16 @@ def ensure_yearbook_week() -> None:
             yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
         return
     yearbook_state["week_id"] = wid
+    if yearbook_state.get("carry_next_monday"):
+        # Keep accumulated stats / nominations; Monday job will skip payout once
+        if not yearbook_state.get("nominate_titles"):
+            yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+        return
     yearbook_state["votes"] = {}
     yearbook_state["ballots"] = {}
     yearbook_state["stats"] = {}
     yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
 
-
-def halloween_color() -> discord.Color:
-    """Rotate black / orange / purple for themed embeds (not user-name colors)."""
-    return discord.Color(random.choice(HALLOWEEN_EMBED_COLORS))
-
-
-def halloween_weather_title(chance: float) -> str:
-    """Flavor title from drop chance (same % bands as normal calm→frenzy feel)."""
-    if chance >= 13:
-        return "🦇 Blood Moon Frenzy"
-    if chance >= 11:
-        return "🎃 Witching Hour"
-    if chance >= 9:
-        return "🌫️ Graveyard Fog"
-    if chance >= 7.5:
-        return "🍂 Harvest Dusk"
-    return "🌙 Still October Night"
-
-
-def reset_halloween_stats() -> None:
-    """Wipe treats + leaderboard counters when Halloween Mode turns off."""
-    for rec in duck_users.values():
-        rec["treats"] = 0
-        rec["treats_given"] = 0
-        rec["treats_received"] = 0
 
 
 def effective_error_weight() -> float:
@@ -722,7 +699,6 @@ def effective_error_weight() -> float:
 async def ensure_environment_for_today() -> dict:
     environment_state.setdefault("error_mode", False)
     environment_state.setdefault("purge_mode", False)
-    environment_state.setdefault("halloween_mode", False)
     environment_state.setdefault("egg_emoji_fresh", "🥚")
     environment_state.setdefault("egg_emoji_rotten", "🦠")
     environment_state.setdefault("egg_emoji_error", "🪲")
@@ -1104,7 +1080,6 @@ async def load_duck_state():
             environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
             environment_state.setdefault("error_mode", False)
             environment_state.setdefault("purge_mode", False)
-            environment_state.setdefault("halloween_mode", False)
             environment_state.setdefault("rewind_mode", False)
             environment_state.setdefault("egg_emoji_fresh", "🥚")
             environment_state.setdefault("egg_emoji_rotten", "🦠")
@@ -1319,19 +1294,7 @@ def build_air_drop_announce_embed(
     slots: int = 1,
 ) -> discord.Embed:
     slots = max(1, int(slots))
-    if kind == "trick_or_treat":
-        title = "# 🎃 Trick or Treat"
-        if slots == 1:
-            body = (
-                "Pick **😈 Trick** or **🍬 Treat** — first correct guess gets "
-                f"**{eggs}** eggs!"
-            )
-        else:
-            body = (
-                f"Pick **😈 Trick** or **🍬 Treat** — first **{slots}** correct guesses "
-                f"get **{eggs}** eggs each!"
-            )
-    elif kind == "reaction":
+    if kind == "reaction":
         title = "# 🎯 Egg Drop"
         if slots == 1:
             body = f"First person to react {emoji} to this post gets **{eggs}** eggs!"
@@ -1349,7 +1312,7 @@ def build_air_drop_announce_embed(
                 f"First **{slots}** people to send **{target}** messages "
                 f"get **{eggs}** eggs each!"
             )
-    color = halloween_color() if is_halloween_mode() else discord.Color(0xC4A35A)
+    color = discord.Color(0xC4A35A)
     embed = discord.Embed(description=f"{title}\n{body}", color=color)
     embed.set_thumbnail(url=AIR_DROP_IMAGE_URL)
     return embed
@@ -1660,19 +1623,10 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
 
     is_duplicate = duck_id in rec["collection"]
     bonus_egg = False
-    treat_gained = False
     error_egg_gained = False
 
     if is_duplicate:
-        if is_halloween_mode():
-            treats = int(rec.get("treats") or 0)
-            if treats < MAX_TREATS:
-                rec["treats"] = treats + 1
-                treat_gained = True
-            elif random.random() < DUPLICATE_BONUS_CHANCE:
-                add_eggs(discord_id, 1, kind="fresh")
-                bonus_egg = True
-        elif random.random() < DUPLICATE_BONUS_CHANCE:
+        if random.random() < DUPLICATE_BONUS_CHANCE:
             add_eggs(discord_id, 1, kind="fresh")
             bonus_egg = True
     else:
@@ -1691,7 +1645,6 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
         "rarity": duck["rarity"],
         "duplicate": is_duplicate,
         "bonus_egg": bonus_egg,
-        "treat_gained": treat_gained,
         "error_egg_gained": error_egg_gained,
         "egg_kind": egg_kind,
     }
@@ -2032,72 +1985,11 @@ def format_egg_channel_name(count: int) -> str:
 #                 UI: VIEWS                   #
 ###############################################
 
-class AirDropTrickTreatView(discord.ui.View):
-    """Halloween air drop: guess Trick or Treat. One vote; wrong = locked out."""
-
-    def __init__(self, guild_id: str):
-        super().__init__(timeout=AIR_DROP_EXPIRY_SECONDS)
-        self.guild_id = guild_id
-
-    async def _guess(self, interaction: discord.Interaction, choice: str):
-        if interaction.user.bot:
-            return
-        state = get_air_drop_state(self.guild_id)
-        active = state.get("active")
-        if not active or active.get("kind") != "trick_or_treat":
-            return await interaction.response.send_message("This drop is over.", ephemeral=True)
-        if interaction.message and int(active.get("message_id") or 0) != interaction.message.id:
-            return await interaction.response.send_message("This drop is over.", ephemeral=True)
-
-        uid = str(interaction.user.id)
-        if uid in (active.get("winners") or []):
-            return await interaction.response.send_message("You already won a slot!", ephemeral=True)
-        if uid in (active.get("locked_out") or []):
-            return await interaction.response.send_message(
-                "Wrong guess — you're locked out of this drop.", ephemeral=True
-            )
-
-        answer = active.get("answer")
-        if choice != answer:
-            active.setdefault("locked_out", []).append(uid)
-            await save_duck_state()
-            return await interaction.response.send_message(
-                f"Wrong! It was **{answer}**. You're out for this drop.",
-                ephemeral=True,
-            )
-
-        duck_cog = None
-        for c in interaction.client.cogs.values():
-            if c.__class__.__name__ == "DuckCog":
-                duck_cog = c
-                break
-        if duck_cog is None:
-            return await interaction.response.send_message("Bot error — try again.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True)
-        await duck_cog._complete_air_drop(
-            self.guild_id, interaction.channel, interaction.user, active
-        )
-        try:
-            await interaction.followup.send("Correct! Check the channel.", ephemeral=True)
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(label="Trick", style=discord.ButtonStyle.danger, emoji="😈")
-    async def trick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._guess(interaction, "trick")
-
-    @discord.ui.button(label="Treat", style=discord.ButtonStyle.success, emoji="🍬")
-    async def treat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._guess(interaction, "treat")
-
 
 class EggDropView(discord.ui.View):
-    """Drop claim UI. Hatch/Inventory are finder-only. Purge adds Steal.
-    Halloween Mode adds 🍬 Treat (others spend treats to boost the drop).
-    """
+    """Drop claim UI. Hatch/Inventory are finder-only. Purge adds Steal."""
 
-    def __init__(self, owner_id: int, egg_count: int = 1, purge: bool = False, halloween: bool = False):
+    def __init__(self, owner_id: int, egg_count: int = 1, purge: bool = False):
         super().__init__(timeout=CLAIM_TIMEOUT_SECONDS)
         self.owner_id = owner_id
         self.egg_count = egg_count
@@ -2106,23 +1998,9 @@ class EggDropView(discord.ui.View):
         self.steal_failed: set[int] = set()
         self.claimed = False
         self.purge = purge
-        self.halloween = halloween
         self.rewound = False  # one ⏪ per drop
-        self.treat_bonus = 0
-        self.treat_uses = 0
-        self.treat_pressers: set[int] = set()
         self._public_edit_task: asyncio.Task | None = None
         self._last_public_edit_at: float = 0.0
-
-        if halloween:
-            candy = discord.ui.Button(
-                label="Treat",
-                style=discord.ButtonStyle.primary,
-                emoji="🍬",
-                custom_id=f"egg_treat:{owner_id}:{id(self)}",
-            )
-            candy.callback = self.treat
-            self.add_item(candy)
 
         if purge:
             steal_btn = discord.ui.Button(
@@ -2136,13 +2014,6 @@ class EggDropView(discord.ui.View):
 
     def drop_content(self, mention: str) -> str:
         egg_word = "egg" if self.egg_count == 1 else "eggs"
-        if self.halloween:
-            line = f"🎃 {mention} found **{self.egg_count}** {egg_word}!"
-            if self.treat_bonus > 0:
-                line += f"\n-# 🍬 +**{self.treat_bonus}** from anonymous treats"
-            if self.purge:
-                line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
-            return line
         line = f"{egg_emoji('fresh')} {mention} found {self.egg_count} {egg_word} on the ground!"
         if self.purge:
             line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
@@ -2176,11 +2047,6 @@ class EggDropView(discord.ui.View):
         except discord.HTTPException as e:
             print(f"[duck_system] drop message edit failed: {e}")
 
-    def _award_treat_received(self, finder_id: str) -> None:
-        if self.treat_uses > 0:
-            rec = get_user_record(finder_id)
-            rec["treats_received"] = int(rec.get("treats_received") or 0) + self.treat_uses
-
     @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
     async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._require_owner(interaction):
@@ -2188,8 +2054,7 @@ class EggDropView(discord.ui.View):
         await interaction.response.defer()
         self.claimed = True
         discord_id = str(interaction.user.id)
-        self._award_treat_received(discord_id)
-
+        
         if self.egg_count == 1:
             result = resolve_hatch(discord_id, egg_kind="fresh")
             if result is None:
@@ -2203,10 +2068,7 @@ class EggDropView(discord.ui.View):
             self.stop()
             if result["duplicate"]:
                 text = f"{result['emoji']} {interaction.user.mention} hatched **{result['title']}** — already owned, duplicate!"
-                if result.get("treat_gained"):
-                    inv_t = get_user_record(discord_id).get("treats", 0)
-                    text += f"\n🍬 Treat collected! Treats: **{inv_t}/{MAX_TREATS}**"
-                elif result["bonus_egg"]:
+                if result["bonus_egg"]:
                     inv = get_user_record(discord_id)["inventory"]
                     text += f"\n🍀 Lucky! A bonus egg was awarded. Inventory: **{inv}**"
                 if result.get("error_egg_gained"):
@@ -2214,7 +2076,7 @@ class EggDropView(discord.ui.View):
                 await self._finish_drop_message(interaction, content=text)
             else:
                 style = hype_for_hatch(result["duck_id"], result["rarity"])
-                color = halloween_color() if is_halloween_mode() else style["color"]
+                color = style["color"]
                 banner = style["banner"].format(
                     emoji=result["emoji"], mention=interaction.user.mention, title=result["title"]
                 )
@@ -2226,15 +2088,12 @@ class EggDropView(discord.ui.View):
 
         pre_existing = set(get_user_record(discord_id)["collection"])
         results = []
-        treats_got = 0
         error_eggs_got = 0
         for _ in range(self.egg_count):
             r = resolve_hatch(discord_id, egg_kind="fresh")
             if r is None:
                 break
             results.append(r)
-            if r.get("treat_gained"):
-                treats_got += 1
             if r.get("error_egg_gained"):
                 error_eggs_got += 1
         await save_duck_state()
@@ -2261,9 +2120,6 @@ class EggDropView(discord.ui.View):
                 lines.append(f"-# {entry}")
             else:
                 lines.append(f"**{entry} (NEW)**")
-        if treats_got:
-            inv_t = get_user_record(discord_id).get("treats", 0)
-            lines.append(f"🍬 **{treats_got}** treat(s) collected · Treats: **{inv_t}/{MAX_TREATS}**")
         await self._finish_drop_message(interaction, content="\n".join(lines))
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
@@ -2273,14 +2129,13 @@ class EggDropView(discord.ui.View):
         await interaction.response.defer()
         self.claimed = True
         discord_id = str(interaction.user.id)
-        self._award_treat_received(discord_id)
         rec = get_user_record(discord_id)
         add_eggs(discord_id, self.egg_count, kind="fresh")
         yb_add_earned(discord_id, self.egg_count)
         await save_duck_state()
         self.stop()
         egg_word = "egg" if self.egg_count == 1 else "eggs"
-        bag = "Treat bag" if is_halloween_mode() else "Inventory"
+        bag = "Inventory"
         await self._finish_drop_message(
             interaction,
             content=(
@@ -2288,75 +2143,6 @@ class EggDropView(discord.ui.View):
                 f"{bag}: **{rec['inventory']}**"
             ),
         )
-
-    async def treat(self, interaction: discord.Interaction):
-        """Halloween: spend 1 treat to add 1–3 eggs (giver gets the same amount)."""
-        if not self.halloween or not is_halloween_mode():
-            return await interaction.response.send_message("Treats aren't active.", ephemeral=True)
-        if self.claimed:
-            return await interaction.response.send_message("This drop is already claimed.", ephemeral=True)
-        if interaction.user.id == self.owner_id:
-            return await interaction.response.send_message(
-                "You can't leave a treat on your own drop.", ephemeral=True
-            )
-        if interaction.user.id in self.treat_pressers:
-            return await interaction.response.send_message(
-                "You already left a treat on this drop.", ephemeral=True
-            )
-        giver_id = str(interaction.user.id)
-        rec = get_user_record(giver_id)
-        treats = int(rec.get("treats") or 0)
-        if treats < 1:
-            return await interaction.response.send_message(
-                f"You have no treats! (Duplicates while Halloween is on fill your bag, max {MAX_TREATS}.)",
-                ephemeral=True,
-            )
-
-        amount = random.randint(1, 3)
-        rec["treats"] = treats - 1
-        add_eggs(giver_id, amount, kind="fresh")
-        rec["treats_given"] = int(rec.get("treats_given") or 0) + 1
-        self.treat_pressers.add(interaction.user.id)
-        self.treat_bonus += amount
-        self.treat_uses += 1
-        self.egg_count += amount
-
-        # One interaction reply only (no defer+followup). State flush is batched.
-        schedule_debounced_save()
-        self._schedule_public_edit()
-
-        try:
-            await interaction.response.send_message(
-                f"🍬 You left a treat (**+{amount}** eggs on the drop). "
-                f"You received **{amount}** egg(s) too. Treats left: **{rec['treats']}/{MAX_TREATS}**",
-                ephemeral=True,
-            )
-        except discord.HTTPException:
-            pass
-
-    def _schedule_public_edit(self) -> None:
-        """At most one public edit per ~10s per drop (giveaway-style counter refresh)."""
-        if self._public_edit_task is not None and not self._public_edit_task.done():
-            return  # already scheduled — totals are in memory; flush will pick them up
-        self._public_edit_task = asyncio.create_task(self._flush_public_edit())
-
-    async def _flush_public_edit(self) -> None:
-        # Respect minimum gap since last successful public edit
-        gap = 10.0 - (time.time() - self._last_public_edit_at)
-        delay = max(2.0, gap)
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
-        self._public_edit_task = None
-        if self.claimed or self.message is None:
-            return
-        try:
-            mention = f"<@{self.owner_id}>"
-            await self.message.edit(content=self.drop_content(mention), view=self)
-            self._last_public_edit_at = time.time()
-        except Exception as e:
-            print(f"[halloween] treat message edit failed: {e}")
 
     async def steal(self, interaction: discord.Interaction):
         """Purge Mode only — 50/50 steal attempt by a non-owner."""
@@ -3014,8 +2800,6 @@ class ErrorAdminView(discord.ui.View):
 
         act = {"all": "All", "active": "Active only", "inactive": "Inactive only"}[self.activity]
         modes = []
-        if is_halloween_mode():
-            modes.append("🎃 Halloween ON")
         if is_error_mode():
             modes.append("⚠️ Error Mode ON")
         if is_purge_mode():
@@ -3026,7 +2810,7 @@ class ErrorAdminView(discord.ui.View):
         if len(desc) > 4096:
             desc = desc[:4000] + "\n-# …truncated"
 
-        color = halloween_color() if is_halloween_mode() else discord.Color.dark_red()
+        color = discord.Color.dark_red()
         embed = discord.Embed(description=desc, color=color)
         embed.set_footer(text="🚫 ERROR zone · server owner")
         return embed
@@ -3081,27 +2865,6 @@ class ErrorAdminView(discord.ui.View):
         toggle_btn.callback = self.toggle
         self.add_item(toggle_btn)
 
-        hallo_on = is_halloween_mode()
-        err_mode = discord.ui.Button(
-            label="Error Mode",
-            style=discord.ButtonStyle.secondary,
-            emoji="⚠️",
-            disabled=hallo_on,
-        )
-        err_mode.callback = self.toggle_error_mode
-        self.add_item(err_mode)
-
-        purge_mode = discord.ui.Button(label="Purge Mode", style=discord.ButtonStyle.danger, emoji="🚨")
-        purge_mode.callback = self.toggle_purge_mode
-        self.add_item(purge_mode)
-
-        hallo_btn = discord.ui.Button(
-            label="Halloween ON" if hallo_on else "Halloween",
-            style=discord.ButtonStyle.success if hallo_on else discord.ButtonStyle.secondary,
-            emoji="🎃",
-        )
-        hallo_btn.callback = self.toggle_halloween
-        self.add_item(hallo_btn)
 
         rewind_on = is_rewind_mode()
         rewind_btn = discord.ui.Button(
@@ -3157,55 +2920,21 @@ class ErrorAdminView(discord.ui.View):
     async def toggle(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ErrorToggleModal())
 
-    async def toggle_halloween(self, interaction: discord.Interaction):
-        environment_state.setdefault("halloween_mode", False)
-        turning_on = not environment_state["halloween_mode"]
-        if turning_on and is_error_mode():
-            return await interaction.response.send_message(
-                "Turn off Error Mode before enabling Halloween.", ephemeral=True
-            )
-        environment_state["halloween_mode"] = turning_on
-        if turning_on:
-            # Re-roll egg count into Halloween 5–10 range; leave drop % alone
-            environment_state["egg_count"] = _roll_egg_count()
-            await save_duck_state()
-            msg = (
-                "🎃 **Halloween Mode ON**\n"
-                f"• Eggs per drop now **5–10** (today: **{environment_state['egg_count']}**)\n"
-                "• Drop % unchanged\n"
-                "• Treats from duplicates · 🍬 on drops · Trick/Treat air drops\n"
-                "• Themed embeds · `/treatboard` enabled\n"
-                "• Error Mode button disabled while this is on"
-            )
-        else:
-            reset_halloween_stats()
-            environment_state["egg_count"] = _roll_egg_count()
-            await save_duck_state()
-            msg = (
-                "✅ **Halloween Mode OFF**\n"
-                "• Treats & treatboard stats cleared\n"
-                "• Eggs per drop back to **1–5**\n"
-                "• Normal embeds and air drops restored"
-            )
-        await interaction.response.send_message(msg, ephemeral=True)
-        # Refresh the error panel if possible
-        try:
-            self._rebuild_items()
-            await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True)
-        except Exception:
-            pass
-
     async def toggle_rewind(self, interaction: discord.Interaction):
         environment_state.setdefault("rewind_mode", False)
         turning_on = not environment_state["rewind_mode"]
         environment_state["rewind_mode"] = turning_on
+        # Re-roll daily egg count into 5–10 (on) or 1–5 (off)
+        environment_state["egg_count"] = _roll_egg_count()
         await save_duck_state()
         if turning_on:
             msg = (
                 "⏪ **Rewind Mode ON**\n"
+                f"• Eggs per drop **5–10** (today: **{environment_state['egg_count']}**)\n"
                 f"• Tokens: **1 per {REWIND_EGGS_PER_TOKEN} hatched**, cap **{REWIND_TOKEN_CAP}**\n"
                 "• React ⏪ on drops (boost them / yourself) or air drops (exact clone)\n"
                 "• ~1/3 air drops are reverse-word challenges\n"
+                "• **10%** chance the next air drop is only **5 minutes** later\n"
                 "• **10 karma → 10 eggs** (instead of 1)\n"
                 "• 25% token refund when ⏪ boosting someone else's ground drop\n"
                 "• Retro weather labels on `/weather`"
@@ -3213,6 +2942,7 @@ class ErrorAdminView(discord.ui.View):
         else:
             msg = (
                 "✅ **Rewind Mode OFF**\n"
+                "• Eggs per drop back to **1–5**\n"
                 "• ⏪ reactions ignored · tokens hidden from inventory\n"
                 "• Normal weather titles · normal air-drop mix"
             )
@@ -3224,10 +2954,6 @@ class ErrorAdminView(discord.ui.View):
             pass
 
     async def toggle_error_mode(self, interaction: discord.Interaction):
-        if is_halloween_mode():
-            return await interaction.response.send_message(
-                "Error Mode is disabled while Halloween is on.", ephemeral=True
-            )
         environment_state.setdefault("error_mode", False)
         environment_state.setdefault("purge_mode", False)
         turning_on = not environment_state["error_mode"]
@@ -5230,8 +4956,7 @@ class DuckCog(commands.Cog):
 
         egg_count = env.get("egg_count", 1)
         purge = is_purge_mode()
-        hallo = is_halloween_mode()
-        view = EggDropView(message.author.id, egg_count, purge=purge, halloween=hallo)
+        view = EggDropView(message.author.id, egg_count, purge=purge)
         drop_text = view.drop_content(message.author.mention)
         try:
             sent = await message.channel.send(content=drop_text, view=view)
@@ -5968,24 +5693,7 @@ class DuckCog(commands.Cog):
         slots = max(1, int(source.get("slots") or 1))
         view = None
 
-        if kind == "trick_or_treat":
-            answer = source.get("answer") or random.choice(["trick", "treat"])
-            embed = build_air_drop_announce_embed(eggs, kind="trick_or_treat", slots=slots)
-            active = {
-                "kind": "trick_or_treat",
-                "channel_id": channel.id,
-                "message_id": None,
-                "answer": answer,
-                "eggs": eggs,
-                "slots": slots,
-                "winners": [],
-                "locked_out": [],
-                "created_at": time.time(),
-                "progress": {},
-                "rewound": True,  # clones can't be rewound again
-            }
-            view = AirDropTrickTreatView(guild_id)
-        elif kind == "reaction":
+        if kind == "reaction":
             emoji = source.get("emoji") or random.choice(AIR_DROP_REACTION_EMOJIS)
             embed = build_air_drop_announce_embed(
                 eggs, kind="reaction", emoji=emoji, slots=slots
@@ -6069,9 +5777,7 @@ class DuckCog(commands.Cog):
 
     async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
         eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
-        if is_halloween_mode():
-            kind = random.choice(["messages", "reaction", "trick_or_treat"])
-        elif is_rewind_mode():
+        if is_rewind_mode():
             # ~1/3 reverse-word, rest normal
             kind = random.choice(["messages", "reaction", "reverse"])
         else:
@@ -6079,23 +5785,7 @@ class DuckCog(commands.Cog):
         slots = roll_air_drop_slots()
 
         view = None
-        if kind == "trick_or_treat":
-            answer = random.choice(["trick", "treat"])
-            embed = build_air_drop_announce_embed(eggs, kind="trick_or_treat", slots=slots)
-            active = {
-                "kind": "trick_or_treat",
-                "channel_id": channel.id,
-                "message_id": None,
-                "answer": answer,
-                "eggs": eggs,
-                "slots": slots,
-                "winners": [],
-                "locked_out": [],
-                "created_at": time.time(),
-                "progress": {},
-            }
-            view = AirDropTrickTreatView(guild_id)
-        elif kind == "reaction":
+        if kind == "reaction":
             emoji = random.choice(AIR_DROP_REACTION_EMOJIS)
             embed = build_air_drop_announce_embed(
                 eggs, kind="reaction", emoji=emoji, slots=slots
@@ -6308,6 +5998,13 @@ class DuckCog(commands.Cog):
         ensure_yearbook_week()
         wid = yearbook_week_id()
         if yearbook_state.get("last_resolved_week") == wid:
+            return
+        # Mid-week enable: skip this Monday's payout and keep stats for a full week
+        if yearbook_state.get("carry_next_monday"):
+            yearbook_state["carry_next_monday"] = False
+            yearbook_state["last_resolved_week"] = wid
+            await save_duck_state()
+            print(f"[yearbook] carried mid-week progress into {wid}; first payout next Monday")
             return
         # Close was 1h earlier — we resolve Monday 00:05
         winners = []
@@ -6690,22 +6387,6 @@ class DuckCog(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
-        if is_halloween_mode():
-            label = halloween_weather_title(float(chance))
-            lines = [
-                f"# {label}",
-                drop_line,
-                eggs_line,
-                fortune_line,
-                "",
-                "🎃 Halloween Mode",
-                "-# Treats, Trick or Treat & 5-10 egg drops!",
-            ]
-            embed = discord.Embed(description="\n".join(lines), color=halloween_color())
-            embed.set_footer(text="🍬 Leave treats on other drops · /treatboard")
-            await interaction.followup.send(embed=embed)
-            return
-
         if is_rewind_mode():
             label = rewind_weather_label(float(chance))
             lines = [
@@ -6715,7 +6396,7 @@ class DuckCog(commands.Cog):
                 fortune_line,
                 "",
                 "⏪ Rewind Mode",
-                "-# Spend ⏪ tokens on drops · reverse-word air drops · retro skies",
+                "-# 5–10 eggs/drop · ⏪ tokens · reverse-word air drops · retro skies",
             ]
             embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
             embed.set_footer(text="⏪ Tokens from hatching · /inventory")
@@ -6859,19 +6540,11 @@ class DuckCog(commands.Cog):
         )
         if error_n > 0:
             egg_lines += f"{egg_emoji('error')} **Error: {error_n}**\n"
-        if is_halloween_mode():
-            description = (
-                f"## 🎃 Treat bag: **{total}** egg(s)\n"
-                f"{egg_lines}"
-                f"> **🍬 Treats: {rec.get('treats', 0)}/{MAX_TREATS}**\n"
-                f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
-            )
-        else:
-            description = (
-                f"## {egg_emoji('fresh')} You have **{total}** egg(s) stored\n"
-                f"{egg_lines}"
-                f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
-            )
+        description = (
+            f"## {egg_emoji('fresh')} You have **{total}** egg(s) stored\n"
+            f"{egg_lines}"
+            f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
+        )
         if is_rewind_mode():
             description += (
                 f"> **⏪ Rewind tokens: {int(rec.get('rewind_tokens') or 0)}/{REWIND_TOKEN_CAP}**\n"
@@ -6894,54 +6567,12 @@ class DuckCog(commands.Cog):
 
         user = interaction.user
         role_color = user.color if isinstance(user, discord.Member) and user.color.value != 0 else discord.Color.blurple()
-        color = halloween_color() if is_halloween_mode() else role_color
+        color = role_color
         embed = discord.Embed(description=description.strip(), color=color)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="treatboard", description="Halloween: top treat givers and receivers.")
-    async def treatboard_cmd(self, interaction: discord.Interaction):
-        if not is_halloween_mode():
-            return await interaction.response.send_message(
-                "🎃 `/treatboard` is only available while Halloween Mode is on.",
-                ephemeral=True,
-            )
-
-        given = sorted(
-            (
-                (uid, int(rec.get("treats_given") or 0))
-                for uid, rec in duck_users.items()
-                if int(rec.get("treats_given") or 0) > 0
-            ),
-            key=lambda t: -t[1],
-        )[:20]
-        received = sorted(
-            (
-                (uid, int(rec.get("treats_received") or 0))
-                for uid, rec in duck_users.items()
-                if int(rec.get("treats_received") or 0) > 0
-            ),
-            key=lambda t: -t[1],
-        )[:20]
-
-        def fmt(rows: list) -> str:
-            if not rows:
-                return "-# Nobody yet"
-            lines = []
-            for i, (uid, n) in enumerate(rows):
-                mark = "⭐️" if i < 5 else "▪️"
-                lines.append(f"{mark} <@{uid}> · **{n}**")
-            return "\n".join(lines)
-
-        desc = (
-            f"# 🍬 Received\n{fmt(received)}\n\n"
-            f"# 🍬 Given\n{fmt(given)}"
-        )
-        embed = discord.Embed(description=desc, color=halloween_color())
-        embed.set_footer(text="🎃 Halloween · claim drops to bank received treats")
-        await interaction.response.send_message(embed=embed)
-
-    # ---------- open eggs from inventory ----------
+    # ---------- open eggs from inventory    # ---------- open eggs from inventory ----------
 
     @app_commands.command(name="hatch", description="Open eggs from your inventory by type.")
     @app_commands.describe(
@@ -6996,7 +6627,6 @@ class DuckCog(commands.Cog):
         pre_existing = set(rec["collection"])
 
         results = []
-        treats_got = 0
         error_eggs_got = 0
         for _ in range(hatch_count):
             spent = try_spend_one_egg_of_kind(discord_id, egg_kind)
@@ -7007,8 +6637,6 @@ class DuckCog(commands.Cog):
                 add_eggs(discord_id, 1, kind=egg_kind)
                 break
             results.append(result)
-            if result.get("treat_gained"):
-                treats_got += 1
             if result.get("error_egg_gained"):
                 error_eggs_got += 1
 
@@ -7056,11 +6684,6 @@ class DuckCog(commands.Cog):
             else:
                 lines.append(f"**{entry} (NEW)**")
 
-        if treats_got:
-            inv_t = get_user_record(discord_id).get("treats", 0)
-            lines.append(
-                f"🍬 **{treats_got}** treat(s) collected · Treats: **{inv_t}/{MAX_TREATS}**"
-            )
         if error_eggs_got:
             inv_e = get_user_record(discord_id).get("inventory_error", 0)
             lines.append(
@@ -7263,6 +6886,8 @@ class YearbookAdminView(discord.ui.View):
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         yearbook_state["enabled"] = not bool(yearbook_state.get("enabled"))
         if yearbook_state["enabled"]:
+            # Fold any partial week into the next full Monday cycle
+            yearbook_state["carry_next_monday"] = True
             ensure_yearbook_week()
         else:
             # Reset used-title history on disable
@@ -7272,6 +6897,7 @@ class YearbookAdminView(discord.ui.View):
             yearbook_state["ballots"] = {}
             yearbook_state["stats"] = {}
             yearbook_state["week_id"] = None
+            yearbook_state["carry_next_monday"] = False
         await save_duck_state()
         # Re-sync slash visibility: members only see nominate/yearbook when on
         try:
@@ -7280,8 +6906,13 @@ class YearbookAdminView(discord.ui.View):
         except Exception as e:
             print(f"[yearbook] tree sync: {e}")
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        on = yearbook_state["enabled"]
+        extra = (
+            "\n-# First Monday after enable **carries** stats into the next week (no early payout)."
+            if on else ""
+        )
         await interaction.followup.send(
-            f"Yearbook is now **{'ON' if yearbook_state['enabled'] else 'OFF'}**.",
+            f"Yearbook is now **{'ON' if on else 'OFF'}**.{extra}",
             ephemeral=True,
         )
 
