@@ -560,6 +560,18 @@ def yearbook_week_id() -> str:
     return datetime.now(eastern).strftime("%G-W%V")
 
 
+def yearbook_week_range_footer() -> str:
+    """Compact Mon–Sun range for the current Eastern ISO week, e.g. 'Nov 3 – 9'."""
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(eastern)
+    start = now - timedelta(days=now.weekday())  # Monday
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=6)  # Sunday
+    if start.month == end.month:
+        return f"{start.strftime('%b')} {start.day} – {end.day}"
+    return f"{start.strftime('%b')} {start.day} – {end.strftime('%b')} {end.day}"
+
+
 def _yb_stat(uid: str) -> dict:
     stats = yearbook_state.setdefault("stats", {})
     rec = stats.setdefault(uid, {"hatched": 0, "earned": 0, "karma": 0, "luck": 0, "msgs": 0})
@@ -6714,7 +6726,7 @@ class DuckCog(commands.Cog):
                 "Yearbook isn't running right now.", ephemeral=True
             )
         ensure_yearbook_week()
-        lines = ["# 📖 Pond Yearbook · This week", ""]
+        lines = ["# 📖 Pond Yearbook", ""]
         for key, title, desc in YEARBOOK_COMPETITIVE:
             best_uid, best_n = None, -1
             for uid, st in (yearbook_state.get("stats") or {}).items():
@@ -6730,7 +6742,7 @@ class DuckCog(commands.Cog):
                 lines.append(f"**{title}** — —")
             lines.append(f"-# {desc}")
         lines.append("")
-        lines.append("## Nomination categories this week")
+        lines.append("## Nomination categories")
         titles = yearbook_state.get("nominate_titles") or []
         if not titles:
             lines.append("-# Rolling… try again in a moment.")
@@ -6741,6 +6753,7 @@ class DuckCog(commands.Cog):
         lines.append("")
         lines.append("-# Use `/nominate` to cast your ballot (standings stay secret until results).")
         embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
+        embed.set_footer(text=f"{yearbook_week_range_footer()} · results Mon")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="nominate", description="Cast your weekly Yearbook ballot (4 nominees).")
