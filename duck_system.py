@@ -5816,13 +5816,18 @@ class DuckCog(commands.Cog):
         elif kind == "reverse":
             word = source.get("word") or random.choice(REVERSE_AIR_WORDS)
             answer = source.get("answer") or word[::-1].lower()
+            if slots == 1:
+                body = (
+                    f"First person to type **`{word}`** backwards "
+                    f"claims **{eggs}** eggs!"
+                )
+            else:
+                body = (
+                    f"First **{slots}** people to type **`{word}`** backwards "
+                    f"claim **{eggs}** eggs each!"
+                )
             embed = discord.Embed(
-                description=(
-                    f"# ⏪ Reverse Drop\n"
-                    f"Type **`{word}`** **backwards** to claim!\n"
-                    f"-# First to type it correctly · **{eggs}** eggs"
-                    + (f" · **{slots}** winners" if slots > 1 else "")
-                ),
+                description=f"# ⏪ Reverse Drop\n{body}",
                 color=discord.Color.purple(),
             )
             try:
@@ -5907,13 +5912,18 @@ class DuckCog(commands.Cog):
         elif kind == "reverse":
             word = random.choice(REVERSE_AIR_WORDS)
             answer = word[::-1].lower()
+            if slots == 1:
+                body = (
+                    f"First person to type **`{word}`** backwards "
+                    f"claims **{eggs}** eggs!"
+                )
+            else:
+                body = (
+                    f"First **{slots}** people to type **`{word}`** backwards "
+                    f"claim **{eggs}** eggs each!"
+                )
             embed = discord.Embed(
-                description=(
-                    f"# ⏪ Reverse Drop\n"
-                    f"Type **`{word}`** **backwards** to claim!\n"
-                    f"-# First to type it correctly · **{eggs}** eggs"
-                    + (f" · **{slots}** winners" if slots > 1 else "")
-                ),
+                description=f"# ⏪ Reverse Drop\n{body}",
                 color=discord.Color.purple(),
             )
             try:
