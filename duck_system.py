@@ -391,11 +391,122 @@ environment_state = {
     "egg_emoji_error": "🪲",
 }
 
+# Full Moon Purge (monthly auto + /purge admin)
+# 24h window centered on full-moon peak (America/New_York).
+full_moon_purge_state: dict = {
+    "warning_channel_id": None,
+    "moon_duck_ids": [],          # configured pool (clear-immune)
+    "active_moon_duck_id": None,  # 1 of N chosen for this window
+    "manual_lock": False,         # True = forced ON, auto schedule paused
+    "warning_sent_for": None,     # window_id string
+    "started_for": None,          # window_id we auto/manual-started
+}
+
+# Synodic month reference (UTC). Good enough for ±1h event windows.
+_FULL_MOON_REF_UTC = datetime(2025, 1, 13, 22, 27, tzinfo=timezone.utc)
+_SYNODIC_DAYS = 29.530588853
+
+
+def full_moon_peak_around(now: datetime) -> datetime:
+    """Nearest full-moon peak to `now`, returned in America/New_York."""
+    eastern = ZoneInfo("America/New_York")
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=eastern)
+    now_utc = now.astimezone(timezone.utc)
+    days = (now_utc - _FULL_MOON_REF_UTC).total_seconds() / 86400.0
+    n = round(days / _SYNODIC_DAYS)
+    peak_utc = _FULL_MOON_REF_UTC + timedelta(days=_SYNODIC_DAYS * n)
+    return peak_utc.astimezone(eastern)
+
+
+def full_moon_window(now: datetime | None = None) -> tuple[datetime, datetime, datetime, str]:
+    """Return (start, peak, end, window_id) for the 24h window around the nearest peak."""
+    eastern = ZoneInfo("America/New_York")
+    now = now or datetime.now(eastern)
+    peak = full_moon_peak_around(now)
+    start = peak - timedelta(hours=12)
+    end = peak + timedelta(hours=12)
+    wid = peak.strftime("%Y-%m-%d")
+    return start, peak, end, wid
+
+
+def is_in_full_moon_window(now: datetime | None = None) -> bool:
+    start, _peak, end, _wid = full_moon_window(now)
+    eastern = ZoneInfo("America/New_York")
+    now = now or datetime.now(eastern)
+    return start <= now <= end
+
+
+def seconds_until_full_moon_start(now: datetime | None = None) -> float:
+    """Seconds until the *next* window start (if currently before it)."""
+    eastern = ZoneInfo("America/New_York")
+    now = now or datetime.now(eastern)
+    start, peak, end, wid = full_moon_window(now)
+    if now < start:
+        return (start - now).total_seconds()
+    # After this window begins: look at the following moon
+    next_peak = peak + timedelta(days=_SYNODIC_DAYS)
+    next_start = next_peak - timedelta(hours=12)
+    return (next_start - now).total_seconds()
+
+
+def is_moon_duck(duck_id: str) -> bool:
+    return duck_id in (full_moon_purge_state.get("moon_duck_ids") or [])
+
+
+def is_active_moon_duck(duck_id: str) -> bool:
+    return duck_id == full_moon_purge_state.get("active_moon_duck_id")
+
+
+def pick_and_activate_moon_duck() -> str | None:
+    """Pick 1 of N configured moon ducks and activate it. Returns duck_id or None."""
+    ids = [d for d in (full_moon_purge_state.get("moon_duck_ids") or []) if d in duck_index]
+    if not ids:
+        full_moon_purge_state["active_moon_duck_id"] = None
+        return None
+    choice = random.choice(ids)
+    full_moon_purge_state["active_moon_duck_id"] = choice
+    duck = duck_index[choice]
+    duck["active"] = True
+    duck["clear_immune"] = True
+    return choice
+
+
+def deactivate_moon_duck() -> None:
+    aid = full_moon_purge_state.get("active_moon_duck_id")
+    if aid and aid in duck_index:
+        duck_index[aid]["active"] = False
+    full_moon_purge_state["active_moon_duck_id"] = None
+
+
+def start_purge_event(*, manual: bool = False, window_id: str | None = None) -> str | None:
+    """Enable purge mode and activate one moon duck. Returns chosen duck_id."""
+    if is_error_mode():
+        return None
+    environment_state["purge_mode"] = True
+    environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
+    if manual:
+        full_moon_purge_state["manual_lock"] = True
+    if window_id:
+        full_moon_purge_state["started_for"] = window_id
+    return pick_and_activate_moon_duck()
+
+
+def stop_purge_event() -> None:
+    environment_state["purge_mode"] = False
+    full_moon_purge_state["manual_lock"] = False
+    deactivate_moon_duck()
+    # Re-roll drop chance if not locked by error mode
+    if not is_error_mode():
+        # leave egg_count; restore drop chance from today's roll path on next ensure
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Rewind (event toggle) + Yearbook (separate toggle)
 # ---------------------------------------------------------------------------
 REWIND_TOKEN_CAP = 5
-REWIND_EGGS_PER_TOKEN = 100  # hatched eggs → +1 token
+REWIND_EGGS_PER_TOKEN = 50  # hatched eggs → +1 token (Rewind package)
 REWIND_REACT = "⏪"
 
 # Dictionary-style words for reverse air drops (random pick)
@@ -1129,7 +1240,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state
     if _pool is None:
         return
     try:
@@ -1154,6 +1265,9 @@ async def load_duck_state():
             yb = data.get("duck_yearbook")
             if isinstance(yb, dict):
                 yearbook_state.update(yb)
+            fmp = data.get("duck_full_moon_purge")
+            if isinstance(fmp, dict):
+                full_moon_purge_state.update(fmp)
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -1214,6 +1328,7 @@ async def save_duck_state() -> bool:
                     ("duck_air_drop_state", json.dumps(air_drop_state)),
                     ("duck_series", json.dumps(duck_series)),
                     ("duck_yearbook", json.dumps(yearbook_state)),
+                    ("duck_full_moon_purge", json.dumps(full_moon_purge_state)),
                 ],
             )
         return True
@@ -1695,6 +1810,17 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
     if duck_id is None:
         return None
 
+    # Full moon duck cannot be hatched from rotten eggs — re-roll a few times
+    if rotten:
+        for _ in range(8):
+            if not is_active_moon_duck(duck_id) and not is_moon_duck(duck_id):
+                break
+            duck_id = roll_duck_id(rotten=True, error_egg=False)
+            if duck_id is None:
+                return None
+        if is_active_moon_duck(duck_id) or is_moon_duck(duck_id):
+            return None
+
     rec = get_user_record(discord_id)
     duck = duck_index[duck_id]
 
@@ -1938,6 +2064,8 @@ def format_grouped_plain(active_ids, owned_ids: set | None = None) -> str:
             duck = duck_index[duck_id]
             entry = f"{duck['emoji']} {duck['title']}"
             entry += format_limited_remaining(duck.get("limited_until"))
+            if is_active_moon_duck(duck_id):
+                entry += " 🌕"
             if duck_id in owned_ids:
                 lines.append(f"-# {entry}")
             else:
@@ -2495,14 +2623,20 @@ class ConfirmClearPoolView(discord.ui.View):
     @discord.ui.button(label="Confirm Clear Pool", style=discord.ButtonStyle.danger, emoji="🧹")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         count = 0
-        for duck in duck_index.values():
-            if duck.get("active"):
-                duck["active"] = False
-                duck["limited_until"] = None
-                count += 1
+        skipped = 0
+        for duck_id, duck in duck_index.items():
+            if not duck.get("active"):
+                continue
+            if duck.get("clear_immune") or is_moon_duck(duck_id) or is_active_moon_duck(duck_id):
+                skipped += 1
+                continue
+            duck["active"] = False
+            duck["limited_until"] = None
+            count += 1
         await save_duck_state()
+        extra = f" ({skipped} moon/immune left active)" if skipped else ""
         await interaction.response.edit_message(
-            content=f"🧹 Pool cleared — {count} duck(s) deactivated (still in the index, nothing deleted).",
+            content=f"🧹 Pool cleared — {count} duck(s) deactivated{extra}.",
             view=None,
         )
 
@@ -2961,15 +3095,6 @@ class ErrorAdminView(discord.ui.View):
         )
         err_mode.callback = self.toggle_error_mode
         self.add_item(err_mode)
-
-        purge_on = is_purge_mode()
-        purge_mode = discord.ui.Button(
-            label="Purge Mode ON" if purge_on else "Purge Mode",
-            style=discord.ButtonStyle.danger if purge_on else discord.ButtonStyle.secondary,
-            emoji="🚨",
-        )
-        purge_mode.callback = self.toggle_purge_mode
-        self.add_item(purge_mode)
 
         rewind_on = is_rewind_mode()
         rewind_btn = discord.ui.Button(
@@ -4911,6 +5036,7 @@ class DuckCog(commands.Cog):
         self.crown_role_payout_loop.start()
         self.air_drop_loop.start()
         self.yearbook_week_loop.start()
+        self.full_moon_purge_loop.start()
 
         # Re-register persistent gift offer buttons after restart
         for gift_id in list(pending_gifts.keys()):
@@ -4934,6 +5060,7 @@ class DuckCog(commands.Cog):
         self.crown_role_payout_loop.cancel()
         self.yearbook_week_loop.cancel()
         self.air_drop_loop.cancel()
+        self.full_moon_purge_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         orig = getattr(error, "original", error)
@@ -5330,6 +5457,17 @@ class DuckCog(commands.Cog):
             embed=view.build_embed(), view=view, ephemeral=True
         )
 
+    @app_commands.command(name="purge", description="Staff: Full Moon Purge config (channel, ducks, toggle).")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def purge_cmd(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        view = PurgeAdminView(interaction.guild)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
+        )
+
     @app_commands.command(name="drop", description="Staff: force an air drop in the air-drop channel now.")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -5689,8 +5827,7 @@ class DuckCog(commands.Cog):
             return
         if payload.emoji.name != REWIND_REACT:
             return
-        if is_purge_mode():
-            return
+        # Rewind package: ⏪ stays available during Purge so owners can recover after a steal
 
         uid = str(payload.user_id)
         guild = self.bot.get_guild(payload.guild_id)
@@ -6301,6 +6438,68 @@ class DuckCog(commands.Cog):
     async def before_yearbook_week_loop(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def full_moon_purge_loop(self):
+        """Auto full-moon purge: 1h warning, 24h window, activate 1 moon duck."""
+        if full_moon_purge_state.get("manual_lock"):
+            return  # rotation paused while staff force-on
+        if is_error_mode():
+            return  # error mode blocks purge from turning on
+
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
+        start, peak, end, wid = full_moon_window(now)
+        changed = False
+
+        # 1h warning (only before the window, not during)
+        secs_to_start = (start - now).total_seconds()
+        if 0 < secs_to_start <= 3600:
+            if full_moon_purge_state.get("warning_sent_for") != wid:
+                ch_id = full_moon_purge_state.get("warning_channel_id")
+                if ch_id:
+                    channel = self.bot.get_channel(int(ch_id))
+                    if channel:
+                        try:
+                            ts = int(start.timestamp())
+                            await channel.send(f"-# ☠️ Purge mode enabled in <t:{ts}:R>")
+                        except Exception as e:
+                            print(f"[full_moon] warning post failed: {e}")
+                full_moon_purge_state["warning_sent_for"] = wid
+                changed = True
+
+        in_window = start <= now <= end
+        if in_window:
+            if not is_purge_mode() or full_moon_purge_state.get("started_for") != wid:
+                chosen = start_purge_event(manual=False, window_id=wid)
+                changed = True
+                print(f"[full_moon] purge ON for {wid}; moon duck={chosen}")
+        else:
+            # End of window — only auto-stop if we started this window
+            if is_purge_mode() and not full_moon_purge_state.get("manual_lock"):
+                if full_moon_purge_state.get("started_for") == wid or (
+                    full_moon_purge_state.get("started_for")
+                    and full_moon_purge_state.get("started_for") != wid
+                    and now > end
+                ):
+                    # If started_for is an older window and we're past current end, stop
+                    stop_purge_event()
+                    # restore drop chance
+                    today_str = time.strftime("%Y-%m-%d", time.gmtime())
+                    chance = round(
+                        random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+                    )
+                    environment_state["date"] = today_str
+                    environment_state["drop_chance_percent"] = chance
+                    changed = True
+                    print(f"[full_moon] purge OFF after window {wid}")
+
+        if changed:
+            await save_duck_state()
+
+    @full_moon_purge_loop.before_loop
+    async def before_full_moon_purge_loop(self):
+        await self.bot.wait_until_ready()
+
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
         entries = state.get("entries", {})
         pool_total = state.get("pool_total", NEST_BASELINE)
@@ -6525,6 +6724,9 @@ class DuckCog(commands.Cog):
         eggs_line = f"🪺 Eggs per Drop Today: **{egg_count}** {egg_word}"
         drop_line = f"{egg_emoji('fresh')} Drop Chance: **{chance:g}%** per check"
 
+        footer = None
+        color = discord.Color.blue()
+
         if is_error_mode():
             lines = [
                 "# ⚠️ Error - Connection Issues",
@@ -6533,27 +6735,9 @@ class DuckCog(commands.Cog):
                 fortune_line,
                 f"🪲 Admin: Error odds **{ERROR_WEIGHT} > {ERROR_WEIGHT_EVENT}**",
             ]
-            if is_purge_mode():
-                lines.append("🚨 **Purge Mode** also active — drops can be stolen")
-            embed = discord.Embed(description="\n".join(lines), color=discord.Color.from_str("#000000"))
-            embed.set_footer(text="📶 Attempting to reconnect..")
-            await interaction.followup.send(embed=embed)
-            return
-
-        if is_purge_mode():
-            lines = [
-                "# 🚨 PURGE MODE",
-                drop_line,
-                eggs_line,
-                fortune_line,
-                "🥷 Drops can be **stolen** (50/50) by other members",
-            ]
-            embed = discord.Embed(description="\n".join(lines), color=discord.Color.red())
-            embed.set_footer(text="Finders keepers — unless someone is faster.")
-            await interaction.followup.send(embed=embed)
-            return
-
-        if is_rewind_mode():
+            color = discord.Color.from_str("#000000")
+            footer = "📶 Attempting to reconnect.."
+        elif is_rewind_mode():
             label = rewind_weather_label(float(chance))
             lines = [
                 f"# {label}",
@@ -6564,28 +6748,37 @@ class DuckCog(commands.Cog):
                 "⏪ Rewind Mode",
                 "-# 5–10 eggs/drop · ⏪ tokens · reverse-word air drops · retro skies",
             ]
-            embed = discord.Embed(description="\n".join(lines), color=discord.Color.purple())
-            embed.set_footer(text="⏪ Tokens from hatching · /inventory")
-            await interaction.followup.send(embed=embed)
-            return
-
-        if chance <= 8:
-            label = "🌦️ Calm"
-        elif chance <= 11:
-            label = "🌤️ Active"
-        elif chance <= 13:
-            label = "⚡ Energetic"
+            color = discord.Color.purple()
+            footer = "⏪ Tokens from hatching · /inventory"
         else:
-            label = "🌩️ Frenzy"
+            if chance <= 8:
+                label = "🌦️ Calm"
+            elif chance <= 11:
+                label = "🌤️ Active"
+            elif chance <= 13:
+                label = "⚡ Energetic"
+            else:
+                label = "🌩️ Frenzy"
+            lines = [
+                f"# {label}",
+                drop_line,
+                eggs_line,
+                fortune_line,
+            ]
+            color = discord.Color.blue()
 
-        lines = [
-            f"# {label}",
-            drop_line,
-            eggs_line,
-            fortune_line,
-        ]
+        # Purge overlays a single line + forced red; does not replace the rest
+        if is_purge_mode():
+            # Insert purge line directly under the title (# line)
+            if lines and lines[0].startswith("#"):
+                lines.insert(1, "-# ☠️ Purge Mode - Stealing Enabled ☠️")
+            else:
+                lines.insert(0, "-# ☠️ Purge Mode - Stealing Enabled ☠️")
+            color = discord.Color.from_str("#FF0000")
 
-        embed = discord.Embed(description="\n".join(lines), color=discord.Color.blue())
+        embed = discord.Embed(description="\n".join(lines), color=color)
+        if footer:
+            embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="hatchpool", description="View the current earnable duck pool.")
@@ -7227,4 +7420,171 @@ class YearbookDQModal(discord.ui.Modal, title="Disqualify member"):
         await save_duck_state()
         await interaction.response.send_message(
             f"Disqualified <@{uid}> from all Yearbook participation.", ephemeral=True
+        )
+
+
+
+class PurgeAdminView(discord.ui.View):
+    """Staff /purge — full moon config + manual toggle."""
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+
+    def build_embed(self) -> discord.Embed:
+        st = full_moon_purge_state
+        ch_id = st.get("warning_channel_id")
+        ch = f"<#{ch_id}>" if ch_id else "— not set —"
+        ids = st.get("moon_duck_ids") or []
+        duck_lines = []
+        for did in ids:
+            d = duck_index.get(did)
+            if d:
+                mark = " 🌕" if did == st.get("active_moon_duck_id") else ""
+                duck_lines.append(f"{d['emoji']} **{d['title']}**{mark}")
+            else:
+                duck_lines.append(f"`{did}` (missing)")
+        ducks_s = "\n".join(duck_lines) if duck_lines else "-# None configured"
+        start, peak, end, wid = full_moon_window()
+        purge_s = "ON" if is_purge_mode() else "OFF"
+        lock_s = "yes (auto paused)" if st.get("manual_lock") else "no"
+        lines = [
+            "# ☠️ Full Moon Purge",
+            f"**Status:** {purge_s} · manual lock: **{lock_s}**",
+            f"**Warning channel:** {ch}",
+            f"**Next/current window:** `{wid}`",
+            f"-# <t:{int(start.timestamp())}:f> → <t:{int(end.timestamp())}:f>",
+            "",
+            "**Moon ducks (1 picked per event):**",
+            ducks_s,
+        ]
+        return discord.Embed(description="\n".join(lines), color=discord.Color.from_str("#FF0000"))
+
+    @discord.ui.button(label="Warning channel", style=discord.ButtonStyle.secondary, emoji="📢")
+    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Pick the channel for the 1-hour purge warning:",
+            view=PurgeChannelSelectView(self),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set ducks", style=discord.ButtonStyle.primary, emoji="🌕")
+    async def set_ducks(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PurgeDucksModal(self, remove=False))
+
+    @discord.ui.button(label="Remove ducks", style=discord.ButtonStyle.secondary, emoji="🗑️")
+    async def remove_ducks(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PurgeDucksModal(self, remove=True))
+
+    @discord.ui.button(label="Toggle purge", style=discord.ButtonStyle.danger, emoji="☠️")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_purge_mode() or full_moon_purge_state.get("manual_lock"):
+            stop_purge_event()
+            if not is_error_mode():
+                today_str = time.strftime("%Y-%m-%d", time.gmtime())
+                chance = round(
+                    random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+                )
+                environment_state["date"] = today_str
+                environment_state["drop_chance_percent"] = chance
+            await save_duck_state()
+            await interaction.response.send_message(
+                "✅ **Purge OFF** — auto full-moon rotation will resume.",
+                ephemeral=True,
+            )
+        else:
+            if is_error_mode():
+                return await interaction.response.send_message(
+                    "Can't enable purge while **Error Mode** is on.", ephemeral=True
+                )
+            _, _, _, wid = full_moon_window()
+            chosen = start_purge_event(manual=True, window_id=wid)
+            await save_duck_state()
+            duck_s = ""
+            if chosen and chosen in duck_index:
+                d = duck_index[chosen]
+                duck_s = f"\nMoon duck: {d['emoji']} **{d['title']}** 🌕"
+            await interaction.response.send_message(
+                f"☠️ **Purge ON** (manual lock — auto schedule paused).{duck_s}",
+                ephemeral=True,
+            )
+        try:
+            await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True)
+        except Exception:
+            pass
+
+
+class PurgeChannelSelectView(discord.ui.View):
+    def __init__(self, parent: PurgeAdminView):
+        super().__init__(timeout=120)
+        self.parent = parent
+        select = discord.ui.ChannelSelect(
+            placeholder="Warning channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        ch = interaction.data["values"][0]
+        full_moon_purge_state["warning_channel_id"] = int(ch)
+        await save_duck_state()
+        await interaction.response.edit_message(
+            content=f"Warning channel set to <#{ch}>.",
+            view=None,
+        )
+
+
+class PurgeDucksModal(discord.ui.Modal):
+    def __init__(self, parent: PurgeAdminView, *, remove: bool):
+        title = "Remove moon ducks" if remove else "Set moon ducks"
+        super().__init__(title=title)
+        self.parent = parent
+        self.remove = remove
+        self.titles = discord.ui.TextInput(
+            label="Duck title(s)",
+            style=discord.TextStyle.paragraph,
+            placeholder="One per line or comma-separated",
+            max_length=2000,
+        )
+        self.add_item(self.titles)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.titles.value)
+        titles = [t.strip() for line in raw.split("\n") for t in line.split(",")]
+        titles = [t for t in titles if t]
+        ids = full_moon_purge_state.setdefault("moon_duck_ids", [])
+        added, removed, missing = [], [], []
+        for title in titles:
+            did = slugify(title)
+            duck = duck_index.get(did)
+            if not duck:
+                missing.append(title)
+                continue
+            if self.remove:
+                if did in ids:
+                    ids.remove(did)
+                    duck["clear_immune"] = False
+                    if full_moon_purge_state.get("active_moon_duck_id") == did:
+                        duck["active"] = False
+                        full_moon_purge_state["active_moon_duck_id"] = None
+                    removed.append(duck["title"])
+            else:
+                if did not in ids:
+                    ids.append(did)
+                duck["clear_immune"] = True
+                added.append(duck["title"])
+        await save_duck_state()
+        parts = []
+        if added:
+            parts.append("✅ Registered: " + ", ".join(added))
+        if removed:
+            parts.append("➖ Removed: " + ", ".join(removed))
+        if missing:
+            parts.append("⚠️ Not found: " + ", ".join(missing))
+        await interaction.response.send_message(
+            "\n".join(parts) or "Nothing changed.",
+            ephemeral=True,
         )
