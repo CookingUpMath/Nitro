@@ -3603,7 +3603,8 @@ async def return_pending_gift(bot: commands.Bot, gift_id: str, reason: str = "de
     amount = gift["amount"]
     add_eggs(giver_id, amount, kind="fresh")
     # Expired only — declined is abusable (friend declines on purpose)
-    if reason == "expired":
+    # Egg gifts under 10 don't grant karma
+    if reason == "expired" and int(amount) >= 10:
         award_karma(giver_id, 1)
     await save_duck_state()
 
@@ -3676,8 +3677,9 @@ class GiftOfferView(discord.ui.View):
         received = amount - lost
         if received > 0:
             add_eggs(gift["target_id"], received, kind="fresh")
-        # Sender karma: successful gift delivery
-        award_karma(gift["giver_id"], 5)
+        # Sender karma: successful gift of at least 10 eggs
+        if int(amount) >= 10:
+            award_karma(gift["giver_id"], 5)
         await save_duck_state()
 
         flavor = format_gift_loss_flavor(lost)
