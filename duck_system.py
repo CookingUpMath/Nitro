@@ -60,11 +60,12 @@ RARITY_DISPLAY = {
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
 MAX_HATCH_PER_COMMAND = 300    # hard cap per /hatch (including "all")
 # --- Fresh / rotten / error eggs ---
-ROT_AFTER_SECONDS = 72 * 3600       # base life before a fresh egg is eligible to rot
+ROT_AFTER_SECONDS = 48 * 3600       # base life before a fresh egg is eligible to rot
 ROT_CHECK_INTERVAL = 12 * 3600      # at most one rot pass per user per 12h
-# Each scheduled rot pass converts a random amount in this range (never more than eligible)
+# Each rot pass: ~10% of eligible fresh eggs, clamped to [MIN, MAX]
+ROT_PER_CHECK_PCT = 0.10
 ROT_PER_CHECK_MIN = 5
-ROT_PER_CHECK_MAX = 10
+ROT_PER_CHECK_MAX = 20
 # Daily qualifying-message thresholds (Eastern) → extra life that day only
 # 0–9: +0h | 10–29: +12h | 30–99: +24h | 100+: +36h
 ROT_MSG_BONUS_HOURS = [
@@ -1111,8 +1112,8 @@ def _batch_is_eligible(batch: dict, now: float, bonus_seconds: int) -> bool:
 
 
 def maybe_apply_egg_rot(rec: dict) -> int:
-    """At most once per 12h: turn up to ROT_PER_CHECK oldest eligible fresh eggs rotten.
-    Never drives inventory negative — only converts min(eligible, 5).
+    """At most once per 12h: rot ~10% of eligible fresh eggs (min 5, max 20).
+    Oldest eligible batches first. Never drives inventory negative.
     """
     now = time.time()
     last = rec.get("last_rot_check_at")
@@ -1134,7 +1135,10 @@ def maybe_apply_egg_rot(rec: dict) -> int:
     if eligible <= 0:
         return 0
 
-    to_rot = min(eligible, random.randint(ROT_PER_CHECK_MIN, ROT_PER_CHECK_MAX))
+    # ~10% of eligible, clamped to [5, 20], never more than eligible
+    to_rot = int(eligible * ROT_PER_CHECK_PCT)
+    to_rot = max(ROT_PER_CHECK_MIN, min(ROT_PER_CHECK_MAX, to_rot))
+    to_rot = min(eligible, to_rot)
     remaining = to_rot
     new_batches = []
     for b in batches:
@@ -1849,11 +1853,17 @@ def _inventory_count_for_kind(rec: dict, kind: str) -> int:
     return 0
 
 
-def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh", skip_yearbook: bool = False):
+def resolve_hatch(
+    discord_id: str,
+    *,
+    egg_kind: str = "fresh",
+    skip_yearbook: bool = False,
+    skip_bonus: bool = False,
+):
     """Roll one hatch. egg_kind: fresh | rotten | error.
     Does NOT spend inventory — caller spends first.
-    0.05% chance to gain an error egg into inventory after any successful hatch.
     skip_yearbook: nest eggs must not affect any Yearbook category.
+    skip_bonus: nest-won eggs never grant duplicate bonus eggs.
     """
     error_egg = egg_kind == "error"
     rotten = egg_kind == "rotten"
@@ -1889,9 +1899,11 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh", skip_yearbook: bo
     bonus_egg = False
     error_egg_gained = False
 
-    if is_duplicate:
+    if is_duplicate and not skip_bonus:
         if random.random() < DUPLICATE_BONUS_CHANCE:
-            add_eggs(discord_id, 1, kind="fresh")
+            # Fresh (and error-egg hatches) → fresh bonus. Rotten → rotten bonus only.
+            bonus_kind = "rotten" if rotten else "fresh"
+            add_eggs(discord_id, 1, kind=bonus_kind)
             bonus_egg = True
     else:
         rec["collection"].append(duck_id)
@@ -7220,7 +7232,10 @@ class DuckCog(commands.Cog):
                 break
             skip_yb = spent == "fresh_nest"
             result = resolve_hatch(
-                discord_id, egg_kind=egg_kind, skip_yearbook=skip_yb
+                discord_id,
+                egg_kind=egg_kind,
+                skip_yearbook=skip_yb,
+                skip_bonus=skip_yb,  # nest-won eggs: no duplicate bonus
             )
             if result is None:
                 add_eggs(discord_id, 1, kind=egg_kind)
