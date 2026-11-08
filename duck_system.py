@@ -73,16 +73,20 @@ ROT_MSG_BONUS_HOURS = [
     (10, 12),
     (0, 0),
 ]
-ERROR_EGG_GAIN_CHANCE = 0.0005      # 0.05% chance to earn an error egg on any hatch
+# Error *egg item* gain — absolute chances (random.random()), NOT table weights.
+# ERROR duck pool uses table weight ERROR_WEIGHT (0.1 vs ~100) ≈ 0.1% of fresh hatches.
+ERROR_EGG_GAIN_CHANCE = 0.0005           # 0.05% on fresh — slightly harder than ~0.1% error pool
+ERROR_EGG_GAIN_CHANCE_ROTTEN = 0.00005   # 0.005% on rotten — extreme
 ROTTEN_RARITY_WEIGHTS = {
-    "common": 78.0,
-    "rare": 16.0,
-    "legendary": 4.5,
-    "divine": 1.0,
-    "secret": 0.4,
-    "quackpot": 0.1,
+    # Noticeably worse than fresh — mass dumped into common
+    "common": 88.0,
+    "rare": 9.0,
+    "legendary": 2.2,
+    "divine": 0.55,
+    "secret": 0.2,
+    "quackpot": 0.05,
 }
-ERROR_WEIGHT_ROTTEN = 0.05          # fixed; Error Mode never boosts rotten/error-egg rolls
+ERROR_WEIGHT_ROTTEN = 0.005         # rotten only — far below quackpot; Error Mode never boosts this
 ERROR_WEIGHT_ERROR_EGG = 0.05       # reserved; error eggs only roll the error duck pool
 DROP_COOLDOWN_SECONDS = 60     # 1 minute between roll attempts, per user
 DROP_MIN_CONTENT_LENGTH = 8    # letters/digits only — spaces & symbols don't count
@@ -400,6 +404,17 @@ full_moon_purge_state: dict = {
     "manual_lock": False,         # True = forced ON, auto schedule paused
     "warning_sent_for": None,     # window_id string
     "started_for": None,          # window_id we auto/manual-started
+}
+
+# Thanksgiving package — isolated toggle (/ty). No cross-talk with other events.
+THANKS_PHRASE = "i'm thankful for"
+THANKS_MIN_CHARS = 50  # meaningful letters/digits after the phrase
+thanksgiving_state: dict = {
+    "enabled": False,
+    "channel_id": None,
+    "duck_id": None,
+    # user_id str -> message_id int (one submission per member)
+    "submissions": {},
 }
 
 # Synodic month reference (UTC). Good enough for ±1h event windows.
@@ -1017,6 +1032,8 @@ def default_user_record():
         "treats": 0,
         "treats_given": 0,
         "treats_received": 0,
+        "reply_karma_date": None,
+        "reply_karma_count": 0,
     }
 
 
@@ -1240,7 +1257,7 @@ _pool = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state, thanksgiving_state
     if _pool is None:
         return
     try:
@@ -1268,6 +1285,9 @@ async def load_duck_state():
             fmp = data.get("duck_full_moon_purge")
             if isinstance(fmp, dict):
                 full_moon_purge_state.update(fmp)
+            tg = data.get("duck_thanksgiving")
+            if isinstance(tg, dict):
+                thanksgiving_state.update(tg)
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -1329,6 +1349,7 @@ async def save_duck_state() -> bool:
                     ("duck_series", json.dumps(duck_series)),
                     ("duck_yearbook", json.dumps(yearbook_state)),
                     ("duck_full_moon_purge", json.dumps(full_moon_purge_state)),
+                    ("duck_thanksgiving", json.dumps(thanksgiving_state)),
                 ],
             )
         return True
@@ -1658,7 +1679,7 @@ def get_active_error_ducks():
 
 def roll_duck_id(*, rotten: bool = False, error_egg: bool = False):
     """Pick one active duck. error_egg=True → only ERROR pool.
-    rotten=True → ROTTEN_RARITY_WEIGHTS + ERROR 0.05 (no Error Mode boost).
+    rotten=True → ROTTEN_RARITY_WEIGHTS only (no ERROR duck pool).
     Otherwise normal weights + effective_error_weight().
     """
     error_ducks = get_active_error_ducks()
@@ -1672,10 +1693,10 @@ def roll_duck_id(*, rotten: bool = False, error_egg: bool = False):
     available_tiers = [r for r in RARITY_ORDER if by_rarity[r]]
     weights = [table[r] for r in available_tiers]
 
-    if error_ducks:
+    # ERROR ducks only on fresh (or dedicated error-egg hatches) — never from rotten
+    if error_ducks and not rotten:
         available_tiers = available_tiers + ["_error"]
-        err_w = ERROR_WEIGHT_ROTTEN if rotten else effective_error_weight()
-        weights = weights + [err_w]
+        weights = weights + [effective_error_weight()]
 
     if not available_tiers:
         return None
@@ -1763,17 +1784,22 @@ def try_spend_one_egg(discord_id: str) -> str | None:
 
 
 def try_spend_one_egg_of_kind(discord_id: str, kind: str) -> str | None:
-    """Spend exactly one egg of the given kind. Returns kind on success, else None."""
+    """Spend exactly one egg of the given kind.
+
+    Returns 'fresh' | 'rotten' | 'error' on success, else None.
+    Nest-locked fresh eggs return 'fresh_nest' so Yearbook stats can be skipped.
+    """
     rec = get_user_record(discord_id)
     if kind == "fresh":
         if int(rec.get("inventory_fresh") or 0) < 1:
             return None
         locked = int(rec.get("nest_locked") or 0)
+        was_nest = locked > 0
         rec["inventory_fresh"] = int(rec["inventory_fresh"]) - 1
         _trim_fresh_batches(rec, 1)
         rec["nest_locked"] = max(0, locked - 1)
         _sync_inventory_total(rec)
-        return "fresh"
+        return "fresh_nest" if was_nest else "fresh"
     if kind == "rotten":
         if int(rec.get("inventory_rotten") or 0) < 1:
             return None
@@ -1799,10 +1825,11 @@ def _inventory_count_for_kind(rec: dict, kind: str) -> int:
     return 0
 
 
-def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
+def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh", skip_yearbook: bool = False):
     """Roll one hatch. egg_kind: fresh | rotten | error.
     Does NOT spend inventory — caller spends first.
     0.05% chance to gain an error egg into inventory after any successful hatch.
+    skip_yearbook: nest eggs must not affect any Yearbook category.
     """
     error_egg = egg_kind == "error"
     rotten = egg_kind == "rotten"
@@ -1845,11 +1872,14 @@ def resolve_hatch(discord_id: str, *, egg_kind: str = "fresh"):
     else:
         rec["collection"].append(duck_id)
 
-    if random.random() < ERROR_EGG_GAIN_CHANCE:
+    egg_gain_p = ERROR_EGG_GAIN_CHANCE_ROTTEN if rotten else ERROR_EGG_GAIN_CHANCE
+    if random.random() < egg_gain_p:
         add_eggs(discord_id, 1, kind="error")
         error_egg_gained = True
 
-    yb_add_luck(discord_id, duck)
+    # Luck is yearbook-related — caller may skip via skip_yearbook on the result
+    if not skip_yearbook:
+        yb_add_luck(discord_id, duck)
 
     return {
         "duck_id": duck_id,
@@ -3536,6 +3566,9 @@ async def return_pending_gift(bot: commands.Bot, gift_id: str, reason: str = "de
     giver_id = gift["giver_id"]
     amount = gift["amount"]
     add_eggs(giver_id, amount, kind="fresh")
+    # Expired only — declined is abusable (friend declines on purpose)
+    if reason == "expired":
+        award_karma(giver_id, 1)
     await save_duck_state()
 
     try:
@@ -3607,6 +3640,8 @@ class GiftOfferView(discord.ui.View):
         received = amount - lost
         if received > 0:
             add_eggs(gift["target_id"], received, kind="fresh")
+        # Sender karma: successful gift delivery
+        award_karma(gift["giver_id"], 5)
         await save_duck_state()
 
         flavor = format_gift_loss_flavor(lost)
@@ -5140,8 +5175,34 @@ class DuckCog(commands.Cog):
             award_karma(pending_inviter, 1)
             state_changed = True
 
+        # --- Reply karma: 1 per reply to another human, max 5/day (UTC) ---
+        if message.reference and message.reference.message_id and not message.author.bot:
+            try:
+                ref = message.reference.resolved
+                if ref is None:
+                    ref = await message.channel.fetch_message(message.reference.message_id)
+                if (
+                    ref
+                    and getattr(ref, "author", None)
+                    and not ref.author.bot
+                    and ref.author.id != message.author.id
+                ):
+                    today = time.strftime("%Y-%m-%d", time.gmtime())
+                    if rec.get("reply_karma_date") != today:
+                        rec["reply_karma_date"] = today
+                        rec["reply_karma_count"] = 0
+                    if int(rec.get("reply_karma_count") or 0) < 5:
+                        rec["reply_karma_count"] = int(rec.get("reply_karma_count") or 0) + 1
+                        award_karma(discord_id, 1)
+                        state_changed = True
+            except Exception:
+                pass
+
         if state_changed:
             await save_duck_state()
+
+        # --- Thanksgiving submissions (isolated package) ---
+        await self._process_thanksgiving_message(message)
 
         # Shared anti-spam gate for passive drops + air-drop challenge progress
         qualifies = message_qualifies_for_egg_drop(message)
@@ -5464,6 +5525,17 @@ class DuckCog(commands.Cog):
         if interaction.guild is None:
             return await interaction.response.send_message("Guild only.", ephemeral=True)
         view = PurgeAdminView(interaction.guild)
+        await interaction.response.send_message(
+            embed=view.build_embed(), view=view, ephemeral=True
+        )
+
+    @app_commands.command(name="ty", description="Staff: Thanksgiving event config (toggle, channel, duck).")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def ty_cmd(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        view = ThanksgivingAdminView(interaction.guild)
         await interaction.response.send_message(
             embed=view.build_embed(), view=view, ephemeral=True
         )
@@ -6438,6 +6510,133 @@ class DuckCog(commands.Cog):
     async def before_yearbook_week_loop(self):
         await self.bot.wait_until_ready()
 
+    async def _process_thanksgiving_message(self, message: discord.Message):
+        """Grant thanksgiving duck for valid 'I'm thankful for…' posts."""
+        if not thanksgiving_state.get("enabled"):
+            return
+        if message.author.bot or not message.guild:
+            return
+        ch_id = thanksgiving_state.get("channel_id")
+        duck_id = thanksgiving_state.get("duck_id")
+        if not ch_id or not duck_id or duck_id not in duck_index:
+            return
+        if message.channel.id != int(ch_id):
+            return
+
+        content = (message.content or "").strip()
+        low = content.casefold()
+        if not low.startswith(THANKS_PHRASE):
+            return
+
+        body = content[len(THANKS_PHRASE):].strip() if low.startswith(THANKS_PHRASE) else content
+        # meaningful length of the thankful body
+        meaningful = _egg_drop_meaningful_len(body)
+        uid = str(message.author.id)
+        subs = thanksgiving_state.setdefault("submissions", {})
+
+        # Second submission: delete the new post, no duck
+        if uid in subs:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await message.author.send(
+                    "🦃 You already submitted a Thanksgiving post for this event — "
+                    "only **one** counts. Extra posts are removed."
+                )
+            except Exception:
+                pass
+            return
+
+        if meaningful < THANKS_MIN_CHARS:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await message.author.send(
+                    f"🦃 Your Thanksgiving post needs at least **{THANKS_MIN_CHARS}** "
+                    f"letters/numbers after “I'm thankful for…”. Try again with a fuller thought."
+                )
+            except Exception:
+                pass
+            return
+
+        duck = duck_index[duck_id]
+        rec = get_user_record(uid)
+        if duck_id not in rec.get("collection", []):
+            rec.setdefault("collection", []).append(duck_id)
+        subs[uid] = message.id
+        await save_duck_state()
+        try:
+            await message.add_reaction("🦃")
+        except Exception:
+            pass
+
+    async def _revoke_thanksgiving(self, uid: str, reason: str):
+        """Remove thanksgiving duck and clear submission."""
+        subs = thanksgiving_state.setdefault("submissions", {})
+        if uid not in subs:
+            return
+        duck_id = thanksgiving_state.get("duck_id")
+        subs.pop(uid, None)
+        if duck_id:
+            rec = get_user_record(uid)
+            col = rec.get("collection") or []
+            if duck_id in col:
+                rec["collection"] = [d for d in col if d != duck_id]
+            favs = rec.get("favorites") or []
+            if duck_id in favs:
+                rec["favorites"] = [d for d in favs if d != duck_id]
+        await save_duck_state()
+        try:
+            user = await self.bot.fetch_user(int(uid))
+            await user.send(f"🦃 Your Thanksgiving duck was removed. Reason: {reason}")
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if not thanksgiving_state.get("enabled"):
+            return
+        ch_id = thanksgiving_state.get("channel_id")
+        if not ch_id or payload.channel_id != int(ch_id):
+            return
+        subs = thanksgiving_state.get("submissions") or {}
+        for uid, mid in list(subs.items()):
+            if int(mid) == int(payload.message_id):
+                await self._revoke_thanksgiving(uid, "your post was deleted.")
+                break
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        if not thanksgiving_state.get("enabled"):
+            return
+        ch_id = thanksgiving_state.get("channel_id")
+        if not ch_id or payload.channel_id != int(ch_id):
+            return
+        subs = thanksgiving_state.get("submissions") or {}
+        uid = None
+        for u, mid in subs.items():
+            if int(mid) == int(payload.message_id):
+                uid = u
+                break
+        if not uid:
+            return
+        data = payload.data or {}
+        content = (data.get("content") or "").strip()
+        low = content.casefold()
+        ok = low.startswith(THANKS_PHRASE)
+        body = content[len(THANKS_PHRASE):].strip() if ok else ""
+        meaningful = _egg_drop_meaningful_len(body) if ok else 0
+        if not ok or meaningful < THANKS_MIN_CHARS:
+            await self._revoke_thanksgiving(
+                uid,
+                f"your post no longer starts with “I'm thankful for…” "
+                f"or dropped under {THANKS_MIN_CHARS} characters.",
+            )
+
     @tasks.loop(minutes=1)
     async def full_moon_purge_loop(self):
         """Auto full-moon purge: 1h warning, 24h window, activate 1 moon duck."""
@@ -6695,11 +6894,13 @@ class DuckCog(commands.Cog):
 
         if random.random() < success_rate:
             target.setdefault("collection", []).append(duck_id)
+            award_karma(giver_id, 5)
             await save_duck_state()
             return await interaction.response.send_message(
                 f"{duck_emoji} **{duck_title}** made it to {member.mention}!\n-# {fortune_line}",
             )
 
+        award_karma(giver_id, 1)
         await save_duck_state()
         await interaction.response.send_message(
             f"{duck_emoji} **{duck_title}** ran away and is gone… "
@@ -6987,20 +7188,27 @@ class DuckCog(commands.Cog):
 
         results = []
         error_eggs_got = 0
+        yearbook_hatches = 0
         for _ in range(hatch_count):
             spent = try_spend_one_egg_of_kind(discord_id, egg_kind)
             if spent is None:
                 break
-            result = resolve_hatch(discord_id, egg_kind=egg_kind)
+            skip_yb = spent == "fresh_nest"
+            result = resolve_hatch(
+                discord_id, egg_kind=egg_kind, skip_yearbook=skip_yb
+            )
             if result is None:
                 add_eggs(discord_id, 1, kind=egg_kind)
                 break
             results.append(result)
+            if not skip_yb:
+                yearbook_hatches += 1
             if result.get("error_egg_gained"):
                 error_eggs_got += 1
 
         if results:
-            yb_add_hatched(discord_id, len(results))
+            if yearbook_hatches:
+                yb_add_hatched(discord_id, yearbook_hatches)
             grant_rewind_from_hatch(discord_id, len(results))
 
         await save_duck_state()
@@ -7586,5 +7794,115 @@ class PurgeDucksModal(discord.ui.Modal):
             parts.append("⚠️ Not found: " + ", ".join(missing))
         await interaction.response.send_message(
             "\n".join(parts) or "Nothing changed.",
+            ephemeral=True,
+        )
+
+
+
+class ThanksgivingAdminView(discord.ui.View):
+    """Staff /ty — Thanksgiving toggle + channel + reward duck."""
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+
+    def build_embed(self) -> discord.Embed:
+        st = thanksgiving_state
+        on = bool(st.get("enabled"))
+        ch = f"<#{st['channel_id']}>" if st.get("channel_id") else "— not set —"
+        duck_id = st.get("duck_id")
+        duck = duck_index.get(duck_id) if duck_id else None
+        duck_s = f"{duck['emoji']} **{duck['title']}**" if duck else "— not set —"
+        n = len(st.get("submissions") or {})
+        lines = [
+            "# 🦃 Thanksgiving",
+            f"**Status:** {'ON' if on else 'OFF'}",
+            f"**Channel:** {ch}",
+            f"**Reward duck:** {duck_s}",
+            f"**Submissions:** **{n}**",
+            "",
+            "-# Posts must start with **I'm thankful for…**",
+            f"-# At least **{THANKS_MIN_CHARS}** letters/numbers after that phrase",
+            "-# One post per member · delete/edit-below-min removes the duck",
+        ]
+        return discord.Embed(
+            description="\n".join(lines),
+            color=discord.Color.dark_gold() if on else discord.Color.dark_grey(),
+        )
+
+    @discord.ui.button(label="Toggle ON/OFF", style=discord.ButtonStyle.primary, emoji="🦃")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thanksgiving_state["enabled"] = not bool(thanksgiving_state.get("enabled"))
+        if not thanksgiving_state["enabled"]:
+            # Turn off only — do not mass-revoke existing ducks
+            pass
+        await save_duck_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.followup.send(
+            f"Thanksgiving is now **{'ON' if thanksgiving_state['enabled'] else 'OFF'}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set channel", style=discord.ButtonStyle.secondary, emoji="📢")
+    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        select = discord.ui.ChannelSelect(
+            placeholder="Thanksgiving channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+
+        async def on_select(inter: discord.Interaction):
+            thanksgiving_state["channel_id"] = int(inter.data["values"][0])
+            await save_duck_state()
+            await inter.response.edit_message(
+                content=f"Thanksgiving channel set to <#{thanksgiving_state['channel_id']}>.",
+                view=None,
+            )
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "Pick the channel for “I'm thankful for…” posts:",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set duck", style=discord.ButtonStyle.secondary, emoji="🦆")
+    async def set_duck(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ThanksgivingDuckModal(self))
+
+
+class ThanksgivingDuckModal(discord.ui.Modal, title="Thanksgiving reward duck"):
+    title_input = discord.ui.TextInput(
+        label="Duck title",
+        placeholder="Exact or close duck name",
+        max_length=100,
+    )
+
+    def __init__(self, parent: ThanksgivingAdminView):
+        super().__init__()
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.title_input.value).strip()
+        did = slugify(raw)
+        duck = duck_index.get(did)
+        if not duck:
+            # fuzzy: first title contains
+            for k, d in duck_index.items():
+                if raw.casefold() in d.get("title", "").casefold():
+                    duck = d
+                    did = k
+                    break
+        if not duck:
+            return await interaction.response.send_message(
+                f"No duck matching **{raw}**.", ephemeral=True
+            )
+        thanksgiving_state["duck_id"] = did
+        await save_duck_state()
+        await interaction.response.send_message(
+            f"Thanksgiving duck set to {duck['emoji']} **{duck['title']}**.",
             ephemeral=True,
         )
