@@ -1222,10 +1222,33 @@ def award_karma(discord_id: str, points: int = 1):
     if points > 0:
         yb_add_karma(discord_id, points)
     # Normal: 10 karma → 1 egg. Rewind mode: 10 karma → 10 eggs.
+    # Each conversion also has a tiny chance at an error egg (same as rotten item rate).
     eggs_per_threshold = 10 if is_rewind_mode() else 1
+    error_eggs_found = 0
     while rec["karma"] >= KARMA_PER_EGG:
         rec["karma"] -= KARMA_PER_EGG
         add_eggs(discord_id, eggs_per_threshold, kind="fresh")
+        if random.random() < ERROR_EGG_GAIN_CHANCE_ROTTEN:
+            add_eggs(discord_id, 1, kind="error")
+            error_eggs_found += 1
+    if error_eggs_found and _bot is not None:
+        try:
+            asyncio.create_task(_dm_karma_error_egg(discord_id, error_eggs_found))
+        except Exception:
+            pass
+
+
+async def _dm_karma_error_egg(discord_id: str, count: int = 1):
+    try:
+        user = await _bot.fetch_user(int(discord_id))
+        if count <= 1:
+            await user.send("Woah! You just found an error egg through karma.")
+        else:
+            await user.send(
+                f"Woah! You just found **{count}** error eggs through karma."
+            )
+    except Exception:
+        pass
 
 
 def remove_karma(discord_id: str, points: int = 1):
@@ -1254,6 +1277,7 @@ def add_eggs(discord_id: str, amount: int, kind: str = "fresh"):
 # Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
 # import back into the main bot file.
 _pool = None
+_bot = None
 
 
 async def load_duck_state():
@@ -5061,8 +5085,9 @@ class DuckCog(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
-        global _pool
+        global _pool, _bot
         _pool = self.bot.db_pool
+        _bot = self.bot
         await load_duck_state()
         self.check_expired_limited.start()
         self.update_egg_counter_channels.start()
