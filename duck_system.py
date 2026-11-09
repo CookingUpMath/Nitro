@@ -601,10 +601,10 @@ yearbook_state: dict = {
     "last_winners": [],
 }
 
+# Prefer a non-expiring link in /ybe if this CDN URL 404s (Discord signed ?ex= links expire).
 YEARBOOK_BANNER_URL = (
     "https://cdn.discordapp.com/attachments/1055252004114546799/"
     "1565237978677256332/POND-YEAR-BOOK-2026-10-27.png"
-    "?ex=6ae42cf6&is=6ae2db76&hm=9235bdac59d86aa947c108c9e49acb4494908f3a4d1abe617460e9242f117699&"
 )
 YEARBOOK_EMBED_COLORS = [0xF02AE0, 0x169EFC, 0xF4F4F4]
 
@@ -641,13 +641,180 @@ def build_yearbook_seat_embed(
             f"## Awaiting winners\n"
             f"-# ❝{line}❞"
         )
-    emb = discord.Embed(description=body, color=color)
+    emb = discord.Embed(description=body, color=discord.Color(color))
     if avatar_url:
         emb.set_thumbnail(url=avatar_url)
     return emb
 
 
-YEARBOOK_NOMINATE_MIN_VOTES = 3
+def yearbook_all_seats() -> list[dict]:
+    """Canonical 8 seats: 4 competitive + up to 4 nomination titles."""
+    seats = []
+    for key, title, desc in YEARBOOK_COMPETITIVE:
+        seats.append({"kind": "comp", "key": key, "title": title, "line": desc})
+    for t in (yearbook_state.get("nominate_titles") or [])[:4]:
+        seats.append({
+            "kind": "nom",
+            "key": t.get("title") or "",
+            "title": t.get("title") or "Nomination",
+            "line": t.get("line") or "",
+        })
+    # Pad nomination slots if titles missing
+    while len([s for s in seats if s["kind"] == "nom"]) < 4:
+        n = len([s for s in seats if s["kind"] == "nom"]) + 1
+        seats.append({
+            "kind": "nom",
+            "key": f"open_{n}",
+            "title": f"Nomination {n}",
+            "line": "Open seat",
+        })
+    return seats[:8]
+
+
+def yearbook_winners_by_title(winners: list | None = None) -> dict:
+    winners = winners if winners is not None else (yearbook_state.get("last_winners") or [])
+    by = {}
+    for w in winners:
+        title = w.get("title")
+        if not title:
+            continue
+        by.setdefault(title, []).append(w)
+    return by
+
+
+async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None) -> str:
+    """Rebuild the yearbook channel message (all seats). Returns status text."""
+    ch_id = yearbook_state.get("channel_id")
+    if not ch_id:
+        return "No yearbook channel set."
+    winners = winners if winners is not None else (yearbook_state.get("last_winners") or [])
+    by_title = yearbook_winners_by_title(winners)
+    seats = yearbook_all_seats()
+    colors = yearbook_color_sequence(len(seats))
+
+    status_bits = []
+    for guild in bot.guilds:
+        channel = guild.get_channel(int(ch_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(ch_id))
+            except Exception:
+                continue
+        embeds = []
+        for i, seat in enumerate(seats):
+            placed = by_title.get(seat["title"]) or []
+            if placed:
+                # One embed per tied winner for that title
+                for j, w in enumerate(placed):
+                    uid = w.get("user_id")
+                    member = guild.get_member(int(uid)) if uid else None
+                    av = member.display_avatar.url if member else None
+                    col = colors[i] if j == 0 else yearbook_color_sequence(2)[1]
+                    embeds.append(build_yearbook_seat_embed(
+                        seat["title"], seat.get("line") or "",
+                        user_id=str(uid) if uid else None,
+                        color=col,
+                        avatar_url=av,
+                    ))
+            else:
+                embeds.append(build_yearbook_seat_embed(
+                    seat["title"], seat.get("line") or "",
+                    color=colors[i],
+                ))
+        embeds = embeds[:10]
+        msg_id = yearbook_state.get("message_id")
+        ok = False
+        if msg_id:
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.edit(content=None, embeds=embeds)
+                ok = True
+            except Exception as e:
+                status_bits.append(f"edit failed: {e}")
+        if not ok:
+            try:
+                banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
+                if banner:
+                    try:
+                        await channel.send(banner)
+                    except Exception:
+                        pass
+                sent = await channel.send(embeds=embeds)
+                yearbook_state["message_id"] = sent.id
+                await save_duck_state()
+                ok = True
+                status_bits.append("reposted board message")
+            except Exception as e:
+                status_bits.append(f"repost failed: {e}")
+        if ok:
+            status_bits.append(f"board updated in #{getattr(channel, 'name', ch_id)}")
+    return "; ".join(status_bits) if status_bits else "No guild channel found."
+
+
+async def grant_yearbook_manual_winner(
+    bot: commands.Bot,
+    *,
+    user_id: str,
+    title: str,
+    line: str,
+    kind: str = "manual",
+) -> dict:
+    """Grant one yearbook seat to a user and append to last_winners."""
+    eggs_amt = int(yearbook_state.get("winner_eggs") or 500)
+    duck_id = yearbook_state.get("winner_duck_id")
+    role_id = yearbook_state.get("role_id")
+    w = {
+        "kind": kind,
+        "title": title,
+        "line": line or "",
+        "user_id": str(user_id),
+        "score": 0,
+        "eggs_awarded": eggs_amt,
+        "manual": True,
+    }
+    add_eggs(str(user_id), eggs_amt, kind="fresh")
+    rec = get_user_record(str(user_id))
+    rec["nest_locked"] = int(rec.get("nest_locked") or 0) + eggs_amt
+    if duck_id and duck_id not in rec.get("collection", []):
+        rec.setdefault("collection", []).append(duck_id)
+        w["duck_given"] = True
+    else:
+        w["duck_given"] = False
+    last = yearbook_state.setdefault("last_winners", [])
+    # Replace existing entry for same title+user if re-granted
+    last = [x for x in last if not (x.get("title") == title and str(x.get("user_id")) == str(user_id))]
+    last.append(w)
+    yearbook_state["last_winners"] = last
+    await save_duck_state()
+
+    for guild in bot.guilds:
+        member = guild.get_member(int(user_id))
+        if not member:
+            continue
+        if role_id:
+            role = guild.get_role(int(role_id))
+            if role and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Yearbook manual winner")
+                except Exception:
+                    pass
+        try:
+            duck_line = ""
+            if w.get("duck_given") and duck_id and duck_id in duck_index:
+                d = duck_index[duck_id]
+                duck_line = f"\n{d['emoji']} **{d['title']}** added to your collection!"
+            elif duck_id:
+                duck_line = "\n-# Winner duck already owned (no duplicate)."
+            await member.send(
+                f"📖 You were awarded **{title}** in the Pond Yearbook!\n"
+                f"**+{eggs_amt}** eggs.{duck_line}"
+            )
+        except Exception:
+            pass
+    return w
+
+
+YEARBOOK_NOMINATE_MIN_VOTES = 2
 YEARBOOK_BALLOT_REWARD = 50
 YEARBOOK_MSG_REQUIREMENT = 50
 YEARBOOK_COMPETITIVE = [
@@ -882,9 +1049,9 @@ def pick_yearbook_titles(n: int = 4) -> list:
 def ensure_yearbook_week() -> None:
     """Roll titles / reset counters when the ISO week changes (if enabled).
 
-    If carry_next_monday is set (enabled mid-week), the week id advances but
-    stats, votes, ballots, and nominate titles are kept so progress folds into
-    the following full week instead of being wiped or paid early.
+    Mid-week enable sets carry_next_monday: the first Monday is skipped for
+    *payout*, and hold_stats_until_payout keeps votes/stats across that boundary
+    so the *second* Monday can still pay the accumulated cycle.
     """
     if not yearbook_state.get("enabled"):
         return
@@ -894,8 +1061,8 @@ def ensure_yearbook_week() -> None:
             yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
         return
     yearbook_state["week_id"] = wid
-    if yearbook_state.get("carry_next_monday"):
-        # Keep accumulated stats / nominations; Monday job will skip payout once
+    if yearbook_state.get("carry_next_monday") or yearbook_state.get("hold_stats_until_payout"):
+        # Keep accumulated stats / nominations across the boundary
         if not yearbook_state.get("nominate_titles"):
             yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
         return
@@ -6411,12 +6578,23 @@ class DuckCog(commands.Cog):
         wid = yearbook_week_id()
         if yearbook_state.get("last_resolved_week") == wid:
             return
-        # Mid-week enable: skip this Monday's payout and keep stats for a full week
+        # Mid-week enable: skip *this* Monday only; hold stats until the next payout
         if yearbook_state.get("carry_next_monday"):
             yearbook_state["carry_next_monday"] = False
+            yearbook_state["hold_stats_until_payout"] = True
             yearbook_state["last_resolved_week"] = wid
             await save_duck_state()
             print(f"[yearbook] carried mid-week progress into {wid}; first payout next Monday")
+            return
+        try:
+            await self.resolve_yearbook_week(wid)
+        except Exception as e:
+            print(f"[yearbook] resolve failed for {wid}: {e}")
+
+    async def resolve_yearbook_week(self, wid: str | None = None, *, force: bool = False):
+        """Pay competitive + nomination seats, update board, reset cycle counters."""
+        wid = wid or yearbook_week_id()
+        if not force and yearbook_state.get("last_resolved_week") == wid:
             return
         # Close was 1h earlier — we resolve Monday 00:05
         winners = []
@@ -6437,24 +6615,39 @@ class DuckCog(commands.Cog):
                     best_n, best_uid = n, uid
             if best_uid and best_n > 0:
                 winners.append({"kind": "comp", "title": title, "line": desc, "user_id": best_uid, "score": best_n})
-        # Nominations
+        # Nominations — min votes required; exact first-place ties all win
         for t in (yearbook_state.get("nominate_titles") or []):
             title = t["title"]
             seat = (yearbook_state.get("votes") or {}).get(title) or {}
-            best_uid, best_n, best_at = None, 0, None
+            best_n = 0
             for nid, entry in seat.items():
                 if nid in (yearbook_state.get("disqualified") or []):
                     continue
                 c = int(entry.get("count") or 0)
-                fa = float(entry.get("first_at") or 0)
                 if c < YEARBOOK_NOMINATE_MIN_VOTES:
                     continue
-                if c > best_n or (c == best_n and (best_at is None or fa < best_at)):
-                    best_n, best_uid, best_at = c, nid, fa
-            if best_uid:
+                if c > best_n:
+                    best_n = c
+            if best_n < YEARBOOK_NOMINATE_MIN_VOTES:
+                continue
+            tied = []
+            for nid, entry in seat.items():
+                if nid in (yearbook_state.get("disqualified") or []):
+                    continue
+                if int(entry.get("count") or 0) == best_n:
+                    tied.append(nid)
+            # Stable order by first_at so embeds/DMs are deterministic
+            tied.sort(
+                key=lambda nid: float((seat.get(nid) or {}).get("first_at") or 0)
+            )
+            for nid in tied:
                 winners.append({
-                    "kind": "nom", "title": title, "line": t.get("line") or "",
-                    "user_id": best_uid, "score": best_n,
+                    "kind": "nom",
+                    "title": title,
+                    "line": t.get("line") or "",
+                    "user_id": nid,
+                    "score": best_n,
+                    "tie_count": len(tied),
                 })
 
         eggs_amt = int(yearbook_state.get("winner_eggs") or 500)
@@ -6463,10 +6656,15 @@ class DuckCog(commands.Cog):
 
         for w in winners:
             uid = w["user_id"]
-            add_eggs(uid, eggs_amt, kind="fresh")  # does not count as earned
+            # Nomination ties split the seat purse (floor). Competitive stays full amount.
+            share = eggs_amt
+            if w.get("kind") == "nom" and int(w.get("tie_count") or 1) > 1:
+                share = eggs_amt // int(w["tie_count"])
+            w["eggs_awarded"] = share
+            add_eggs(uid, share, kind="fresh")  # does not count as earned
             rec = get_user_record(uid)
             # Same as nest wins — cannot be donated back into the nest
-            rec["nest_locked"] = int(rec.get("nest_locked") or 0) + eggs_amt
+            rec["nest_locked"] = int(rec.get("nest_locked") or 0) + share
             if duck_id and duck_id not in rec.get("collection", []):
                 rec.setdefault("collection", []).append(duck_id)
                 w["duck_given"] = True
@@ -6475,14 +6673,12 @@ class DuckCog(commands.Cog):
 
         yearbook_state["last_winners"] = winners
         yearbook_state["last_resolved_week"] = wid
-        # Roll next week clean
-        yearbook_state["votes"] = {}
-        yearbook_state["ballots"] = {}
-        yearbook_state["stats"] = {}
-        yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+        yearbook_state["hold_stats_until_payout"] = False
+        yearbook_state["carry_next_monday"] = False
         await save_duck_state()
+        print(f"[yearbook] resolved {wid}: {len(winners)} winner slot(s)")
 
-        # Roles + DMs + channel edit
+        # Roles + DMs (board uses current nomination titles — publish BEFORE rolling new ones)
         for guild in self.bot.guilds:
             role = guild.get_role(int(role_id)) if role_id else None
             for w in winners:
@@ -6500,50 +6696,32 @@ class DuckCog(commands.Cog):
                             duck_line = f"\n{d['emoji']} **{d['title']}** added to your collection!"
                         elif duck_id:
                             duck_line = "\n-# Winner duck already owned (no duplicate)."
+                        share = int(w.get("eggs_awarded") or eggs_amt)
+                        tie_n = int(w.get("tie_count") or 1)
+                        tie_note = (
+                            f"\n-# Tied with {tie_n - 1} other(s) — eggs split."
+                            if w.get("kind") == "nom" and tie_n > 1
+                            else ""
+                        )
                         await member.send(
                             f"📖 You won **{w['title']}** in the Pond Yearbook!\n"
-                            f"**+{eggs_amt}** eggs.{duck_line}"
+                            f"**+{share}** eggs.{tie_note}{duck_line}"
                         )
                     except Exception:
                         pass
 
-            ch_id = yearbook_state.get("channel_id")
-            msg_id = yearbook_state.get("message_id")
-            if not ch_id or not msg_id:
-                continue
-            channel = guild.get_channel(int(ch_id))
-            if channel is None:
-                continue
-            embeds = []
-            colors = yearbook_color_sequence(len(winners) or 1)
-            for i, w in enumerate(winners):
-                member = guild.get_member(int(w["user_id"]))
-                av = member.display_avatar.url if member else None
-                embeds.append(build_yearbook_seat_embed(
-                    w["title"],
-                    w.get("line") or "",
-                    user_id=w["user_id"],
-                    color=colors[i],
-                    avatar_url=av,
-                ))
-            if not embeds:
-                embeds = [build_yearbook_seat_embed(
-                    "Pond Yearbook",
-                    "Awaiting next week",
-                    color=YEARBOOK_EMBED_COLORS[0],
-                )]
-            try:
-                msg = await channel.fetch_message(int(msg_id))
-                await msg.edit(content=None, embeds=embeds[:10])
-            except Exception as e:
-                print(f"[yearbook] results edit failed: {e}")
-                try:
-                    await channel.send(YEARBOOK_BANNER_URL)
-                    sent = await channel.send(embeds=embeds[:10])
-                    yearbook_state["message_id"] = sent.id
-                    await save_duck_state()
-                except Exception as e2:
-                    print(f"[yearbook] results repost failed: {e2}")
+        try:
+            status = await publish_yearbook_board(self.bot, winners)
+            print(f"[yearbook] board: {status}")
+        except Exception as e:
+            print(f"[yearbook] board publish failed: {e}")
+
+        # Roll next week clean AFTER board shows this cycle's winners
+        yearbook_state["votes"] = {}
+        yearbook_state["ballots"] = {}
+        yearbook_state["stats"] = {}
+        yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+        await save_duck_state()
 
     @yearbook_week_loop.before_loop
     async def before_yearbook_week_loop(self):
@@ -7575,6 +7753,122 @@ class YearbookAdminView(discord.ui.View):
     async def dq(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(YearbookDQModal(self))
 
+    @discord.ui.button(label="Force resolve now", style=discord.ButtonStyle.danger, emoji="📖", row=1)
+    async def force_resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Pay out current stats/votes immediately (recovery / manual close)."""
+        if not yearbook_state.get("enabled"):
+            return await interaction.response.send_message(
+                "Yearbook is OFF — turn it on first.", ephemeral=True
+            )
+        stats_n = len(yearbook_state.get("stats") or {})
+        votes_n = sum(len(v) for v in (yearbook_state.get("votes") or {}).values())
+        await interaction.response.defer(ephemeral=True)
+        cog = interaction.client.get_cog("DuckCog")
+        if cog is None:
+            return await interaction.followup.send("Duck cog not loaded.", ephemeral=True)
+        try:
+            await cog.resolve_yearbook_week(force=True)
+        except Exception as e:
+            return await interaction.followup.send(f"Resolve failed: `{e}`", ephemeral=True)
+        winners = yearbook_state.get("last_winners") or []
+        await interaction.followup.send(
+            f"📖 Forced resolve complete.\n"
+            f"-# Had **{stats_n}** scored member(s), **{votes_n}** nomination entr(y/ies).\n"
+            f"-# **{len(winners)}** seat result(s) written. Board updated if channel is set.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Refresh board", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
+    async def refresh_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            status = await publish_yearbook_board(interaction.client)
+        except Exception as e:
+            return await interaction.followup.send(f"Board refresh failed: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"🔄 {status}", ephemeral=True)
+
+    @discord.ui.button(label="Manual winner", style=discord.ButtonStyle.primary, emoji="✋", row=1)
+    async def manual_winner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Pick a **seat**, then a **member**. They get eggs + duck + role, and the board refreshes.",
+            view=YearbookManualWinnerView(interaction.guild),
+            ephemeral=True,
+        )
+
+
+class YearbookManualWinnerView(discord.ui.View):
+    """Staff: assign a yearbook seat to a member (missed week recovery)."""
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.seat_title: str | None = None
+        self.seat_line: str = ""
+        self.seat_kind: str = "manual"
+        seats = yearbook_all_seats()
+        options = []
+        for s in seats:
+            label = s["title"][:100]
+            desc = (s.get("line") or s.get("kind") or "")[:100]
+            options.append(discord.SelectOption(label=label, value=s["title"], description=desc or None))
+        seat_sel = discord.ui.Select(
+            placeholder="Yearbook seat",
+            options=options[:25],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        seat_sel.callback = self.on_seat
+        self.add_item(seat_sel)
+        user_sel = discord.ui.UserSelect(
+            placeholder="Winner",
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+        user_sel.callback = self.on_user
+        self.add_item(user_sel)
+
+    async def on_seat(self, interaction: discord.Interaction):
+        title = interaction.data["values"][0]
+        self.seat_title = title
+        for s in yearbook_all_seats():
+            if s["title"] == title:
+                self.seat_line = s.get("line") or ""
+                self.seat_kind = s.get("kind") or "manual"
+                break
+        await interaction.response.defer()
+
+    async def on_user(self, interaction: discord.Interaction):
+        if not self.seat_title:
+            return await interaction.response.send_message(
+                "Pick a **seat** first, then the member.", ephemeral=True
+            )
+        uid = interaction.data["values"][0]
+        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
+        if member is None or member.bot:
+            return await interaction.response.send_message(
+                "Pick a real (non-bot) member.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            w = await grant_yearbook_manual_winner(
+                interaction.client,
+                user_id=str(member.id),
+                title=self.seat_title,
+                line=self.seat_line,
+                kind=self.seat_kind,
+            )
+            status = await publish_yearbook_board(interaction.client)
+        except Exception as e:
+            return await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
+        eggs = int(w.get("eggs_awarded") or 500)
+        await interaction.followup.send(
+            f"✅ **{self.seat_title}** → {member.mention} (**+{eggs}** eggs, nest-locked).\n"
+            f"-# {status}",
+            ephemeral=True,
+        )
+
 
 class YearbookChannelPickView(discord.ui.View):
     def __init__(self, parent: YearbookAdminView):
@@ -7592,28 +7886,15 @@ class YearbookChannelPickView(discord.ui.View):
     async def picked(self, interaction: discord.Interaction):
         ch_id = int(interaction.data["values"][0])
         yearbook_state["channel_id"] = ch_id
-        channel = interaction.guild.get_channel(ch_id)
-        # Post placeholder banner + awaiting message
-        try:
-            await channel.send(YEARBOOK_BANNER_URL)
-            seats = [
-                (title, desc) for _, title, desc in YEARBOOK_COMPETITIVE
-            ] + [
-                (t["title"], t.get("line") or "")
-                for t in (yearbook_state.get("nominate_titles") or [])[:4]
-            ]
-            colors = yearbook_color_sequence(len(seats) or 1)
-            embeds = [
-                build_yearbook_seat_embed(title, line, color=colors[i])
-                for i, (title, line) in enumerate(seats)
-            ]
-            msg = await channel.send(embeds=embeds[:10])
-            yearbook_state["message_id"] = msg.id
-        except Exception as e:
-            print(f"[yearbook] channel setup post failed: {e}")
+        yearbook_state["message_id"] = None  # force fresh post
         await save_duck_state()
+        try:
+            status = await publish_yearbook_board(interaction.client, yearbook_state.get("last_winners") or [])
+        except Exception as e:
+            status = f"post failed: {e}"
+            print(f"[yearbook] channel setup post failed: {e}")
         await interaction.response.edit_message(
-            content=f"Yearbook channel set to <#{ch_id}> (placeholder posted).",
+            content=f"Yearbook channel set to <#{ch_id}>. {status}",
             view=None,
         )
 
