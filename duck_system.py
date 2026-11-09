@@ -588,6 +588,7 @@ yearbook_state: dict = {
     "enabled": False,
     "channel_id": None,
     "message_id": None,
+    "log_channel_id": None,  # plain text winner log for staff recovery
     "role_id": None,
     "winner_duck_id": None,
     "winner_eggs": 500,
@@ -680,6 +681,62 @@ def yearbook_winners_by_title(winners: list | None = None) -> dict:
             continue
         by.setdefault(title, []).append(w)
     return by
+
+
+def build_yearbook_log_embed(winners: list | None = None, *, note: str = "") -> discord.Embed:
+    """Single plain embed listing every winner — for staff log / recovery."""
+    winners = winners if winners is not None else (yearbook_state.get("last_winners") or [])
+    wid = yearbook_state.get("week_id") or yearbook_week_id()
+    lines = [
+        f"**Yearbook log** · `{wid}`",
+        f"-# {note}" if note else "-# Copy this if you need to re-grant rewards",
+        "",
+    ]
+    if not winners:
+        lines.append("_No winners recorded._")
+    else:
+        for i, w in enumerate(winners, 1):
+            uid = w.get("user_id")
+            title = w.get("title") or "Seat"
+            eggs = int(w.get("eggs_awarded") or yearbook_state.get("winner_eggs") or 500)
+            kind = w.get("kind") or "?"
+            manual = " · manual" if w.get("manual") else ""
+            mention = f"<@{uid}>" if uid else "—"
+            lines.append(
+                f"**{i}.** {title} → {mention} · `{uid}` · **{eggs}** eggs · {kind}{manual}"
+            )
+    emb = discord.Embed(
+        description="\n".join(lines)[:4000],
+        color=discord.Color.dark_grey(),
+    )
+    emb.set_footer(text=f"{len(winners)} entry(ies)")
+    return emb
+
+
+async def post_yearbook_log(
+    bot: commands.Bot,
+    winners: list | None = None,
+    *,
+    note: str = "",
+) -> str:
+    """Post the plain winners log to the configured log channel."""
+    ch_id = yearbook_state.get("log_channel_id")
+    if not ch_id:
+        return "No log channel set."
+    emb = build_yearbook_log_embed(winners, note=note)
+    for guild in bot.guilds:
+        channel = guild.get_channel(int(ch_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(ch_id))
+            except Exception:
+                continue
+        try:
+            await channel.send(embed=emb)
+            return f"log posted in #{getattr(channel, 'name', ch_id)}"
+        except Exception as e:
+            return f"log post failed: {e}"
+    return "Log channel not found."
 
 
 async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None) -> str:
@@ -6715,6 +6772,13 @@ class DuckCog(commands.Cog):
             print(f"[yearbook] board: {status}")
         except Exception as e:
             print(f"[yearbook] board publish failed: {e}")
+        try:
+            log_status = await post_yearbook_log(
+                self.bot, winners, note="Automatic weekly resolve"
+            )
+            print(f"[yearbook] log: {log_status}")
+        except Exception as e:
+            print(f"[yearbook] log post failed: {e}")
 
         # Roll next week clean AFTER board shows this cycle's winners
         yearbook_state["votes"] = {}
@@ -7689,6 +7753,7 @@ class YearbookAdminView(discord.ui.View):
             f"# 📖 Yearbook config",
             f"**Enabled:** {'Yes' if yb.get('enabled') else 'No (commands hidden from members when off)'}",
             f"**Channel:** {('<#' + str(yb['channel_id']) + '>') if yb.get('channel_id') else '— not set —'}",
+            f"**Log channel:** {('<#' + str(yb['log_channel_id']) + '>') if yb.get('log_channel_id') else '— not set —'}",
             f"**Role:** {('<@&' + str(yb['role_id']) + '>') if yb.get('role_id') else '— not set —'}",
             f"**Winner duck:** {duck_s}",
             f"**Eggs per seat:** **{int(yb.get('winner_eggs') or 500)}**",
@@ -7795,6 +7860,41 @@ class YearbookAdminView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(label="Set log channel", style=discord.ButtonStyle.secondary, emoji="📋", row=2)
+    async def set_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        sel = discord.ui.ChannelSelect(
+            placeholder="Yearbook staff log channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+
+        async def picked(inter: discord.Interaction):
+            yearbook_state["log_channel_id"] = int(inter.data["values"][0])
+            await save_duck_state()
+            await inter.response.edit_message(
+                content=f"Log channel set to <#{yearbook_state['log_channel_id']}>.",
+                view=None,
+            )
+
+        sel.callback = picked
+        view.add_item(sel)
+        await interaction.response.send_message(
+            "Pick a channel for the plain winners log (recovery copy):",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Post log now", style=discord.ButtonStyle.secondary, emoji="📝", row=2)
+    async def post_log_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        status = await post_yearbook_log(
+            interaction.client,
+            note="Manual log dump from /ybe",
+        )
+        await interaction.followup.send(f"📋 {status}", ephemeral=True)
+
 
 class YearbookManualWinnerView(discord.ui.View):
     """Staff: assign a yearbook seat to a member (missed week recovery)."""
@@ -7860,12 +7960,16 @@ class YearbookManualWinnerView(discord.ui.View):
                 kind=self.seat_kind,
             )
             status = await publish_yearbook_board(interaction.client)
+            log_status = await post_yearbook_log(
+                interaction.client,
+                note=f"Manual: {self.seat_title}",
+            )
         except Exception as e:
             return await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
         eggs = int(w.get("eggs_awarded") or 500)
         await interaction.followup.send(
             f"✅ **{self.seat_title}** → {member.mention} (**+{eggs}** eggs, nest-locked).\n"
-            f"-# {status}",
+            f"-# {status}\n-# {log_status}",
             ephemeral=True,
         )
 
