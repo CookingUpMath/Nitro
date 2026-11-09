@@ -58,7 +58,7 @@ RARITY_DISPLAY = {
 }
 
 DUPLICATE_BONUS_CHANCE = 0.15  # 15% extra egg on a duplicate hatch
-MAX_HATCH_PER_COMMAND = 300    # hard cap per /hatch (including "all")
+MAX_HATCH_PER_COMMAND = 250    # hard cap per /hatch (including "all")
 # --- Fresh / rotten / error eggs ---
 ROT_AFTER_SECONDS = 48 * 3600       # base life before a fresh egg is eligible to rot
 ROT_CHECK_INTERVAL = 12 * 3600      # at most one rot pass per user per 12h
@@ -1417,6 +1417,15 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("last_rot_check_at", None)
     rec.setdefault("activity_date", None)
     rec.setdefault("activity_msgs_today", 0)
+    rec.setdefault("gift_karma_count", 0)
+    rec.setdefault("gift_karma_cooldown_until", 0)
+    # One-time style cleanup: duplicate ids inflate /collection summary
+    col = rec.get("collection")
+    if isinstance(col, list) and len(col) != len(set(col)):
+        rec["collection"] = dedupe_owned_ids(col)
+    favs = rec.get("favorites")
+    if isinstance(favs, list) and len(favs) != len(set(favs)):
+        rec["favorites"] = dedupe_owned_ids(favs)
     _migrate_egg_inventory(rec)
     rec.setdefault("inventory_fresh", 0)
     rec.setdefault("inventory_rotten", 0)
@@ -2249,19 +2258,36 @@ def filter_owned_ids(owned: list, *, series_key_name: str | None = None, rarity:
     return ids
 
 
+def dedupe_owned_ids(owned: list) -> list:
+    """Preserve acquire order; drop duplicate duck ids."""
+    seen = set()
+    out = []
+    for d in owned or []:
+        if d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
 def build_collection_home_embed(owned: list, favorites: list, display_name: str, color: discord.Color) -> discord.Embed:
+    owned = dedupe_owned_ids(owned)
     fav_ids = [d for d in favorites if d in owned and d in duck_index][:MAX_FAVORITES]
     by_rarity = {r: 0 for r in RARITY_ORDER}
     errors = 0
+    valid = 0
     for duck_id in owned:
         duck = duck_index.get(duck_id)
         if not duck:
             continue
+        valid += 1
+        # Error ducks only count toward 💢 — not their display rarity (avoids double-count)
+        if duck.get("is_error"):
+            errors += 1
+            continue
         r = duck.get("rarity")
         if r in by_rarity:
             by_rarity[r] += 1
-        if duck.get("is_error"):
-            errors += 1
 
     parts = [f"**Favorite ({len(fav_ids)}/{MAX_FAVORITES})**"]
     if fav_ids:
@@ -2284,7 +2310,7 @@ def build_collection_home_embed(owned: list, favorites: list, display_name: str,
     parts.append(f"-# {row2}")
 
     embed = discord.Embed(description="\n".join(parts), color=color)
-    embed.set_footer(text=f"🎒 {display_name}'s Collection - {len(owned)}/{len(duck_index)} indexed")
+    embed.set_footer(text=f"🎒 {display_name}'s Collection - {valid}/{len(duck_index)} indexed")
     return embed
 
 
