@@ -2165,8 +2165,9 @@ def resolve_hatch(
     bonus_egg = False
     error_egg_gained = False
 
-    if is_duplicate and not skip_bonus:
-        if random.random() < DUPLICATE_BONUS_CHANCE:
+    # IMPORTANT: never append on duplicate — skip_bonus must not fall into an else-append
+    if is_duplicate:
+        if not skip_bonus and random.random() < DUPLICATE_BONUS_CHANCE:
             # Fresh (and error-egg hatches) → fresh bonus. Rotten → rotten bonus only.
             bonus_kind = "rotten" if rotten else "fresh"
             add_eggs(discord_id, 1, kind=bonus_kind)
@@ -7233,7 +7234,8 @@ class DuckCog(commands.Cog):
         fortune_line = f"🧧 The pond reads: **{fortune_name}**"
 
         if random.random() < success_rate:
-            target.setdefault("collection", []).append(duck_id)
+            if duck_id not in target.get("collection", []):
+                target.setdefault("collection", []).append(duck_id)
             award_karma(giver_id, 5)
             await save_duck_state()
             return await interaction.response.send_message(
