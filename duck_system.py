@@ -1259,6 +1259,9 @@ def default_user_record():
         "treats_received": 0,
         "reply_karma_date": None,
         "reply_karma_count": 0,
+        # Egg-gift karma farm cap: 10 counting gifts, then 48h cooldown
+        "gift_karma_count": 0,
+        "gift_karma_cooldown_until": 0,
     }
 
 
@@ -1442,6 +1445,36 @@ def record_qualifying_activity(discord_id: str) -> None:
         rec["activity_msgs_today"] = 0
     rec["activity_msgs_today"] = int(rec.get("activity_msgs_today") or 0) + 1
     yb_add_msg(discord_id)
+
+
+GIFT_KARMA_MAX_GIFTS = 10
+GIFT_KARMA_COOLDOWN_SECONDS = 48 * 3600
+
+
+def try_award_gift_karma(discord_id: str, points: int) -> bool:
+    """Award gift-related karma if under the 10-gift / 48h cap. Returns True if awarded."""
+    if points <= 0:
+        return False
+    rec = get_user_record(discord_id)
+    now = time.time()
+    until = float(rec.get("gift_karma_cooldown_until") or 0)
+    if until and now < until:
+        return False
+    # Cooldown finished — reset the window
+    if until and now >= until:
+        rec["gift_karma_count"] = 0
+        rec["gift_karma_cooldown_until"] = 0
+    count = int(rec.get("gift_karma_count") or 0)
+    if count >= GIFT_KARMA_MAX_GIFTS:
+        # Safety: force cooldown if somehow over without until
+        rec["gift_karma_cooldown_until"] = now + GIFT_KARMA_COOLDOWN_SECONDS
+        return False
+    award_karma(discord_id, points)
+    count += 1
+    rec["gift_karma_count"] = count
+    if count >= GIFT_KARMA_MAX_GIFTS:
+        rec["gift_karma_cooldown_until"] = now + GIFT_KARMA_COOLDOWN_SECONDS
+    return True
 
 
 def award_karma(discord_id: str, points: int = 1):
@@ -3829,7 +3862,7 @@ async def return_pending_gift(bot: commands.Bot, gift_id: str, reason: str = "de
     # Expired only — declined is abusable (friend declines on purpose)
     # Egg gifts under 10 don't grant karma
     if reason == "expired" and int(amount) >= 10:
-        award_karma(giver_id, 1)
+        try_award_gift_karma(giver_id, 1)
     await save_duck_state()
 
     try:
@@ -3901,9 +3934,9 @@ class GiftOfferView(discord.ui.View):
         received = amount - lost
         if received > 0:
             add_eggs(gift["target_id"], received, kind="fresh")
-        # Sender karma: successful gift of at least 10 eggs
+        # Sender karma: successful gift of at least 10 eggs (capped 10 gifts / 48h)
         if int(amount) >= 10:
-            award_karma(gift["giver_id"], 5)
+            try_award_gift_karma(gift["giver_id"], 5)
         await save_duck_state()
 
         flavor = format_gift_loss_flavor(lost)
