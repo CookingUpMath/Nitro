@@ -588,6 +588,8 @@ yearbook_state: dict = {
     "enabled": False,
     "channel_id": None,
     "message_id": None,
+    "banner_message_id": None,  # separate banner image message (not the seat embeds)
+    "banner_url": None,  # optional override of YEARBOOK_BANNER_URL
     "log_channel_id": None,  # plain text winner log for staff recovery
     "role_id": None,
     "winner_duck_id": None,
@@ -602,10 +604,11 @@ yearbook_state: dict = {
     "last_winners": [],
 }
 
-# Prefer a non-expiring link in /ybe if this CDN URL 404s (Discord signed ?ex= links expire).
+# Discord CDN ?ex= links expire — re-set via /ybe → Update banner when needed.
 YEARBOOK_BANNER_URL = (
     "https://cdn.discordapp.com/attachments/1055252004114546799/"
-    "1565237978677256332/POND-YEAR-BOOK-2026-10-27.png"
+    "1570321911303377007/Yearbookliquid.png"
+    "?ex=6af6abbe&is=6af55a3e&hm=61a86219937928abac7729797f7c97268f5829be1f25676926501bceeb172107&"
 )
 YEARBOOK_EMBED_COLORS = [0xF02AE0, 0x169EFC, 0xF4F4F4]
 
@@ -739,6 +742,83 @@ async def post_yearbook_log(
     return "Log channel not found."
 
 
+async def update_yearbook_banner(bot: commands.Bot) -> str:
+    """Update banner image in place when possible.
+
+    Never clears last_winners. Prefer editing the existing banner message so
+    order stays above the seat embeds. If the banner message is missing, post
+    a new banner only (staff can delete the old image message manually).
+    """
+    ch_id = yearbook_state.get("channel_id")
+    if not ch_id:
+        return "No yearbook channel set."
+    banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
+    if not banner:
+        return "No banner URL configured."
+    for guild in bot.guilds:
+        channel = guild.get_channel(int(ch_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(ch_id))
+            except Exception:
+                continue
+        banner_mid = yearbook_state.get("banner_message_id")
+        if banner_mid:
+            try:
+                msg = await channel.fetch_message(int(banner_mid))
+                await msg.edit(content=banner)
+                return f"banner edited in place in #{getattr(channel, 'name', ch_id)} (winners untouched)"
+            except Exception as e:
+                print(f"[yearbook] banner edit failed: {e}")
+        try:
+            sent = await channel.send(banner)
+            yearbook_state["banner_message_id"] = sent.id
+            await save_duck_state()
+            return (
+                f"banner posted as a new message in #{getattr(channel, 'name', ch_id)}. "
+                f"Delete the old image message if it is still above the embeds — "
+                f"winner names are stored in the bot and were not cleared."
+            )
+        except Exception as e:
+            return f"banner post failed: {e}"
+    return "Yearbook channel not found."
+
+
+async def repost_yearbook_stack(bot: commands.Bot) -> str:
+    """Delete tracked banner+board messages and repost banner then embeds.
+
+    Uses last_winners — names are preserved. Safe for banner art swaps when
+    edit-in-place is not possible.
+    """
+    ch_id = yearbook_state.get("channel_id")
+    if not ch_id:
+        return "No yearbook channel set."
+    winners = yearbook_state.get("last_winners") or []
+    for guild in bot.guilds:
+        channel = guild.get_channel(int(ch_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(ch_id))
+            except Exception:
+                continue
+        for key in ("banner_message_id", "message_id"):
+            mid = yearbook_state.get(key)
+            if not mid:
+                continue
+            try:
+                msg = await channel.fetch_message(int(mid))
+                await msg.delete()
+            except Exception:
+                pass
+            yearbook_state[key] = None
+        # Force publish path to post banner + embeds fresh, in order
+        yearbook_state["message_id"] = None
+        await save_duck_state()
+        status = await publish_yearbook_board(bot, winners)
+        return f"stack reposted (names kept from last_winners). {status}"
+    return "Yearbook channel not found."
+
+
 async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None) -> str:
     """Rebuild the yearbook channel message (all seats). Returns status text."""
     ch_id = yearbook_state.get("channel_id")
@@ -793,7 +873,8 @@ async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None)
                 banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
                 if banner:
                     try:
-                        await channel.send(banner)
+                        bmsg = await channel.send(banner)
+                        yearbook_state["banner_message_id"] = bmsg.id
                     except Exception:
                         pass
                 sent = await channel.send(embeds=embeds)
@@ -7906,12 +7987,33 @@ class YearbookAdminView(discord.ui.View):
 
     @discord.ui.button(label="Refresh board", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
     async def refresh_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Rebuild seat embeds only — keeps last_winners names."""
         await interaction.response.defer(ephemeral=True)
         try:
             status = await publish_yearbook_board(interaction.client)
         except Exception as e:
             return await interaction.followup.send(f"Board refresh failed: `{e}`", ephemeral=True)
         await interaction.followup.send(f"🔄 {status}", ephemeral=True)
+
+    @discord.ui.button(label="Update banner", style=discord.ButtonStyle.secondary, emoji="🖼️", row=1)
+    async def update_banner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Swap the header image only — does not clear winner names."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            status = await update_yearbook_banner(interaction.client)
+        except Exception as e:
+            return await interaction.followup.send(f"Banner update failed: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"🖼️ {status}", ephemeral=True)
+
+    @discord.ui.button(label="Repost stack", style=discord.ButtonStyle.secondary, emoji="📌", row=1)
+    async def repost_stack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Banner + embeds, correct order. Keeps last_winners names."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            status = await repost_yearbook_stack(interaction.client)
+        except Exception as e:
+            return await interaction.followup.send(f"Repost failed: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"📌 {status}", ephemeral=True)
 
     @discord.ui.button(label="Manual winner", style=discord.ButtonStyle.primary, emoji="✋", row=1)
     async def manual_winner(self, interaction: discord.Interaction, button: discord.ui.Button):
