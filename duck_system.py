@@ -750,10 +750,9 @@ def build_yearbook_banner_embed(banner_url: str) -> discord.Embed:
 
 
 async def update_yearbook_banner(bot: commands.Bot) -> str:
-    """Update banner via embed set_image (large display, no CDN download).
+    """Post banner as a plain image link (Discord unfurl — no embed frame).
 
-    Never clears last_winners. Discord clients load the image URL directly —
-    the bot does not fetch the file (avoids Cloudflare / expired CDN issues).
+    Never downloads the file (that hit Cloudflare). Never clears last_winners.
     """
     ch_id = yearbook_state.get("channel_id")
     if not ch_id:
@@ -761,7 +760,6 @@ async def update_yearbook_banner(bot: commands.Bot) -> str:
     banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
     if not banner:
         return "No banner URL configured."
-    # Strip query string noise is optional; keep full URL so signed links work while valid
     for guild in bot.guilds:
         channel = guild.get_channel(int(ch_id))
         if channel is None:
@@ -770,12 +768,11 @@ async def update_yearbook_banner(bot: commands.Bot) -> str:
             except Exception:
                 continue
 
-        emb = build_yearbook_banner_embed(banner)
         banner_mid = yearbook_state.get("banner_message_id")
         if banner_mid:
             try:
                 msg = await channel.fetch_message(int(banner_mid))
-                await msg.edit(content=None, embed=emb, attachments=[])
+                await msg.edit(content=banner, embed=None, embeds=[])
                 return f"banner updated in place in #{getattr(channel, 'name', ch_id)} (winners untouched)"
             except Exception as e:
                 print(f"[yearbook] banner edit failed: {e}")
@@ -786,11 +783,11 @@ async def update_yearbook_banner(bot: commands.Bot) -> str:
                 yearbook_state["banner_message_id"] = None
 
         try:
-            sent = await channel.send(embed=emb)
+            sent = await channel.send(banner)
             yearbook_state["banner_message_id"] = sent.id
             await save_duck_state()
             return (
-                f"banner posted in #{getattr(channel, 'name', ch_id)}. "
+                f"banner link posted in #{getattr(channel, 'name', ch_id)}. "
                 f"Winners were not cleared — use Repost stack if order needs fixing."
             )
         except Exception as e:
@@ -887,7 +884,7 @@ async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None)
                 banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
                 if banner:
                     try:
-                        bmsg = await channel.send(embed=build_yearbook_banner_embed(banner))
+                        bmsg = await channel.send(banner)
                         yearbook_state["banner_message_id"] = bmsg.id
                     except Exception as e:
                         print(f"[yearbook] banner send: {e}")
