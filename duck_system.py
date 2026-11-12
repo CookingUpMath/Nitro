@@ -8005,7 +8005,7 @@ class YearbookAdminView(discord.ui.View):
             return await interaction.followup.send(f"Banner update failed: `{e}`", ephemeral=True)
         await interaction.followup.send(f"🖼️ {status}", ephemeral=True)
 
-    @discord.ui.button(label="Repost stack", style=discord.ButtonStyle.secondary, emoji="📌", row=1)
+    @discord.ui.button(label="Repost stack", style=discord.ButtonStyle.secondary, emoji="📌", row=2)
     async def repost_stack(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Banner + embeds, correct order. Keeps last_winners names."""
         await interaction.response.defer(ephemeral=True)
@@ -8015,7 +8015,7 @@ class YearbookAdminView(discord.ui.View):
             return await interaction.followup.send(f"Repost failed: `{e}`", ephemeral=True)
         await interaction.followup.send(f"📌 {status}", ephemeral=True)
 
-    @discord.ui.button(label="Manual winner", style=discord.ButtonStyle.primary, emoji="✋", row=1)
+    @discord.ui.button(label="Manual winner", style=discord.ButtonStyle.primary, emoji="✋", row=2)
     async def manual_winner(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             "Pick a **seat**, then a **member**. They get eggs + duck + role, and the board refreshes.",
@@ -8023,7 +8023,7 @@ class YearbookAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Set log channel", style=discord.ButtonStyle.secondary, emoji="📋", row=2)
+    @discord.ui.button(label="Set log channel", style=discord.ButtonStyle.secondary, emoji="📋", row=3)
     async def set_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=120)
         sel = discord.ui.ChannelSelect(
@@ -8049,7 +8049,7 @@ class YearbookAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Post log now", style=discord.ButtonStyle.secondary, emoji="📝", row=2)
+    @discord.ui.button(label="Post log now", style=discord.ButtonStyle.secondary, emoji="📝", row=3)
     async def post_log_now(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         status = await post_yearbook_log(
