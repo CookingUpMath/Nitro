@@ -742,12 +742,39 @@ async def post_yearbook_log(
     return "Log channel not found."
 
 
-async def update_yearbook_banner(bot: commands.Bot) -> str:
-    """Update banner image in place when possible.
+def build_yearbook_banner_embed(banner_url: str) -> discord.Embed:
+    """Full-width banner image (much larger than a bare link unfurl)."""
+    emb = discord.Embed(color=YEARBOOK_EMBED_COLORS[0])
+    emb.set_image(url=banner_url)
+    return emb
 
-    Never clears last_winners. Prefer editing the existing banner message so
-    order stays above the seat embeds. If the banner message is missing, post
-    a new banner only (staff can delete the old image message manually).
+
+async def _fetch_banner_file(banner_url: str) -> discord.File | None:
+    """Download banner and re-upload as an attachment (largest Discord display)."""
+    try:
+        import aiohttp
+        import io
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(banner_url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+        name = "yearbook_banner.png"
+        if ".jpg" in banner_url.lower() or ".jpeg" in banner_url.lower():
+            name = "yearbook_banner.jpg"
+        elif ".webp" in banner_url.lower():
+            name = "yearbook_banner.webp"
+        return discord.File(io.BytesIO(data), filename=name)
+    except Exception as e:
+        print(f"[yearbook] banner download failed: {e}")
+        return None
+
+
+async def update_yearbook_banner(bot: commands.Bot) -> str:
+    """Update banner in place. Prefer attachment (large); fall back to embed image.
+
+    Never clears last_winners.
     """
     ch_id = yearbook_state.get("channel_id")
     if not ch_id:
@@ -762,22 +789,30 @@ async def update_yearbook_banner(bot: commands.Bot) -> str:
                 channel = await bot.fetch_channel(int(ch_id))
             except Exception:
                 continue
+
+        file = await _fetch_banner_file(banner)
         banner_mid = yearbook_state.get("banner_message_id")
+
+        # Edit in place: attachments can't be swapped via edit easily — delete+repost same slot flow
         if banner_mid:
             try:
                 msg = await channel.fetch_message(int(banner_mid))
-                await msg.edit(content=banner)
-                return f"banner edited in place in #{getattr(channel, 'name', ch_id)} (winners untouched)"
+                await msg.delete()
             except Exception as e:
-                print(f"[yearbook] banner edit failed: {e}")
+                print(f"[yearbook] old banner delete: {e}")
+            yearbook_state["banner_message_id"] = None
+
         try:
-            sent = await channel.send(banner)
+            if file is not None:
+                sent = await channel.send(file=file)
+            else:
+                sent = await channel.send(embed=build_yearbook_banner_embed(banner))
             yearbook_state["banner_message_id"] = sent.id
             await save_duck_state()
+            how = "attachment (full size)" if file is not None else "embed image"
             return (
-                f"banner posted as a new message in #{getattr(channel, 'name', ch_id)}. "
-                f"Delete the old image message if it is still above the embeds — "
-                f"winner names are stored in the bot and were not cleared."
+                f"banner posted as {how} in #{getattr(channel, 'name', ch_id)}. "
+                f"Winners were not cleared — use Repost stack if order needs fixing."
             )
         except Exception as e:
             return f"banner post failed: {e}"
@@ -873,10 +908,14 @@ async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None)
                 banner = yearbook_state.get("banner_url") or YEARBOOK_BANNER_URL
                 if banner:
                     try:
-                        bmsg = await channel.send(banner)
+                        bfile = await _fetch_banner_file(banner)
+                        if bfile is not None:
+                            bmsg = await channel.send(file=bfile)
+                        else:
+                            bmsg = await channel.send(embed=build_yearbook_banner_embed(banner))
                         yearbook_state["banner_message_id"] = bmsg.id
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[yearbook] banner send: {e}")
                 sent = await channel.send(embeds=embeds)
                 yearbook_state["message_id"] = sent.id
                 await save_duck_state()
