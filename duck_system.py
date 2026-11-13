@@ -2722,6 +2722,7 @@ class EggDropView(discord.ui.View):
                     interaction,
                     content="The pool is empty right now — nothing to hatch. Sorry, egg's gone!",
                 )
+            grant_rewind_from_hatch(discord_id, 1)
             await save_duck_state()
             self.stop()
             if result["duplicate"]:
@@ -2754,6 +2755,8 @@ class EggDropView(discord.ui.View):
             results.append(r)
             if r.get("error_egg_gained"):
                 error_eggs_got += 1
+        if results:
+            grant_rewind_from_hatch(discord_id, len(results))
         await save_duck_state()
         self.stop()
         if not results:
@@ -6341,14 +6344,7 @@ class DuckCog(commands.Cog):
             target_id = str(view.owner_id)
             add_eggs(target_id, eggs, kind="fresh")
             yb_add_earned(target_id, eggs)
-            # 25% token refund only when boosting someone else's ground drop
-            refunded = False
-            if target_id != uid and random.random() < 0.25:
-                rec = get_user_record(uid)
-                tokens = int(rec.get("rewind_tokens") or 0)
-                if tokens < REWIND_TOKEN_CAP:
-                    rec["rewind_tokens"] = tokens + 1
-                    refunded = True
+            # Tokens only from hatching — no refunds from ⏪ usage
             await save_duck_state()
             channel = self.bot.get_channel(payload.channel_id)
             if channel:
@@ -6357,10 +6353,9 @@ class DuckCog(commands.Cog):
                         who = "their own"
                     else:
                         who = f"<@{view.owner_id}>'s"
-                    extra = " · ⏪ token refunded!" if refunded else ""
                     await channel.send(
                         f"⏪ {member.mention} rewound {who} drop — "
-                        f"**+{eggs}** eggs to <@{view.owner_id}>!{extra}",
+                        f"**+{eggs}** eggs to <@{view.owner_id}>!",
                         delete_after=20,
                     )
                 except Exception:
