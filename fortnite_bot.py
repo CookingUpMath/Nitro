@@ -690,25 +690,60 @@ async def fortboard(interaction: discord.Interaction):
 ###############################################
 #            /resetuser COMMAND              #
 ###############################################
+# Accepts either a still-present Member OR a raw Discord user ID so staff can
+# clean up links for people who already left the server (Member picker can't
+# resolve departed users).
 
 @bot.tree.command(
     name="resetuser",
-    description="Staff: Reset a user's linked Fortnite account."
+    description="Staff: Reset a user's linked Fortnite account (works for leavers via user ID)."
 )
-@app_commands.describe(member="The member to reset")
+@app_commands.describe(
+    member="Server member to reset (if they're still in the server)",
+    user_id="Discord user ID — use this when the person already left",
+)
 @app_commands.checks.has_permissions(manage_guild=True)
-async def resetuser(interaction: discord.Interaction, member: discord.Member):
+async def resetuser(
+    interaction: discord.Interaction,
+    member: discord.Member = None,
+    user_id: str = None,
+):
 
-    discord_id = str(member.id)
+    if member is None and not user_id:
+        return await interaction.response.send_message(
+            "Provide either a **member** (still in the server) or their **user_id** "
+            "(18-digit Discord ID) if they already left.",
+            ephemeral=True,
+        )
+
+    if member is not None:
+        discord_id = str(member.id)
+        label = member.display_name
+    else:
+        cleaned = user_id.strip().replace("<@", "").replace("!", "").replace(">", "")
+        if not cleaned.isdigit():
+            return await interaction.response.send_message(
+                "That doesn't look like a Discord user ID. Right-click the user "
+                "(or an old message of theirs) → Copy User ID, then paste it here. "
+                "Developer Mode must be on in Discord settings.",
+                ephemeral=True,
+            )
+        discord_id = cleaned
+        label = f"user `{discord_id}`"
+        # Prefer the Epic name we stored, if any, for a friendlier confirm message.
+        stored = user_db.get(discord_id) or {}
+        if stored.get("display_name"):
+            label = f"{stored['display_name']} (`{discord_id}`)"
 
     if discord_id not in user_db or not user_db[discord_id].get("account_id"):
         return await interaction.response.send_message(
-            f"{member.display_name} does not have a Fortnite account linked.",
-            ephemeral=True
+            f"{label} does not have a Fortnite account linked in the database.",
+            ephemeral=True,
         )
 
+    # Strip linked role if they're still in this guild.
     role_id = guild_config.get(str(interaction.guild.id), {}).get("linked_role_id")
-    if role_id:
+    if role_id and member is not None:
         role = interaction.guild.get_role(role_id)
         if role and role in member.roles:
             try:
@@ -716,25 +751,19 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
             except Exception:
                 pass
 
-    user_db[discord_id] = {
-        "guild_id": None,
-        "display_name": None,
-        "account_id": None,
-        "locked": False,
-        "last_wins": None,
-        "last_kills": None,
-        "last_mode_wins": None,
-        "last_win_ts": None,
-        "weekly_baseline_wins": None,
-        "weekly_baseline_kills": None,
-        "skin_name": None,
-        "skin_icon_url": None,
-    }
+    # Drop from any weekly champion holder lists.
+    for gid, config in list(guild_config.items()):
+        holders = config.get("fortboard_role_holders") or []
+        if discord_id in holders:
+            config["fortboard_role_holders"] = [h for h in holders if h != discord_id]
+
+    # Fully remove the record (same outcome as leaving the server).
+    del user_db[discord_id]
     await save_db()
 
     await interaction.response.send_message(
-        f"{member.display_name}'s Fortnite account link has been reset.",
-        ephemeral=True
+        f"{label}'s Fortnite account link has been fully removed from the database.",
+        ephemeral=True,
     )
 
 
