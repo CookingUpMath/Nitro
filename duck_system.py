@@ -1196,11 +1196,14 @@ def pick_yearbook_titles(n: int = 4) -> list:
 
 
 def ensure_yearbook_week() -> None:
-    """Roll titles / reset counters when the ISO week changes (if enabled).
+    """Keep week_id in sync when the ISO week changes (if enabled).
 
-    Mid-week enable sets carry_next_monday: the first Monday is skipped for
-    *payout*, and hold_stats_until_payout keeps votes/stats across that boundary
-    so the *second* Monday can still pay the accumulated cycle.
+    IMPORTANT: never clear stats/votes/ballots here. Monday 00:05 calls this
+    *before* resolve; wiping first is what caused empty winner boards.
+    Only resolve_yearbook_week() clears counters *after* a successful payout.
+
+    Mid-week enable still uses carry_next_monday / hold_stats_until_payout in
+    the week loop so the first Monday can skip pay without destroying data.
     """
     if not yearbook_state.get("enabled"):
         return
@@ -1209,16 +1212,10 @@ def ensure_yearbook_week() -> None:
         if not yearbook_state.get("nominate_titles"):
             yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
         return
+    # Week boundary — update id only. Keep stats/votes/titles for resolve.
     yearbook_state["week_id"] = wid
-    if yearbook_state.get("carry_next_monday") or yearbook_state.get("hold_stats_until_payout"):
-        # Keep accumulated stats / nominations across the boundary
-        if not yearbook_state.get("nominate_titles"):
-            yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
-        return
-    yearbook_state["votes"] = {}
-    yearbook_state["ballots"] = {}
-    yearbook_state["stats"] = {}
-    yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
+    if not yearbook_state.get("nominate_titles"):
+        yearbook_state["nominate_titles"] = pick_yearbook_titles(4)
 
 
 
@@ -6767,7 +6764,7 @@ class DuckCog(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def yearbook_week_loop(self):
-        """Monday 00:05 Eastern: pay winners, refresh board, roll new week."""
+        """Pay winners once per ISO week after Monday 00:05 Eastern (with catch-up)."""
         if not is_yearbook_enabled():
             return
         try:
@@ -6775,32 +6772,50 @@ class DuckCog(commands.Cog):
         except Exception:
             return
         now = datetime.now(eastern)
-        # Monday hour 0, minute >= 5; run once per week_id
-        if now.weekday() != 0 or now.hour != 0 or now.minute < 5:
-            return
-        ensure_yearbook_week()
         wid = yearbook_week_id()
         if yearbook_state.get("last_resolved_week") == wid:
             return
+
+        # Monday 00:00 of this ISO week; eligible from 00:05 onward (Tue–Sun = catch-up)
+        week_monday = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        resolve_after = week_monday + timedelta(minutes=5)
+        if now < resolve_after:
+            return
+
         # Mid-week enable: skip *this* Monday only; hold stats until the next payout
         if yearbook_state.get("carry_next_monday"):
             yearbook_state["carry_next_monday"] = False
             yearbook_state["hold_stats_until_payout"] = True
+            yearbook_state["week_id"] = wid
             yearbook_state["last_resolved_week"] = wid
             await save_duck_state()
             print(f"[yearbook] carried mid-week progress into {wid}; first payout next Monday")
             return
+
+        # Resolve while stats/votes still present (ensure_yearbook_week never wipes them)
         try:
             await self.resolve_yearbook_week(wid)
         except Exception as e:
             print(f"[yearbook] resolve failed for {wid}: {e}")
+            return
+        yearbook_state["week_id"] = wid
+        await save_duck_state()
 
     async def resolve_yearbook_week(self, wid: str | None = None, *, force: bool = False):
         """Pay competitive + nomination seats, update board, reset cycle counters."""
         wid = wid or yearbook_week_id()
         if not force and yearbook_state.get("last_resolved_week") == wid:
             return
-        # Close was 1h earlier — we resolve Monday 00:05
+
+        # Snapshot before any mutation — used for logging / safety
+        stats_snapshot = dict(yearbook_state.get("stats") or {})
+        votes_snapshot = dict(yearbook_state.get("votes") or {})
+        titles_snapshot = list(yearbook_state.get("nominate_titles") or [])
+        stats_n = len(stats_snapshot)
+        votes_n = len(votes_snapshot)
+
         winners = []
         # Competitive
         key_map = {
@@ -6810,24 +6825,30 @@ class DuckCog(commands.Cog):
             "lucky_duck": "luck",
         }
         for key, title, desc in YEARBOOK_COMPETITIVE:
-            best_uid, best_n, best_first = None, -1, None
-            for uid, st in (yearbook_state.get("stats") or {}).items():
+            best_uid, best_n = None, -1
+            for uid, st in stats_snapshot.items():
                 if uid in (yearbook_state.get("disqualified") or []):
                     continue
-                n = int(st.get(key_map[key]) or 0)
+                n = int((st or {}).get(key_map[key]) or 0)
                 if n > best_n:
                     best_n, best_uid = n, uid
             if best_uid and best_n > 0:
-                winners.append({"kind": "comp", "title": title, "line": desc, "user_id": best_uid, "score": best_n})
+                winners.append({
+                    "kind": "comp",
+                    "title": title,
+                    "line": desc,
+                    "user_id": best_uid,
+                    "score": best_n,
+                })
         # Nominations — min votes required; exact first-place ties all win
-        for t in (yearbook_state.get("nominate_titles") or []):
+        for t in titles_snapshot:
             title = t["title"]
-            seat = (yearbook_state.get("votes") or {}).get(title) or {}
+            seat = votes_snapshot.get(title) or {}
             best_n = 0
             for nid, entry in seat.items():
                 if nid in (yearbook_state.get("disqualified") or []):
                     continue
-                c = int(entry.get("count") or 0)
+                c = int((entry or {}).get("count") or 0)
                 if c < YEARBOOK_NOMINATE_MIN_VOTES:
                     continue
                 if c > best_n:
@@ -6838,9 +6859,8 @@ class DuckCog(commands.Cog):
             for nid, entry in seat.items():
                 if nid in (yearbook_state.get("disqualified") or []):
                     continue
-                if int(entry.get("count") or 0) == best_n:
+                if int((entry or {}).get("count") or 0) == best_n:
                     tied.append(nid)
-            # Stable order by first_at so embeds/DMs are deterministic
             tied.sort(
                 key=lambda nid: float((seat.get(nid) or {}).get("first_at") or 0)
             )
@@ -6858,16 +6878,15 @@ class DuckCog(commands.Cog):
         duck_id = yearbook_state.get("winner_duck_id")
         role_id = yearbook_state.get("role_id")
 
+        # Pay winners first; only then mark resolved / clear (so a crash mid-pay can retry)
         for w in winners:
             uid = w["user_id"]
-            # Nomination ties split the seat purse (floor). Competitive stays full amount.
             share = eggs_amt
             if w.get("kind") == "nom" and int(w.get("tie_count") or 1) > 1:
                 share = eggs_amt // int(w["tie_count"])
             w["eggs_awarded"] = share
-            add_eggs(uid, share, kind="fresh")  # does not count as earned
+            add_eggs(uid, share, kind="fresh")
             rec = get_user_record(uid)
-            # Same as nest wins — cannot be donated back into the nest
             rec["nest_locked"] = int(rec.get("nest_locked") or 0) + share
             if duck_id and duck_id not in rec.get("collection", []):
                 rec.setdefault("collection", []).append(duck_id)
@@ -6875,14 +6894,23 @@ class DuckCog(commands.Cog):
             else:
                 w["duck_given"] = False
 
-        yearbook_state["last_winners"] = winners
+        if winners:
+            yearbook_state["last_winners"] = winners
+        else:
+            # Do NOT wipe prior board names when this cycle had nobody to pay
+            print(
+                f"[yearbook] {wid}: 0 winners "
+                f"(stats_users={stats_n}, vote_seats={votes_n}) — keeping previous last_winners on board"
+            )
+
         yearbook_state["last_resolved_week"] = wid
         yearbook_state["hold_stats_until_payout"] = False
         yearbook_state["carry_next_monday"] = False
+        yearbook_state["week_id"] = wid
         await save_duck_state()
         print(f"[yearbook] resolved {wid}: {len(winners)} winner slot(s)")
 
-        # Roles + DMs (board uses current nomination titles — publish BEFORE rolling new ones)
+        # Roles + DMs
         for guild in self.bot.guilds:
             role = guild.get_role(int(role_id)) if role_id else None
             for w in winners:
@@ -6914,20 +6942,30 @@ class DuckCog(commands.Cog):
                     except Exception:
                         pass
 
-        try:
-            status = await publish_yearbook_board(self.bot, winners)
-            print(f"[yearbook] board: {status}")
-        except Exception as e:
-            print(f"[yearbook] board publish failed: {e}")
+        # Board: only republish when we have new winners (avoids blanking the channel)
+        if winners:
+            # Temporarily ensure seat titles match this cycle for nomination embeds
+            yearbook_state["nominate_titles"] = titles_snapshot
+            try:
+                status = await publish_yearbook_board(self.bot, winners)
+                print(f"[yearbook] board: {status}")
+            except Exception as e:
+                print(f"[yearbook] board publish failed: {e}")
         try:
             log_status = await post_yearbook_log(
-                self.bot, winners, note="Automatic weekly resolve"
+                self.bot,
+                winners if winners else (yearbook_state.get("last_winners") or []),
+                note=(
+                    "Automatic weekly resolve"
+                    if winners
+                    else f"Automatic weekly resolve — 0 winners (stats={stats_n}, votes={votes_n})"
+                ),
             )
             print(f"[yearbook] log: {log_status}")
         except Exception as e:
             print(f"[yearbook] log post failed: {e}")
 
-        # Roll next week clean AFTER board shows this cycle's winners
+        # New cycle counters only after payout attempt is fully recorded
         yearbook_state["votes"] = {}
         yearbook_state["ballots"] = {}
         yearbook_state["stats"] = {}
@@ -7927,6 +7965,7 @@ class YearbookAdminView(discord.ui.View):
             yearbook_state["stats"] = {}
             yearbook_state["week_id"] = None
             yearbook_state["carry_next_monday"] = False
+            yearbook_state["hold_stats_until_payout"] = False
             yearbook_state["enabled_at"] = None
         await save_duck_state()
         # Re-sync slash visibility: members only see nominate/yearbook when on
