@@ -330,10 +330,6 @@ def weekly_kills_for(info: dict) -> int:
 
 _startup_done = False
 
-# Names currently shown in the bot's custom status (win announcements).
-# Used so we can clear presence when a displayed winner leaves the server.
-_last_status_names = []
-
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
@@ -366,12 +362,7 @@ async def on_ready():
         print(f"[startup] slash command sync failed (will retry on next reconnect): {e}")
     print(f"Bot is online as {bot.user}")
     print(f"[startup] Application ID: {bot.application_id}")
-    # Presence does not survive process restarts — clear to a neutral default
-    # so we never show a stale win from a previous run.
-    try:
-        await bot.change_presence(activity=discord.CustomActivity(name="Tracking Fortnite wins"))
-    except Exception as e:
-        print(f"[status] failed to set default presence on ready: {e}")
+    # Presence is owned by the duck pond status system (not Fortnite wins).
     if not check_wins.is_running():
         check_wins.start()
     if not weekly_reset_loop.is_running():
@@ -381,8 +372,7 @@ async def on_ready():
 @bot.event
 async def on_member_remove(member: discord.Member):
     """Fully disconnect a leaving member from the Fortnite side of the bot:
-    wipe their user_db record, drop them from any weekly champion holder list,
-    and refresh presence if they were the one shown in the win status.
+    wipe their user_db record and drop them from any weekly champion holder list.
     """
     discord_id = str(member.id)
     guild_id = str(member.guild.id) if member.guild else None
@@ -407,21 +397,6 @@ async def on_member_remove(member: discord.Member):
 
     if changed:
         await save_db()
-
-    # If the current status is showing this person's display name, clear or
-    # refresh it so a departed member's win doesn't stick on the bot forever.
-    global _last_status_names
-    display = member.display_name
-    if display and display in _last_status_names:
-        remaining = [n for n in _last_status_names if n != display]
-        if remaining:
-            await update_status(remaining)
-        else:
-            try:
-                await bot.change_presence(activity=discord.CustomActivity(name="Tracking Fortnite wins"))
-            except Exception as e:
-                print(f"[status] failed to clear presence after member leave: {e}")
-            _last_status_names = []
 
 
 ###############################################
@@ -987,8 +962,7 @@ async def check_wins():
             print(f"[check_wins] error processing {discord_id}: {e}")
             continue
 
-    if winners_this_cycle:
-        await update_status(winners_this_cycle)
+    # Win detection still runs for stats / fortboard — presence is pond status only.
 
 
 @check_wins.error
@@ -998,23 +972,6 @@ async def check_wins_error(error):
     print(f"[check_wins] loop crashed, restarting: {error}")
     if not check_wins.is_running():
         check_wins.start()
-
-
-async def update_status(winner_names: list):
-    global _last_status_names
-    names = list(dict.fromkeys(winner_names))  # de-dupe, keep order
-    _last_status_names = names
-    if len(names) == 1:
-        status_text = f"🏆 {names[0]}"
-    elif len(names) == 2:
-        status_text = f"🏆 {names[0]} & {names[1]}"
-    else:
-        status_text = f"🏆 {', '.join(names[:-1])} & {names[-1]}"
-
-    try:
-        await bot.change_presence(activity=discord.CustomActivity(name=status_text))
-    except Exception as e:
-        print(f"[status] failed to update presence: {e}")
 
 
 async def check_wins_for_user(discord_id, info):
