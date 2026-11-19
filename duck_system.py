@@ -418,6 +418,104 @@ thanksgiving_state: dict = {
     "submissions": {},
 }
 
+# ---------------------------------------------------------------------------
+# Pond Status Perks (hourly presence) — duck-side, not Fortnite wins
+# Status format: "EMOJI DisplayName" for perks, plain mood text for Nobody
+# ---------------------------------------------------------------------------
+POND_STATUS_DURATION = 3600  # 1 hour
+POND_STATUS_ACTIVE_WINDOW = 48 * 3600
+POND_STATUS_MIN_MSGS = 10
+BLESSED_HOUR_CAP = 200
+
+# Mood lines when nobody holds a perk (no emoji — bot mood from drop odds)
+POND_STATUS_MOOD_LOW = [
+    "kinda quiet today…",
+    "not feeling it",
+    "low energy",
+    "just drifting",
+    "heavy water today",
+    "moving slow",
+    "bit of a lull",
+    "soft and sleepy",
+    "not much spark",
+    "taking it easy",
+]
+POND_STATUS_MOOD_MID = [
+    "steady as usual",
+    "just hanging out",
+    "normal pond day",
+    "vibing",
+    "keeping pace",
+    "nothing wild",
+    "even waters",
+    "same old rhythm",
+    "cruising along",
+    "middle of the road",
+]
+POND_STATUS_MOOD_HIGH = [
+    "feeling lucky",
+    "pond's buzzing",
+    "good energy today",
+    "amped up",
+    "something's cooking",
+    "high tide mood",
+    "can't sit still",
+    "good vibes only",
+    "feeling generous",
+    "locked in",
+]
+
+# perk_id -> (emoji, display_name, tier)  tier: common | uncommon | rare
+POND_PERKS = {
+    "charm": ("❤️", "Charm", "common"),
+    "blessed": ("🌟", "Blessed", "common"),
+    "santa": ("🎅", "Santa", "common"),
+    "slippery": ("🧼", "Slippery", "common"),
+    "lucky": ("🍀", "Lucky", "uncommon"),
+    "rewinder": ("⏪", "Rewinder", "uncommon"),
+    "infected": ("🧪", "Infected", "uncommon"),
+    "rotten_luck": ("🤢", "Rotten Luck", "uncommon"),
+    "mirror": ("🪞", "Mirror", "uncommon"),
+    "thief": ("🥷", "Thief", "rare"),
+    "auto_win": ("🎯", "Auto Win", "rare"),
+    "magnetic": ("🧲", "Magnetic", "rare"),
+    "fragile": ("💔", "Fragile", "rare"),
+}
+
+# Tier roll weights (nobody is rolled inside common)
+POND_TIER_WEIGHTS = [
+    ("common", 50),
+    ("uncommon", 35),
+    ("rare", 15),
+]
+# Within common: chance to be Nobody vs a real common perk
+POND_COMMON_NOBODY_WEIGHT = 55  # % of common rolls that are nobody
+POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery"]
+POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck", "mirror"]
+POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile"]
+
+# Lucky hatcher: cut common ~in half, redistribute freed mass upward
+LUCKY_RARITY_WEIGHTS = {
+    "common": 30.0,
+    "rare": 35.0,
+    "legendary": 18.0,
+    "divine": 9.0,
+    "secret": 5.0,
+    "quackpot": 3.0,
+}
+
+pond_status_state: dict = {
+    "enabled": True,
+    "perk_id": None,          # None = nobody / mood only
+    "holder_id": None,        # discord id str
+    "holder_guild_id": None,
+    "expires_at": 0.0,
+    "status_text": "steady as usual",
+    "blessed_eggs_given": 0,
+    "mirror_pending": None,   # {"amount": int, "from_id": str} or None
+}
+
+
 # Synodic month reference (UTC). Good enough for ±1h event windows.
 _FULL_MOON_REF_UTC = datetime(2025, 1, 13, 22, 27, tzinfo=timezone.utc)
 _SYNODIC_DAYS = 29.530588853
@@ -1162,6 +1260,11 @@ def grant_rewind_from_hatch(uid: str, eggs_hatched: int) -> int:
 
 
 def try_spend_rewind_token(uid: str) -> bool:
+    """Spend one rewind token. Status Rewinder holder gets free uses (no token)."""
+    uid = str(uid)
+    # Hourly status perk: free rewinds (suppressed while Rewind *event* is on)
+    if is_pond_perk("rewinder", uid) and not is_rewind_mode():
+        return True
     if not is_rewind_mode():
         return False
     rec = get_user_record(uid)
@@ -1387,6 +1490,177 @@ def give_fortune_for_drop_chance(chance: float) -> tuple[str, float]:
     return GIVE_FORTUNE_TIERS[4]
 
 
+def pond_status_active() -> bool:
+    if not pond_status_state.get("enabled", True):
+        return False
+    exp = float(pond_status_state.get("expires_at") or 0)
+    return exp > time.time()
+
+
+def pond_status_perk_id() -> str | None:
+    if not pond_status_active():
+        return None
+    return pond_status_state.get("perk_id")
+
+
+def pond_status_holder_id() -> str | None:
+    if not pond_status_active():
+        return None
+    return pond_status_state.get("holder_id")
+
+
+def is_pond_perk(perk_id: str, discord_id: str | None = None) -> bool:
+    if pond_status_perk_id() != perk_id:
+        return False
+    if discord_id is None:
+        return True
+    return str(discord_id) == str(pond_status_state.get("holder_id") or "")
+
+
+def note_status_activity(discord_id: str) -> None:
+    """Rolling 48h qualifying message count for status eligibility."""
+    rec = get_user_record(discord_id)
+    now = time.time()
+    last = float(rec.get("last_qualifying_activity_at") or 0)
+    if last and (now - last) > POND_STATUS_ACTIVE_WINDOW:
+        rec["status_msgs_48h"] = 0
+    rec["status_msgs_48h"] = int(rec.get("status_msgs_48h") or 0) + 1
+
+
+def eligible_pond_status_holders() -> list[str]:
+    """Members active in last 48h with enough qualifying messages."""
+    now = time.time()
+    out = []
+    for uid, rec in duck_users.items():
+        last = float(rec.get("last_qualifying_activity_at") or 0)
+        if not last or (now - last) > POND_STATUS_ACTIVE_WINDOW:
+            continue
+        if int(rec.get("status_msgs_48h") or 0) < POND_STATUS_MIN_MSGS:
+            continue
+        out.append(str(uid))
+    return out
+
+
+def _mood_band_for_drop_chance(chance: float) -> list[str]:
+    if chance < 9:
+        return POND_STATUS_MOOD_LOW
+    if chance < 13:
+        return POND_STATUS_MOOD_MID
+    return POND_STATUS_MOOD_HIGH
+
+
+def pick_pond_status_mood(chance: float | None = None) -> str:
+    if chance is None:
+        chance = float(environment_state.get("drop_chance_percent") or ENVIRONMENT_MIN_CHANCE)
+    return random.choice(_mood_band_for_drop_chance(chance))
+
+
+def _perk_ids_for_tier(tier: str) -> list[str]:
+    if tier == "common":
+        return list(POND_COMMON_PERK_IDS)
+    if tier == "uncommon":
+        return list(POND_UNCOMMON_PERK_IDS)
+    return list(POND_RARE_PERK_IDS)
+
+
+def roll_pond_status_selection() -> tuple[str | None, str | None, str]:
+    """Return (perk_id|None, holder_id|None, status_text)."""
+    chance = float(environment_state.get("drop_chance_percent") or ENVIRONMENT_MIN_CHANCE)
+    tiers = [t for t, _w in POND_TIER_WEIGHTS]
+    weights = [w for _t, w in POND_TIER_WEIGHTS]
+    tier = random.choices(tiers, weights=weights, k=1)[0]
+
+    if tier == "common" and random.random() * 100 < POND_COMMON_NOBODY_WEIGHT:
+        text = pick_pond_status_mood(chance)
+        return None, None, text
+
+    candidates = _perk_ids_for_tier(tier)
+    # Suppress thief during purge, rewinder optional during rewind event
+    filtered = []
+    for pid in candidates:
+        if pid == "thief" and is_purge_mode():
+            continue
+        if pid == "rewinder" and is_rewind_mode():
+            continue
+        filtered.append(pid)
+    if not filtered:
+        text = pick_pond_status_mood(chance)
+        return None, None, text
+
+    perk_id = random.choice(filtered)
+    emoji, name, _t = POND_PERKS[perk_id]
+    holders = eligible_pond_status_holders()
+    if not holders:
+        text = pick_pond_status_mood(chance)
+        return None, None, text
+    holder = random.choice(holders)
+    status_text = f"{emoji} {name}"
+    return perk_id, holder, status_text
+
+
+async def apply_pond_status_presence(bot: commands.Bot) -> None:
+    text = (pond_status_state.get("status_text") or "steady as usual")[:128]
+    try:
+        await bot.change_presence(activity=discord.CustomActivity(name=text))
+    except Exception as e:
+        print(f"[pond_status] presence failed: {e}")
+
+
+async def rotate_pond_status(bot: commands.Bot) -> None:
+    """Pick a new hourly perk/mood and push bot presence."""
+    if not pond_status_state.get("enabled", True):
+        return
+    await ensure_environment_for_today()
+    perk_id, holder_id, status_text = roll_pond_status_selection()
+    pond_status_state["perk_id"] = perk_id
+    pond_status_state["holder_id"] = holder_id
+    pond_status_state["expires_at"] = time.time() + POND_STATUS_DURATION
+    pond_status_state["status_text"] = status_text
+    pond_status_state["blessed_eggs_given"] = 0
+    pond_status_state["mirror_pending"] = None
+    pond_status_state["holder_guild_id"] = None
+    if holder_id and bot.guilds:
+        # Prefer a shared guild where the member is present
+        for g in bot.guilds:
+            if g.get_member(int(holder_id)):
+                pond_status_state["holder_guild_id"] = str(g.id)
+                break
+        if not pond_status_state["holder_guild_id"]:
+            pond_status_state["holder_guild_id"] = str(bot.guilds[0].id)
+    await save_duck_state()
+    await apply_pond_status_presence(bot)
+    who = f"holder={holder_id}" if holder_id else "nobody"
+    print(f"[pond_status] {status_text} ({who}) until {pond_status_state['expires_at']:.0f}")
+
+
+def effective_drop_chance_percent(discord_id: str | None = None) -> float:
+    """Base weather chance, modified by Charm / Magnetic."""
+    base = float(environment_state.get("drop_chance_percent") or ENVIRONMENT_MIN_CHANCE)
+    if is_pond_perk("magnetic", discord_id):
+        return float(ENVIRONMENT_MAX_CHANCE)
+    if is_pond_perk("charm"):
+        # Whole hour: everyone enjoys x2 while Charm is active
+        return min(100.0, base * 2.0)
+    return base
+
+
+def effective_eggs_per_drop(discord_id: str | None = None) -> int:
+    base = int(environment_state.get("egg_count") or 1)
+    if is_pond_perk("magnetic", discord_id):
+        return 10 if is_rewind_mode() else 5
+    return base
+
+
+def apply_earn_egg_modifiers(discord_id: str, amount: int) -> int:
+    """Fragile halves earned eggs (floor at 1 if amount > 0)."""
+    if amount <= 0:
+        return 0
+    if is_pond_perk("fragile", discord_id):
+        return max(1, amount // 2) if amount > 1 else amount
+    return amount
+
+
+
 def _sync_inventory_total(rec: dict) -> None:
     rec["inventory"] = (
         int(rec.get("inventory_fresh") or 0)
@@ -1542,6 +1816,7 @@ def record_qualifying_activity(discord_id: str) -> None:
         rec["activity_date"] = today
         rec["activity_msgs_today"] = 0
     rec["activity_msgs_today"] = int(rec.get("activity_msgs_today") or 0) + 1
+    note_status_activity(discord_id)
     yb_add_msg(discord_id)
 
 
@@ -1615,12 +1890,44 @@ def remove_karma(discord_id: str, points: int = 1):
     rec["karma"] = max(rec.get("karma", 0) - points, 0)
 
 
-def add_eggs(discord_id: str, amount: int, kind: str = "fresh"):
+def add_eggs(discord_id: str, amount: int, kind: str = "fresh", *, skip_status_mods: bool = False):
     """Add eggs. kind: 'fresh' | 'rotten' | 'error'. Fresh gets a FIFO batch timestamp.
     Does not save — caller should await save_duck_state().
+
+    Status mods (unless skip_status_mods):
+    - Fragile: half amount
+    - Slippery: fresh eggs go to nest instead of inventory (still nest entries)
+    - Mirror: 50% chance next other chatter mirrors the amount
     """
     if amount <= 0:
         return
+    discord_id = str(discord_id)
+    if not skip_status_mods:
+        amount = apply_earn_egg_modifiers(discord_id, amount)
+        if amount <= 0:
+            return
+
+    # Slippery: divert fresh earnings into the community nest
+    if (
+        not skip_status_mods
+        and kind == "fresh"
+        and is_pond_perk("slippery", discord_id)
+        and amount > 0
+    ):
+        gid = pond_status_state.get("holder_guild_id")
+        if gid:
+            st = get_nest_state(str(gid))
+            st["pool_total"] = int(st.get("pool_total") or NEST_BASELINE) + amount
+            entries = st.setdefault("entries", {})
+            entries[discord_id] = int(entries.get(discord_id) or 0) + amount
+        # No inventory credit
+        if is_pond_perk("mirror", discord_id) and random.random() < 0.5:
+            pond_status_state["mirror_pending"] = {
+                "amount": amount,
+                "from_id": discord_id,
+            }
+        return
+
     rec = get_user_record(discord_id)
     if kind == "rotten":
         rec["inventory_rotten"] = int(rec.get("inventory_rotten") or 0) + amount
@@ -1632,6 +1939,18 @@ def add_eggs(discord_id: str, amount: int, kind: str = "fresh"):
         batches.append({"amount": amount, "acquired_at": time.time()})
     _sync_inventory_total(rec)
 
+    # Mirror: next different chatter may receive the same amount
+    if (
+        not skip_status_mods
+        and is_pond_perk("mirror", discord_id)
+        and amount > 0
+        and random.random() < 0.5
+    ):
+        pond_status_state["mirror_pending"] = {
+            "amount": amount,
+            "from_id": discord_id,
+        }
+
 
 # Set once in DuckCog.cog_load() from bot.db_pool — avoids any circular
 # import back into the main bot file.
@@ -1640,7 +1959,7 @@ _bot = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state, thanksgiving_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state, thanksgiving_state, pond_status_state
     if _pool is None:
         return
     try:
@@ -1649,7 +1968,8 @@ async def load_duck_state():
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
                 "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts',"
-                "'duck_air_drop_state','duck_series','duck_yearbook')"
+                "'duck_air_drop_state','duck_series','duck_yearbook',"
+                "'duck_full_moon_purge','duck_thanksgiving','duck_pond_status')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
             duck_index = data.get("duck_index", {})
@@ -1671,6 +1991,9 @@ async def load_duck_state():
             tg = data.get("duck_thanksgiving")
             if isinstance(tg, dict):
                 thanksgiving_state.update(tg)
+            ps = data.get("duck_pond_status")
+            if isinstance(ps, dict):
+                pond_status_state.update(ps)
             environment_state = data.get(
                 "duck_environment",
                 {
@@ -1733,6 +2056,7 @@ async def save_duck_state() -> bool:
                     ("duck_yearbook", json.dumps(yearbook_state)),
                     ("duck_full_moon_purge", json.dumps(full_moon_purge_state)),
                     ("duck_thanksgiving", json.dumps(thanksgiving_state)),
+                    ("duck_pond_status", json.dumps(pond_status_state)),
                 ],
             )
         return True
@@ -2060,9 +2384,10 @@ def get_active_error_ducks():
     return [d for d, duck in duck_index.items() if duck.get("active") and duck.get("is_error")]
 
 
-def roll_duck_id(*, rotten: bool = False, error_egg: bool = False):
+def roll_duck_id(*, rotten: bool = False, error_egg: bool = False, lucky: bool = False):
     """Pick one active duck. error_egg=True → only ERROR pool.
     rotten=True → ROTTEN_RARITY_WEIGHTS only (no ERROR duck pool).
+    lucky=True → LUCKY_RARITY_WEIGHTS (common cut, higher tiers boosted).
     Otherwise normal weights + effective_error_weight().
     """
     error_ducks = get_active_error_ducks()
@@ -2072,7 +2397,12 @@ def roll_duck_id(*, rotten: bool = False, error_egg: bool = False):
         return random.choice(error_ducks)
 
     by_rarity = get_active_ducks_by_rarity()
-    table = ROTTEN_RARITY_WEIGHTS if rotten else RARITY_WEIGHTS
+    if rotten:
+        table = ROTTEN_RARITY_WEIGHTS
+    elif lucky:
+        table = LUCKY_RARITY_WEIGHTS
+    else:
+        table = RARITY_WEIGHTS
     available_tiers = [r for r in RARITY_ORDER if by_rarity[r]]
     weights = [table[r] for r in available_tiers]
 
@@ -2222,7 +2552,8 @@ def resolve_hatch(
     """
     error_egg = egg_kind == "error"
     rotten = egg_kind == "rotten"
-    duck_id = roll_duck_id(rotten=rotten, error_egg=error_egg)
+    lucky = (not rotten) and (not error_egg) and is_pond_perk("lucky", discord_id)
+    duck_id = roll_duck_id(rotten=rotten, error_egg=error_egg, lucky=lucky)
     if duck_id is None:
         return None
 
@@ -2643,11 +2974,13 @@ def format_egg_channel_name(count: int) -> str:
 class EggDropView(discord.ui.View):
     """Drop claim UI. Hatch/Inventory are finder-only. Purge adds Steal."""
 
-    def __init__(self, owner_id: int, egg_count: int = 1, purge: bool = False):
+    def __init__(self, owner_id: int, egg_count: int = 1, purge: bool = False, egg_kind: str = "fresh"):
         super().__init__(timeout=CLAIM_TIMEOUT_SECONDS)
         self.owner_id = owner_id
         self.egg_count = egg_count
         self.base_egg_count = egg_count
+        self.egg_kind = egg_kind if egg_kind in ("fresh", "rotten") else "fresh"
+        self.infected = False  # 🧪 Infected perk flipped this drop to rotten
         self.message: discord.Message | None = None
         self.steal_failed: set[int] = set()
         self.claimed = False
@@ -2667,9 +3000,17 @@ class EggDropView(discord.ui.View):
             steal_btn.callback = self.steal
             self.add_item(steal_btn)
 
+    def effective_kind(self) -> str:
+        if self.infected or self.egg_kind == "rotten":
+            return "rotten"
+        return "fresh"
+
     def drop_content(self, mention: str) -> str:
         egg_word = "egg" if self.egg_count == 1 else "eggs"
-        line = f"{egg_emoji('fresh')} {mention} found {self.egg_count} {egg_word} on the ground!"
+        kind = self.effective_kind()
+        line = f"{egg_emoji(kind)} {mention} found {self.egg_count} {egg_word} on the ground!"
+        if kind == "rotten":
+            line += "\n-# 🤢 These eggs are **rotten**"
         if self.purge:
             line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
         return line
@@ -2711,7 +3052,7 @@ class EggDropView(discord.ui.View):
         discord_id = str(interaction.user.id)
         
         if self.egg_count == 1:
-            result = resolve_hatch(discord_id, egg_kind="fresh")
+            result = resolve_hatch(discord_id, egg_kind=self.effective_kind())
             if result is None:
                 await save_duck_state()
                 self.stop()
@@ -2746,7 +3087,7 @@ class EggDropView(discord.ui.View):
         results = []
         error_eggs_got = 0
         for _ in range(self.egg_count):
-            r = resolve_hatch(discord_id, egg_kind="fresh")
+            r = resolve_hatch(discord_id, egg_kind=self.effective_kind())
             if r is None:
                 break
             results.append(r)
@@ -2788,7 +3129,7 @@ class EggDropView(discord.ui.View):
         self.claimed = True
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
-        add_eggs(discord_id, self.egg_count, kind="fresh")
+        add_eggs(discord_id, self.egg_count, kind=self.effective_kind())
         yb_add_earned(discord_id, self.egg_count)
         await save_duck_state()
         self.stop()
@@ -2824,7 +3165,7 @@ class EggDropView(discord.ui.View):
             self.claimed = True
             stealer_id = str(interaction.user.id)
             # Finder didn't claim — no treats_received credit
-            add_eggs(stealer_id, self.egg_count, kind="fresh")
+            add_eggs(stealer_id, self.egg_count, kind=self.effective_kind())
             yb_add_earned(stealer_id, self.egg_count)
             await save_duck_state()
             self.stop()
@@ -3759,23 +4100,93 @@ class EggEmojiModal(discord.ui.Modal, title="Egg Emojis"):
         )
 
 
-class HatchToggleView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
+def build_system_toggles_embed(guild_id: str) -> discord.Embed:
+    """Staff overview of major on/off switches for this guild + global status perks."""
+    cfg = duck_config.get(guild_id, {})
+    drops_on = cfg.get("hatching_enabled", True)
+    air_on = cfg.get("air_drops_enabled", True)
+    hatch_on = cfg.get("hatch_enabled", True)
+    status_on = pond_status_state.get("enabled", True)
+    air_ch = cfg.get("air_drop_channel_id")
+    air_line = f"{'🟢 ON' if air_on else '🔴 OFF'}"
+    if air_ch:
+        air_line += f" · <#{air_ch}>"
+    lines = [
+        "# 🎛️ System Toggles",
+        "",
+        f"**🪂 Air Drops** — {air_line}",
+        f"**🥚 Ground Drops** — {'🟢 ON' if drops_on else '🔴 OFF'}",
+        f"**🐣 Hatch Command** — {'🟢 ON' if hatch_on else '🔴 OFF'}",
+        f"**🎭 Status Perks** — {'🟢 ON' if status_on else '🔴 OFF'}",
+        "",
+        "-# Each button flips that switch. Status perks are bot-wide; the rest are this server.",
+    ]
+    return discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
 
-    @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
-    async def turn_on(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = str(interaction.guild.id)
-        duck_config.setdefault(guild_id, {})["hatching_enabled"] = True
-        await save_duck_state()
-        await interaction.response.edit_message(content="Egg drops are now **On**.", view=None)
 
-    @discord.ui.button(label="Turn Off", style=discord.ButtonStyle.danger)
-    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = str(interaction.guild.id)
-        duck_config.setdefault(guild_id, {})["hatching_enabled"] = False
+class SystemTogglesView(discord.ui.View):
+    """Editor → Toggles: air drops, ground drops, /hatch, status perks."""
+
+    def __init__(self, guild_id: str):
+        super().__init__(timeout=180)
+        self.guild_id = str(guild_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Nothing to see here.", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=build_system_toggles_embed(self.guild_id),
+            view=self,
+        )
+
+    @discord.ui.button(label="Air Drops", style=discord.ButtonStyle.primary, emoji="🪂", row=0)
+    async def toggle_air(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = duck_config.setdefault(self.guild_id, {})
+        cfg["air_drops_enabled"] = not cfg.get("air_drops_enabled", True)
+        if cfg["air_drops_enabled"]:
+            state = get_air_drop_state(self.guild_id)
+            if not state.get("next_drop_at") and not state.get("active"):
+                schedule_next_air_drop(self.guild_id)
         await save_duck_state()
-        await interaction.response.edit_message(content="Egg drops are now **Off**.", view=None)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Ground Drops", style=discord.ButtonStyle.primary, emoji="🥚", row=0)
+    async def toggle_drops(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = duck_config.setdefault(self.guild_id, {})
+        cfg["hatching_enabled"] = not cfg.get("hatching_enabled", True)
+        await save_duck_state()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Hatch Cmd", style=discord.ButtonStyle.primary, emoji="🐣", row=0)
+    async def toggle_hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = duck_config.setdefault(self.guild_id, {})
+        cfg["hatch_enabled"] = not cfg.get("hatch_enabled", True)
+        await save_duck_state()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Status Perks", style=discord.ButtonStyle.primary, emoji="🎭", row=0)
+    async def toggle_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pond_status_state["enabled"] = not pond_status_state.get("enabled", True)
+        if not pond_status_state["enabled"]:
+            # Clear active hour so presence doesn't look like a live perk
+            pond_status_state["perk_id"] = None
+            pond_status_state["holder_id"] = None
+            pond_status_state["expires_at"] = 0
+            pond_status_state["status_text"] = "status perks off"
+            pond_status_state["mirror_pending"] = None
+            try:
+                await apply_pond_status_presence(interaction.client)
+            except Exception:
+                pass
+        else:
+            # Rotate soon on next loop tick
+            pond_status_state["expires_at"] = 0
+        await save_duck_state()
+        await self._refresh(interaction)
 
 
 class DuckGivingToggleView(discord.ui.View):
@@ -3950,9 +4361,11 @@ GIFT_SAFE_FLAVOR = [
 ]
 
 
-def roll_gift_loss(amount: int) -> int:
+def roll_gift_loss(amount: int, giver_id: str | None = None) -> int:
     """Return how many eggs break/sink in transit (0 .. amount)."""
     if amount <= 0:
+        return 0
+    if giver_id and is_pond_perk("santa", str(giver_id)):
         return 0
     # Mode at 0.15 so pure 0% is possible but not the typical result.
     frac = random.triangular(0.0, 0.30, 0.15)
@@ -4049,7 +4462,7 @@ class GiftOfferView(discord.ui.View):
             )
 
         amount = gift["amount"]
-        lost = roll_gift_loss(amount)
+        lost = roll_gift_loss(amount, gift.get("giver_id"))
         received = amount - lost
         if received > 0:
             add_eggs(gift["target_id"], received, kind="fresh")
@@ -5303,25 +5716,6 @@ class ChannelSetterView(discord.ui.View):
                 ephemeral=True,
             )
 
-    @discord.ui.button(label="Toggle Air Drops", style=discord.ButtonStyle.primary, emoji="🪂")
-    async def toggle_air(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = str(interaction.guild.id)
-        cfg = duck_config.setdefault(guild_id, {})
-        cfg["air_drops_enabled"] = not cfg.get("air_drops_enabled", True)
-        enabled = cfg["air_drops_enabled"]
-        if enabled:
-            state = get_air_drop_state(guild_id)
-            if not state.get("next_drop_at") and not state.get("active"):
-                schedule_next_air_drop(guild_id)
-        await save_duck_state()
-        ch_id = cfg.get("air_drop_channel_id")
-        ch_bit = f"<#{ch_id}>" if ch_id else "*no channel set yet*"
-        status = "**ON**" if enabled else "**OFF**"
-        await interaction.response.send_message(
-            f"🪂 Air drops are now {status}.\nChannel: {ch_bit}",
-            ephemeral=True,
-        )
-
 
 class AirDropChannelSelectView(discord.ui.View):
     def __init__(self):
@@ -5350,7 +5744,7 @@ class AirDropChannelSelectView(discord.ui.View):
                 f"🪂 Air drop channel set to {channel.mention}.\n"
                 f"Timing scales with chat heat (quiet **1–3h**, warm **30m–1h**, hot **10–30m**). "
                 f"Unclaimed drops expire after **30 minutes**.\n"
-                f"-# Use **Channel Setter → Toggle Air Drops** to pause them."
+                f"-# Use **/editor → Toggles** to pause air drops."
             ),
             view=None,
         )
@@ -5366,7 +5760,7 @@ class EditorView(discord.ui.View):
             discord.SelectOption(label="Toggle Duck Activation", value="toggle_active", emoji="🔁"),
             discord.SelectOption(label="Manage Series", value="series", emoji="📚"),
             discord.SelectOption(label="Clear Pool", value="clear_pool", emoji="🧹"),
-            discord.SelectOption(label="Toggle Egg Drops", value="toggle", emoji="🥚"),
+            discord.SelectOption(label="Toggles", value="toggles", emoji="🎛️"),
             discord.SelectOption(label="Egg Emojis", value="egg_emojis", emoji="🎨"),
             discord.SelectOption(label="Toggle Duck Giving", value="toggle_give", emoji="🎁"),
             discord.SelectOption(label="Channel Setter", value="channels", emoji="📡"),
@@ -5411,9 +5805,12 @@ class EditorView(discord.ui.View):
                 view=ConfirmClearPoolView(interaction.user.id),
                 ephemeral=True,
             )
-        elif choice == "toggle":
+        elif choice == "toggles":
+            gid = str(interaction.guild.id)
             await interaction.response.send_message(
-                "Turn egg drops on or off:", view=HatchToggleView(), ephemeral=True
+                embed=build_system_toggles_embed(gid),
+                view=SystemTogglesView(gid),
+                ephemeral=True,
             )
         elif choice == "egg_emojis":
             await interaction.response.send_modal(EggEmojiModal())
@@ -5438,7 +5835,8 @@ class EditorView(discord.ui.View):
                 air_line += f" in <#{air_ch}>"
             await interaction.response.send_message(
                 f"**📡 Channel Setter**\n{air_line}\n"
-                "Pick what to configure, or toggle air drops:",
+                "Pick what to configure.\n"
+                "-# On/off for air drops is under **Toggles**.",
                 view=ChannelSetterView(interaction.guild),
                 ephemeral=True,
             )
@@ -5487,6 +5885,7 @@ class DuckCog(commands.Cog):
         self.air_drop_loop.start()
         self.yearbook_week_loop.start()
         self.full_moon_purge_loop.start()
+        self.pond_status_loop.start()
 
         # Re-register persistent gift offer buttons after restart
         for gift_id in list(pending_gifts.keys()):
@@ -5511,6 +5910,7 @@ class DuckCog(commands.Cog):
         self.yearbook_week_loop.cancel()
         self.air_drop_loop.cancel()
         self.full_moon_purge_loop.cancel()
+        self.pond_status_loop.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         orig = getattr(error, "original", error)
@@ -5610,8 +6010,28 @@ class DuckCog(commands.Cog):
                         rec["reply_karma_count"] = int(rec.get("reply_karma_count") or 0) + 1
                         award_karma(discord_id, 1)
                         state_changed = True
+                    # Blessed: 25% chance to grant 1–3 eggs to the person you replied to
+                    if is_pond_perk("blessed", discord_id):
+                        given = int(pond_status_state.get("blessed_eggs_given") or 0)
+                        if given < BLESSED_HOUR_CAP and random.random() < 0.25:
+                            n = random.randint(1, 3)
+                            n = min(n, BLESSED_HOUR_CAP - given)
+                            if n > 0:
+                                add_eggs(str(ref.author.id), n, kind="fresh")
+                                pond_status_state["blessed_eggs_given"] = given + n
+                                state_changed = True
             except Exception:
                 pass
+
+        # --- Mirror: next chatter after Mirror holder may receive mirrored eggs ---
+        pending = pond_status_state.get("mirror_pending")
+        if pending and isinstance(pending, dict):
+            from_id = str(pending.get("from_id") or "")
+            amt = int(pending.get("amount") or 0)
+            if from_id and amt > 0 and discord_id != from_id:
+                pond_status_state["mirror_pending"] = None
+                add_eggs(discord_id, amt, kind="fresh", skip_status_mods=True)
+                state_changed = True
 
         if state_changed:
             await save_duck_state()
@@ -5658,14 +6078,16 @@ class DuckCog(commands.Cog):
         rec["last_roll_check_ts"] = now  # kept in-memory only — not worth a DB write on every message
 
         env = await ensure_environment_for_today()
-        if random.random() >= (env["drop_chance_percent"] / 100):
+        drop_pct = effective_drop_chance_percent(discord_id)
+        if random.random() >= (drop_pct / 100):
             return
         if roll_duck_id() is None:
             return  # pool is empty, nothing to give right now
 
-        egg_count = env.get("egg_count", 1)
+        egg_count = effective_eggs_per_drop(discord_id)
         purge = is_purge_mode()
-        view = EggDropView(message.author.id, egg_count, purge=purge)
+        drop_kind = "rotten" if is_pond_perk("rotten_luck", discord_id) else "fresh"
+        view = EggDropView(message.author.id, egg_count, purge=purge, egg_kind=drop_kind)
         drop_text = view.drop_content(message.author.mention)
         try:
             sent = await message.channel.send(content=drop_text, view=view)
@@ -5759,6 +6181,12 @@ class DuckCog(commands.Cog):
             await self._process_air_drop_reaction(payload)
         except Exception as e:
             print(f"[air_drop] reaction handle failed: {e}")
+
+        # Status Thief 🥷 / Infected 🧪
+        try:
+            await self._process_status_perk_reaction(payload)
+        except Exception as e:
+            print(f"[pond_status] reaction handle failed: {e}")
 
         if payload.guild_id is None:
             return
@@ -6185,11 +6613,35 @@ class DuckCog(commands.Cog):
 
         uid = str(winner.id)
         winners = cur.setdefault("winners", [])
-        if uid in winners:
+        ghost_wins = cur.setdefault("ghost_wins", [])
+        if uid in winners or uid in ghost_wins:
             return  # already claimed a slot on this drop
 
         slots = max(1, int(cur.get("slots") or 1))
-        if len(winners) >= slots:
+        is_ghost = is_pond_perk("auto_win", uid)
+
+        if not is_ghost and len(winners) >= slots:
+            return
+
+        eggs = int(cur["eggs"])
+        if is_ghost:
+            # Ghost: earns eggs but does not consume a winner slot
+            ghost_wins.append(uid)
+            add_eggs(uid, eggs, kind="fresh")
+            yb_add_earned(uid, eggs)
+            rec = get_user_record(uid)
+            await save_duck_state()
+            try:
+                await channel.send(
+                    embed=build_air_drop_claim_embed(
+                        winner.mention,
+                        rec["inventory"],
+                        slots=slots,
+                        winners_so_far=len(winners),
+                    )
+                )
+            except Exception as e:
+                print(f"[air_drop] ghost claim announce failed: {e}")
             return
 
         # Claim slot before any await so concurrent finishers can't over-fill
@@ -6199,7 +6651,6 @@ class DuckCog(commands.Cog):
             winners.pop()
             return
 
-        eggs = int(cur["eggs"])
         add_eggs(uid, eggs, kind="fresh")
         yb_add_earned(uid, eggs)
         rec = get_user_record(uid)
@@ -6304,9 +6755,83 @@ class DuckCog(commands.Cog):
 
             await self._complete_air_drop(guild_id, message.channel, message.author, active)
 
+    async def _process_status_perk_reaction(self, payload: discord.RawReactionActionEvent):
+        """Thief (🥷 50/50 steal) and Infected (🧪 turn unclaimed drop rotten)."""
+        if payload.guild_id is None or payload.user_id == self.bot.user.id:
+            return
+        if payload.emoji.id is not None:
+            return  # unicode only
+        name = payload.emoji.name or ""
+        uid = str(payload.user_id)
+        mid = payload.message_id
+
+        # Infected: holder reacts 🧪 on an unclaimed ground drop
+        if name == "🧪" and is_pond_perk("infected", uid):
+            view = active_egg_drops.get(mid)
+            if view is None or view.claimed:
+                return
+            if getattr(view, "infected", False):
+                return
+            view.infected = True
+            view.egg_kind = "rotten"
+            channel = self.bot.get_channel(payload.channel_id)
+            if channel and view.message:
+                try:
+                    owner_mention = f"<@{view.owner_id}>"
+                    await view.message.edit(content=view.drop_content(owner_mention))
+                except Exception:
+                    pass
+            return
+
+        # Thief: holder reacts 🥷 — disabled during purge (button handles that)
+        if name == "🥷" and is_pond_perk("thief", uid) and not is_purge_mode():
+            view = active_egg_drops.get(mid)
+            if view is None or view.claimed:
+                return
+            if payload.user_id == view.owner_id:
+                return
+            if payload.user_id in view.steal_failed:
+                return
+            channel = self.bot.get_channel(payload.channel_id)
+            member = payload.member
+            if member is None and channel and getattr(channel, "guild", None):
+                member = channel.guild.get_member(payload.user_id)
+            if random.random() < 0.5:
+                view.claimed = True
+                stealer_id = uid
+                add_eggs(stealer_id, view.egg_count, kind=view.effective_kind())
+                yb_add_earned(stealer_id, view.egg_count)
+                await save_duck_state()
+                view.stop()
+                egg_word = "egg" if view.egg_count == 1 else "eggs"
+                content = (
+                    f"🥷 <@{uid}> stole **{view.egg_count}** {egg_word} "
+                    f"from <@{view.owner_id}>!"
+                )
+                if view.message:
+                    try:
+                        await view.message.edit(content=content, view=None)
+                    except Exception:
+                        if channel:
+                            await channel.send(content, delete_after=20)
+                active_egg_drops.pop(mid, None)
+            else:
+                view.steal_failed.add(payload.user_id)
+                if channel:
+                    try:
+                        await channel.send(
+                            f"🥷 <@{uid}> failed to steal <@{view.owner_id}>'s drop.",
+                            delete_after=12,
+                        )
+                    except Exception:
+                        pass
+            return
+
     async def _process_rewind_reaction(self, payload: discord.RawReactionActionEvent):
         """Spend a rewind token to double a live drop or stack a second air drop."""
-        if not is_rewind_mode():
+        # Event tokens OR hourly status Rewinder (when event is off)
+        uid_early = str(payload.user_id)
+        if not is_rewind_mode() and not is_pond_perk("rewinder", uid_early):
             return
         if payload.guild_id is None or payload.user_id == self.bot.user.id:
             return
@@ -7165,6 +7690,30 @@ class DuckCog(commands.Cog):
     async def before_full_moon_purge_loop(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def pond_status_loop(self):
+        """Rotate pond status perk / mood about every hour."""
+        if not pond_status_state.get("enabled", True):
+            return
+        now = time.time()
+        exp = float(pond_status_state.get("expires_at") or 0)
+        # First boot or expired → roll immediately
+        if exp <= now:
+            try:
+                await rotate_pond_status(self.bot)
+            except Exception as e:
+                print(f"[pond_status] rotate failed: {e}")
+
+    @pond_status_loop.before_loop
+    async def before_pond_status_loop(self):
+        await self.bot.wait_until_ready()
+        # Apply current text on boot if still valid; else rotate next loop tick
+        if pond_status_active():
+            try:
+                await apply_pond_status_presence(self.bot)
+            except Exception:
+                pass
+
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
         entries = state.get("entries", {})
         pool_total = state.get("pool_total", NEST_BASELINE)
@@ -7617,6 +8166,13 @@ class DuckCog(commands.Cog):
         type: app_commands.Choice[str],
         amount: str,
     ):
+        if interaction.guild:
+            gid = str(interaction.guild.id)
+            if not duck_config.get(gid, {}).get("hatch_enabled", True):
+                return await interaction.response.send_message(
+                    "🐣 Hatching is currently **off** on this server.",
+                    ephemeral=True,
+                )
         await interaction.response.defer()
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
@@ -7743,6 +8299,46 @@ class DuckCog(commands.Cog):
         await interaction.response.send_message(
             embed=view.build_embed(), view=view, ephemeral=True
         )
+
+    @app_commands.command(name="perklegend", description="Explain pond status perks and curses.")
+    async def perklegend_cmd(self, interaction: discord.Interaction):
+        lines = [
+            "# 📖 Pond Status Legend",
+            "Every hour the bot may pick **one** active member for a perk/curse, or nobody.",
+            "Status shows `EMOJI Name` for perks, or a **mood line** when nobody is chosen.",
+            "",
+            "**Common**",
+            "❤️ Charm — 2× drop rate for everyone this hour",
+            "🌟 Blessed — replies can grant 1–3 eggs to others (cap 200/hour)",
+            "🎅 Santa — your gifts never lose eggs",
+            "🧼 Slippery — eggs you earn go straight to the nest",
+            "",
+            "**Uncommon**",
+            "🍀 Lucky — better hatch odds (common cut)",
+            "⏪ Rewinder — free drop rewinds (when Rewind event is off)",
+            "🧪 Infected — react 🧪 on unclaimed drops to rot them",
+            "🤢 Rotten Luck — your ground drops are rotten",
+            "🪞 Mirror — 50% chance the next chatter mirrors your egg gain",
+            "",
+            "**Rare**",
+            "🥷 Thief — react 🥷 to steal drops (50/50; off during Purge)",
+            "🎯 Auto Win — clear air drops as a ghost (doesn't take a slot)",
+            "🧲 Magnetic — max drop rate + max eggs for you",
+            "💔 Fragile — half eggs earned",
+            "",
+            "-# Eligible: 10+ qualifying messages in the last 48 hours.",
+        ]
+        emb = discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
+        cur = pond_status_state.get("status_text") or "—"
+        holder = pond_status_state.get("holder_id")
+        if pond_status_active():
+            left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
+            mins = left // 60
+            who = f"<@{holder}>" if holder else "nobody"
+            emb.set_footer(text=f"Now: {cur} · {who} · ~{mins}m left")
+        else:
+            emb.set_footer(text=f"Last: {cur}")
+        await interaction.response.send_message(embed=emb, ephemeral=True)
 
     @app_commands.command(name="yearbook", description="View live competitive Yearbook standings.")
     async def yearbook_cmd(self, interaction: discord.Interaction):
