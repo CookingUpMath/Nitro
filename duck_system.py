@@ -344,6 +344,32 @@ def get_nest_state(guild_id: str) -> dict:
     return state
 
 
+def is_nest_enabled(guild_id: str) -> bool:
+    return bool(duck_config.get(str(guild_id), {}).get("nest_enabled", True))
+
+
+def refund_nest_donations(guild_id: str) -> tuple[int, int]:
+    """Return each member's donated eggs (entries only, not doubled pool).
+
+    Clears the nest pool back to baseline. Does not touch already-paid
+    nest *prizes*. Returns (users_refunded, eggs_returned).
+    """
+    state = get_nest_state(str(guild_id))
+    entries = dict(state.get("entries") or {})
+    users = 0
+    eggs = 0
+    for uid, amt in entries.items():
+        amt = int(amt or 0)
+        if amt <= 0:
+            continue
+        add_eggs(str(uid), amt, kind="fresh", skip_status_mods=True)
+        users += 1
+        eggs += amt
+    state["entries"] = {}
+    state["pool_total"] = NEST_BASELINE
+    return users, eggs
+
+
 def format_nest_countdown() -> str:
     """Short-form time remaining until the next nest draw (Saturday 00:00 UTC)."""
     now = datetime.now(timezone.utc)
@@ -1922,7 +1948,7 @@ def add_eggs(discord_id: str, amount: int, kind: str = "fresh", *, skip_status_m
         if amount <= 0:
             return
 
-    # Slippery: divert fresh earnings into the community nest
+    # Slippery: divert fresh earnings into the community nest (if nest is online)
     if (
         not skip_status_mods
         and kind == "fresh"
@@ -1930,18 +1956,18 @@ def add_eggs(discord_id: str, amount: int, kind: str = "fresh", *, skip_status_m
         and amount > 0
     ):
         gid = pond_status_state.get("holder_guild_id")
-        if gid:
+        if gid and is_nest_enabled(str(gid)):
             st = get_nest_state(str(gid))
             st["pool_total"] = int(st.get("pool_total") or NEST_BASELINE) + amount
             entries = st.setdefault("entries", {})
             entries[discord_id] = int(entries.get(discord_id) or 0) + amount
-        # No inventory credit
-        if is_pond_perk("mirror", discord_id) and random.random() < 0.5:
-            pond_status_state["mirror_pending"] = {
-                "amount": amount,
-                "from_id": discord_id,
-            }
-        return
+            if is_pond_perk("mirror", discord_id) and random.random() < 0.5:
+                pond_status_state["mirror_pending"] = {
+                    "amount": amount,
+                    "from_id": discord_id,
+                }
+            return
+        # Nest offline → fall through and put eggs in inventory normally
 
     rec = get_user_record(discord_id)
     if kind == "rotten":
@@ -4121,26 +4147,34 @@ def build_system_toggles_embed(guild_id: str) -> discord.Embed:
     drops_on = cfg.get("hatching_enabled", True)
     air_on = cfg.get("air_drops_enabled", True)
     hatch_on = cfg.get("hatch_enabled", True)
+    nest_on = cfg.get("nest_enabled", True)
     status_on = pond_status_state.get("enabled", True)
     air_ch = cfg.get("air_drop_channel_id")
     air_line = f"{'🟢 ON' if air_on else '🔴 OFF'}"
     if air_ch:
         air_line += f" · <#{air_ch}>"
+    nest_state_now = get_nest_state(guild_id)
+    nest_entries = sum(int(v or 0) for v in (nest_state_now.get("entries") or {}).values())
+    nest_line = f"{'🟢 ON' if nest_on else '🔴 OFF'}"
+    if nest_on and nest_entries:
+        nest_line += f" · **{nest_entries}** donated this cycle"
     lines = [
         "# 🎛️ System Toggles",
         "",
         f"**🪂 Air Drops** — {air_line}",
         f"**🥚 Ground Drops** — {'🟢 ON' if drops_on else '🔴 OFF'}",
         f"**🐣 Hatch Command** — {'🟢 ON' if hatch_on else '🔴 OFF'}",
+        f"**🪺 Nest** — {nest_line}",
         f"**🎭 Status Perks** — {'🟢 ON' if status_on else '🔴 OFF'}",
         "",
-        "-# Each button flips that switch. Status perks are bot-wide; the rest are this server.",
+        "-# Nest OFF returns donated eggs to members (not past prizes).",
+        "-# Status perks are bot-wide; the rest are this server.",
     ]
     return discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
 
 
 class SystemTogglesView(discord.ui.View):
-    """Editor → Toggles: air drops, ground drops, /hatch, status perks."""
+    """Editor → Toggles: air drops, ground drops, /hatch, nest, status perks."""
 
     def __init__(self, guild_id: str):
         super().__init__(timeout=180)
@@ -4152,8 +4186,10 @@ class SystemTogglesView(discord.ui.View):
             return False
         return True
 
-    async def _refresh(self, interaction: discord.Interaction):
+    async def _refresh(self, interaction: discord.Interaction, extra: str | None = None):
+        content = extra or None
         await interaction.response.edit_message(
+            content=content,
             embed=build_system_toggles_embed(self.guild_id),
             view=self,
         )
@@ -4183,7 +4219,30 @@ class SystemTogglesView(discord.ui.View):
         await save_duck_state()
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Status Perks", style=discord.ButtonStyle.primary, emoji="🎭", row=0)
+    @discord.ui.button(label="Nest", style=discord.ButtonStyle.primary, emoji="🪺", row=0)
+    async def toggle_nest(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = duck_config.setdefault(self.guild_id, {})
+        turning_off = cfg.get("nest_enabled", True)
+        # turning_off True means currently ON → about to disable
+        if turning_off:
+            users, eggs = refund_nest_donations(self.guild_id)
+            cfg["nest_enabled"] = False
+            await save_duck_state()
+            note = (
+                f"🪺 Nest **OFF** — returned **{eggs}** donated egg(s) to **{users}** member(s). "
+                f"Past nest prizes are kept."
+            )
+            await self._refresh(interaction, extra=note)
+        else:
+            cfg["nest_enabled"] = True
+            # Fresh empty cycle
+            st = get_nest_state(self.guild_id)
+            st["entries"] = {}
+            st["pool_total"] = NEST_BASELINE
+            await save_duck_state()
+            await self._refresh(interaction, extra="🪺 Nest **ON** — open for donations again.")
+
+    @discord.ui.button(label="Status Perks", style=discord.ButtonStyle.primary, emoji="🎭", row=1)
     async def toggle_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         pond_status_state["enabled"] = not pond_status_state.get("enabled", True)
         if not pond_status_state["enabled"]:
@@ -4302,6 +4361,17 @@ class NestConfirmView(discord.ui.View):
 
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
+        guild_id = str(interaction.guild.id) if interaction.guild else None
+
+        if not guild_id or not is_nest_enabled(guild_id):
+            try:
+                await interaction.edit_original_response(
+                    content="The nest is currently offline",
+                    view=None,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
 
         if not try_spend_eggs(discord_id, self.amount, for_nest=True):
             free = donatable_egg_count(discord_id)
@@ -4315,7 +4385,6 @@ class NestConfirmView(discord.ui.View):
                 pass
             return
 
-        guild_id = str(interaction.guild.id)
         state = get_nest_state(guild_id)
         state["pool_total"] += self.amount * 2
         state["entries"][discord_id] = state["entries"].get(discord_id, 0) + self.amount
@@ -6565,6 +6634,8 @@ class DuckCog(commands.Cog):
         for guild in list(self.bot.guilds):
             guild_id_str = str(guild.id)
             try:
+                if not is_nest_enabled(guild_id_str):
+                    continue
                 state = get_nest_state(guild_id_str)
                 if state.get("last_reset_week") == week_id:
                     continue
@@ -7796,6 +7867,11 @@ class DuckCog(commands.Cog):
     @app_commands.command(name="nest", description="Donate eggs to the community nest for a chance to win it all.")
     @app_commands.describe(amount="How many eggs to donate")
     async def nest_cmd(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000]):
+        if not interaction.guild or not is_nest_enabled(str(interaction.guild.id)):
+            return await interaction.response.send_message(
+                "The nest is currently offline",
+                ephemeral=True,
+            )
         discord_id = str(interaction.user.id)
         rec = get_user_record(discord_id)
         free = donatable_egg_count(discord_id)
