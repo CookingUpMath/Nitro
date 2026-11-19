@@ -426,6 +426,8 @@ POND_STATUS_DURATION = 3600  # 1 hour
 POND_STATUS_ACTIVE_WINDOW = 48 * 3600
 POND_STATUS_MIN_MSGS = 10
 BLESSED_HOUR_CAP = 200
+# Charm only boosts drops while the holder has chatted recently
+CHARM_ACTIVE_SECONDS = 5 * 60  # 5 min after holder's last qualifying message
 
 # Mood lines when nobody holds a perk (no emoji — bot mood from drop odds)
 POND_STATUS_MOOD_LOW = [
@@ -469,13 +471,13 @@ POND_STATUS_MOOD_HIGH = [
 POND_PERKS = {
     "charm": ("❤️", "Charm", "common"),
     "blessed": ("🌟", "Blessed", "common"),
-    "santa": ("🎅", "Santa", "common"),
+    "santa": ("🧑‍🎄", "Santa", "common"),
     "slippery": ("🧼", "Slippery", "common"),
+    "mirror": ("🪞", "Mirror", "common"),
     "lucky": ("🍀", "Lucky", "uncommon"),
     "rewinder": ("⏪", "Rewinder", "uncommon"),
     "infected": ("🧪", "Infected", "uncommon"),
     "rotten_luck": ("🤢", "Rotten Luck", "uncommon"),
-    "mirror": ("🪞", "Mirror", "uncommon"),
     "thief": ("🥷", "Thief", "rare"),
     "auto_win": ("🎯", "Auto Win", "rare"),
     "magnetic": ("🧲", "Magnetic", "rare"),
@@ -490,8 +492,8 @@ POND_TIER_WEIGHTS = [
 ]
 # Within common: chance to be Nobody vs a real common perk
 POND_COMMON_NOBODY_WEIGHT = 55  # % of common rolls that are nobody
-POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery"]
-POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck", "mirror"]
+POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery", "mirror"]
+POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck"]
 POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile"]
 
 # Lucky hatcher: cut common ~in half, redistribute freed mass upward
@@ -513,6 +515,7 @@ pond_status_state: dict = {
     "status_text": "steady as usual",
     "blessed_eggs_given": 0,
     "mirror_pending": None,   # {"amount": int, "from_id": str} or None
+    "charm_last_active_at": 0.0,  # last qualifying msg from Charm holder
 }
 
 
@@ -1525,6 +1528,9 @@ def note_status_activity(discord_id: str) -> None:
     if last and (now - last) > POND_STATUS_ACTIVE_WINDOW:
         rec["status_msgs_48h"] = 0
     rec["status_msgs_48h"] = int(rec.get("status_msgs_48h") or 0) + 1
+    # Charm: only "on" while the holder is actually chatting
+    if is_pond_perk("charm", str(discord_id)):
+        pond_status_state["charm_last_active_at"] = now
 
 
 def eligible_pond_status_holders() -> list[str]:
@@ -1618,6 +1624,7 @@ async def rotate_pond_status(bot: commands.Bot) -> None:
     pond_status_state["status_text"] = status_text
     pond_status_state["blessed_eggs_given"] = 0
     pond_status_state["mirror_pending"] = None
+    pond_status_state["charm_last_active_at"] = 0.0
     pond_status_state["holder_guild_id"] = None
     if holder_id and bot.guilds:
         # Prefer a shared guild where the member is present
@@ -1633,13 +1640,21 @@ async def rotate_pond_status(bot: commands.Bot) -> None:
     print(f"[pond_status] {status_text} ({who}) until {pond_status_state['expires_at']:.0f}")
 
 
+def charm_is_hot() -> bool:
+    """True if Charm is active and the holder chatted within CHARM_ACTIVE_SECONDS."""
+    if not is_pond_perk("charm"):
+        return False
+    last = float(pond_status_state.get("charm_last_active_at") or 0)
+    return last > 0 and (time.time() - last) <= CHARM_ACTIVE_SECONDS
+
+
 def effective_drop_chance_percent(discord_id: str | None = None) -> float:
     """Base weather chance, modified by Charm / Magnetic."""
     base = float(environment_state.get("drop_chance_percent") or ENVIRONMENT_MIN_CHANCE)
     if is_pond_perk("magnetic", discord_id):
         return float(ENVIRONMENT_MAX_CHANCE)
-    if is_pond_perk("charm"):
-        # Whole hour: everyone enjoys x2 while Charm is active
+    # Charm: 2x for everyone only while the holder is actively chatting
+    if charm_is_hot():
         return min(100.0, base * 2.0)
     return base
 
@@ -7905,6 +7920,10 @@ class DuckCog(commands.Cog):
         fortune_name, success_rate = give_fortune_for_drop_chance(
             float(env.get("drop_chance_percent") or 10)
         )
+        # Santa: 100% duck gift success for the status holder
+        if is_pond_perk("santa", giver_id):
+            success_rate = 1.0
+            fortune_name = "Santa"
         fortune_line = f"🧧 The pond reads: **{fortune_name}**"
 
         if random.random() < success_rate:
@@ -8300,41 +8319,67 @@ class DuckCog(commands.Cog):
             embed=view.build_embed(), view=view, ephemeral=True
         )
 
-    @app_commands.command(name="perklegend", description="Explain pond status perks and curses.")
-    async def perklegend_cmd(self, interaction: discord.Interaction):
+    @app_commands.command(name="perks", description="Pond status perks, curses, and your eligibility.")
+    async def perks_cmd(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        rec = get_user_record(uid)
+        now = time.time()
+        last = float(rec.get("last_qualifying_activity_at") or 0)
+        msgs = int(rec.get("status_msgs_48h") or 0)
+        eligible = (
+            last > 0
+            and (now - last) <= POND_STATUS_ACTIVE_WINDOW
+            and msgs >= POND_STATUS_MIN_MSGS
+        )
+        elig_line = (
+            "## ```✅ Currently: Eligible ```"
+            if eligible
+            else f"## ```❌ Currently: Not eligible ({msgs}/{POND_STATUS_MIN_MSGS} msgs) ```"
+        )
         lines = [
-            "# 📖 Pond Status Legend",
-            "Every hour the bot may pick **one** active member for a perk/curse, or nobody.",
-            "Status shows `EMOJI Name` for perks, or a **mood line** when nobody is chosen.",
-            "",
-            "**Common**",
-            "❤️ Charm — 2× drop rate for everyone this hour",
-            "🌟 Blessed — replies can grant 1–3 eggs to others (cap 200/hour)",
-            "🎅 Santa — your gifts never lose eggs",
-            "🧼 Slippery — eggs you earn go straight to the nest",
-            "",
-            "**Uncommon**",
-            "🍀 Lucky — better hatch odds (common cut)",
-            "⏪ Rewinder — free drop rewinds (when Rewind event is off)",
-            "🧪 Infected — react 🧪 on unclaimed drops to rot them",
-            "🤢 Rotten Luck — your ground drops are rotten",
-            "🪞 Mirror — 50% chance the next chatter mirrors your egg gain",
-            "",
-            "**Rare**",
-            "🥷 Thief — react 🥷 to steal drops (50/50; off during Purge)",
-            "🎯 Auto Win — clear air drops as a ghost (doesn't take a slot)",
-            "🧲 Magnetic — max drop rate + max eggs for you",
-            "💔 Fragile — half eggs earned",
-            "",
-            "-# Eligible: 10+ qualifying messages in the last 48 hours.",
+            "**Every hour** the bot may pick **one** active member for a perk/curse, or nobody. "
+            "Status will display `EMOJI DisplayName` for perks, or a mood when nobody is chosen. "
+            f"**{POND_STATUS_MIN_MSGS}** messages in the last **48 hours** to qualify.",
+            elig_line,
+            "## Common",
+            "**`❤️` Charm**",
+            "-# 2x drop rate for everyone while Charm is actively chatting",
+            "**`🌟` Blessed**",
+            "-# Replies can grant 1-3 eggs to others (cap 200)",
+            "**`🧑‍🎄` Santa**",
+            "-# Your egg gifts never lose eggs; duck gifts always succeed",
+            "**`🧼` Slippery**",
+            "-# Eggs you earn go straight to the nest",
+            "**`🪞` Mirror**",
+            "-# 50% chance the next chatter mirrors your gain",
+            "## Uncommon",
+            "**`🍀` Lucky**",
+            "-# Better hatch odds (cuts common)",
+            "**`⏪` Rewinder**",
+            "-# The ability to rewind using ⏪ reaction",
+            "**`🧪` Infected**",
+            "-# React 🧪 on unclaimed drops to rot them",
+            "**`🤢` Rotten Luck**",
+            "-# Your ground drops are rotten",
+            "## Rare",
+            "**`🥷` Thief**",
+            "-# React 🥷 to steal drops (50/50 | off on Purge)",
+            "**`🎯` Auto Win**",
+            "-# Clear air drops as a ghost (doesn't take a slot)",
+            "**`🧲` Magnetic**",
+            "-# Max drop rate + max eggs for you",
+            "**`💔` Fragile**",
+            "-# Half eggs earned",
         ]
-        emb = discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
+        emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
         cur = pond_status_state.get("status_text") or "—"
         holder = pond_status_state.get("holder_id")
-        if pond_status_active():
+        if not pond_status_state.get("enabled", True):
+            emb.set_footer(text="Last: status perks off")
+        elif pond_status_active():
             left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
             mins = left // 60
-            who = f"<@{holder}>" if holder else "nobody"
+            who = f"@{holder}" if holder else "nobody"
             emb.set_footer(text=f"Now: {cur} · {who} · ~{mins}m left")
         else:
             emb.set_footer(text=f"Last: {cur}")
