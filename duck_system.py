@@ -1157,9 +1157,8 @@ LUCK_RARITIES = {"secret", "quackpot", "mythic", "error"}  # error via is_error 
 
 
 def _roll_egg_count() -> int:
-    table = REWIND_EGG_COUNT_WEIGHTS if environment_state.get("rewind_mode") else EGG_COUNT_WEIGHTS
-    counts = [c for c, _ in table]
-    weights = [w for _, w in table]
+    counts = [c for c, _ in EGG_COUNT_WEIGHTS]
+    weights = [w for _, w in EGG_COUNT_WEIGHTS]
     return random.choices(counts, weights=weights, k=1)[0]
 
 
@@ -1172,7 +1171,8 @@ def is_purge_mode() -> bool:
 
 
 def is_rewind_mode() -> bool:
-    return bool(environment_state.get("rewind_mode"))
+    """Rewind *event* package removed — always False. Status Rewinder is separate."""
+    return False
 
 
 def is_yearbook_enabled() -> bool:
@@ -1269,39 +1269,13 @@ def yb_add_msg(uid: str) -> None:
 
 
 def grant_rewind_from_hatch(uid: str, eggs_hatched: int) -> int:
-    """Award rewind tokens from hatched eggs. Returns tokens gained."""
-    if not is_rewind_mode() or eggs_hatched <= 0:
-        return 0
-    rec = get_user_record(uid)
-    progress = int(rec.get("rewind_hatch_progress") or 0) + eggs_hatched
-    tokens = int(rec.get("rewind_tokens") or 0)
-    gained = 0
-    while progress >= REWIND_EGGS_PER_TOKEN and tokens < REWIND_TOKEN_CAP:
-        progress -= REWIND_EGGS_PER_TOKEN
-        tokens += 1
-        gained += 1
-    if tokens >= REWIND_TOKEN_CAP:
-        # Keep leftover progress only if under cap path; still store remainder
-        pass
-    rec["rewind_hatch_progress"] = progress
-    rec["rewind_tokens"] = min(tokens, REWIND_TOKEN_CAP)
-    return gained
+    """No-op — Rewind event tokens removed. Status Rewinder does not use tokens."""
+    return 0
 
 
 def try_spend_rewind_token(uid: str) -> bool:
-    """Spend one rewind token. Status Rewinder holder gets free uses (no token)."""
-    uid = str(uid)
-    # Hourly status perk: free rewinds (suppressed while Rewind *event* is on)
-    if is_pond_perk("rewinder", uid) and not is_rewind_mode():
-        return True
-    if not is_rewind_mode():
-        return False
-    rec = get_user_record(uid)
-    tokens = int(rec.get("rewind_tokens") or 0)
-    if tokens < 1:
-        return False
-    rec["rewind_tokens"] = tokens - 1
-    return True
+    """Allow a free ⏪ only for the hourly Status Rewinder holder."""
+    return is_pond_perk("rewinder", str(uid))
 
 
 def rewind_weather_label(chance: float) -> str:
@@ -1612,22 +1586,19 @@ def roll_pond_status_selection() -> tuple[str | None, str | None, str]:
     for pid in candidates:
         if pid == "thief" and is_purge_mode():
             continue
-        if pid == "rewinder" and is_rewind_mode():
-            continue
         filtered.append(pid)
     if not filtered:
         text = pick_pond_status_mood(chance)
         return None, None, text
 
     perk_id = random.choice(filtered)
-    emoji, name, _t = POND_PERKS[perk_id]
     holders = eligible_pond_status_holders()
     if not holders:
         text = pick_pond_status_mood(chance)
         return None, None, text
     holder = random.choice(holders)
-    status_text = f"{emoji} {name}"
-    return perk_id, holder, status_text
+    # status_text filled in rotate_pond_status as "EMOJI DisplayName"
+    return perk_id, holder, ""
 
 
 async def apply_pond_status_presence(bot: commands.Bot) -> None:
@@ -1647,23 +1618,32 @@ async def rotate_pond_status(bot: commands.Bot) -> None:
     pond_status_state["perk_id"] = perk_id
     pond_status_state["holder_id"] = holder_id
     pond_status_state["expires_at"] = time.time() + POND_STATUS_DURATION
-    pond_status_state["status_text"] = status_text
     pond_status_state["blessed_eggs_given"] = 0
     pond_status_state["mirror_pending"] = None
     pond_status_state["charm_last_active_at"] = 0.0
     pond_status_state["holder_guild_id"] = None
-    if holder_id and bot.guilds:
-        # Prefer a shared guild where the member is present
+
+    if perk_id and holder_id:
+        emoji, _name, _t = POND_PERKS[perk_id]
+        display = None
         for g in bot.guilds:
-            if g.get_member(int(holder_id)):
+            member = g.get_member(int(holder_id))
+            if member is not None:
+                display = member.display_name
                 pond_status_state["holder_guild_id"] = str(g.id)
                 break
-        if not pond_status_state["holder_guild_id"]:
+        if not pond_status_state["holder_guild_id"] and bot.guilds:
             pond_status_state["holder_guild_id"] = str(bot.guilds[0].id)
+        if not display:
+            display = "Someone"
+        # Presence: perk emoji + member display name only (legend is /perks)
+        status_text = f"{emoji} {display}"[:128]
+
+    pond_status_state["status_text"] = status_text or pick_pond_status_mood()
     await save_duck_state()
     await apply_pond_status_presence(bot)
-    who = f"holder={holder_id}" if holder_id else "nobody"
-    print(f"[pond_status] {status_text} ({who}) until {pond_status_state['expires_at']:.0f}")
+    who = f"holder={holder_id} perk={perk_id}" if holder_id else "nobody"
+    print(f"[pond_status] {pond_status_state['status_text']} ({who}) until {pond_status_state['expires_at']:.0f}")
 
 
 def charm_is_hot() -> bool:
@@ -1688,7 +1668,7 @@ def effective_drop_chance_percent(discord_id: str | None = None) -> float:
 def effective_eggs_per_drop(discord_id: str | None = None) -> int:
     base = int(environment_state.get("egg_count") or 1)
     if is_pond_perk("magnetic", discord_id):
-        return 10 if is_rewind_mode() else 5
+        return 5
     return base
 
 
@@ -1898,7 +1878,7 @@ def award_karma(discord_id: str, points: int = 1):
         yb_add_karma(discord_id, points)
     # Normal: 10 karma → 1 egg. Rewind mode: 10 karma → 10 eggs.
     # Each conversion also has a tiny chance at an error egg (same as rotten item rate).
-    eggs_per_threshold = 10 if is_rewind_mode() else 1
+    eggs_per_threshold = 1
     error_eggs_found = 0
     while rec["karma"] >= KARMA_PER_EGG:
         rec["karma"] -= KARMA_PER_EGG
@@ -2048,7 +2028,7 @@ async def load_duck_state():
             environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
             environment_state.setdefault("error_mode", False)
             environment_state.setdefault("purge_mode", False)
-            environment_state.setdefault("rewind_mode", False)
+            environment_state["rewind_mode"] = False  # event package removed
             environment_state.setdefault("egg_emoji_fresh", "🥚")
             environment_state.setdefault("egg_emoji_rotten", "🦠")
             environment_state.setdefault("egg_emoji_error", "🪲")
@@ -2235,16 +2215,13 @@ def measure_air_drop_heat(guild_id: str) -> str:
 
 def schedule_next_air_drop(guild_id: str) -> float:
     """Set next_drop_at from current chat heat. Returns that timestamp."""
-    if is_rewind_mode() and random.random() < 0.10:
-        delay = 5 * 60  # 10% chance of a rapid follow-up drop
+    tier = measure_air_drop_heat(guild_id)
+    if tier == "hot":
+        delay = random.randint(AIR_DROP_HOT_MIN, AIR_DROP_HOT_MAX)
+    elif tier == "warm":
+        delay = random.randint(AIR_DROP_WARM_MIN, AIR_DROP_WARM_MAX)
     else:
-        tier = measure_air_drop_heat(guild_id)
-        if tier == "hot":
-            delay = random.randint(AIR_DROP_HOT_MIN, AIR_DROP_HOT_MAX)
-        elif tier == "warm":
-            delay = random.randint(AIR_DROP_WARM_MIN, AIR_DROP_WARM_MAX)
-        else:
-            delay = random.randint(AIR_DROP_QUIET_MIN, AIR_DROP_QUIET_MAX)
+        delay = random.randint(AIR_DROP_QUIET_MIN, AIR_DROP_QUIET_MAX)
     when = time.time() + delay
     get_air_drop_state(guild_id)["next_drop_at"] = when
     return when
@@ -3920,15 +3897,6 @@ class ErrorAdminView(discord.ui.View):
         err_mode.callback = self.toggle_error_mode
         self.add_item(err_mode)
 
-        rewind_on = is_rewind_mode()
-        rewind_btn = discord.ui.Button(
-            label="Rewind ON" if rewind_on else "Rewind",
-            style=discord.ButtonStyle.success if rewind_on else discord.ButtonStyle.secondary,
-            emoji="⏪",
-        )
-        rewind_btn.callback = self.toggle_rewind
-        self.add_item(rewind_btn)
-
     async def _edit(self, interaction: discord.Interaction):
         try:
             if not interaction.response.is_done():
@@ -3974,38 +3942,6 @@ class ErrorAdminView(discord.ui.View):
     async def toggle(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ErrorToggleModal())
 
-    async def toggle_rewind(self, interaction: discord.Interaction):
-        environment_state.setdefault("rewind_mode", False)
-        turning_on = not environment_state["rewind_mode"]
-        environment_state["rewind_mode"] = turning_on
-        # Re-roll daily egg count into 5–10 (on) or 1–5 (off)
-        environment_state["egg_count"] = _roll_egg_count()
-        await save_duck_state()
-        if turning_on:
-            msg = (
-                "⏪ **Rewind Mode ON**\n"
-                f"• Eggs per drop **5–10** (today: **{environment_state['egg_count']}**)\n"
-                f"• Tokens: **1 per {REWIND_EGGS_PER_TOKEN} hatched**, cap **{REWIND_TOKEN_CAP}**\n"
-                "• React ⏪ on drops (boost them / yourself) or air drops (exact clone)\n"
-                "• ~1/3 air drops are reverse-word challenges\n"
-                "• **10%** chance the next air drop is only **5 minutes** later\n"
-                "• **10 karma → 10 eggs** (instead of 1)\n"
-                "• 25% token refund when ⏪ boosting someone else's ground drop\n"
-                "• Retro weather labels on `/weather`"
-            )
-        else:
-            msg = (
-                "✅ **Rewind Mode OFF**\n"
-                "• Eggs per drop back to **1–5**\n"
-                "• ⏪ reactions ignored · tokens hidden from inventory\n"
-                "• Normal weather titles · normal air-drop mix"
-            )
-        await interaction.response.send_message(msg, ephemeral=True)
-        try:
-            self._rebuild_items()
-            await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True)
-        except Exception:
-            pass
 
     async def toggle_error_mode(self, interaction: discord.Interaction):
         environment_state.setdefault("error_mode", False)
@@ -6914,10 +6850,9 @@ class DuckCog(commands.Cog):
             return
 
     async def _process_rewind_reaction(self, payload: discord.RawReactionActionEvent):
-        """Spend a rewind token to double a live drop or stack a second air drop."""
-        # Event tokens OR hourly status Rewinder (when event is off)
+        """Status Rewinder only — free ⏪ on drops / air-drop clones."""
         uid_early = str(payload.user_id)
-        if not is_rewind_mode() and not is_pond_perk("rewinder", uid_early):
+        if not is_pond_perk("rewinder", uid_early):
             return
         if payload.guild_id is None or payload.user_id == self.bot.user.id:
             return
@@ -7163,11 +7098,7 @@ class DuckCog(commands.Cog):
 
     async def _post_air_drop(self, guild: discord.Guild, guild_id: str, channel: discord.TextChannel):
         eggs = random.randint(AIR_DROP_EGGS_MIN, AIR_DROP_EGGS_MAX)
-        if is_rewind_mode():
-            # ~1/3 reverse-word, rest normal
-            kind = random.choice(["messages", "reaction", "reverse"])
-        else:
-            kind = random.choice(["messages", "reaction"])
+        kind = random.choice(["messages", "reaction"])
         slots = roll_air_drop_slots()
 
         view = None
@@ -8049,19 +7980,6 @@ class DuckCog(commands.Cog):
             ]
             color = discord.Color.from_str("#000000")
             footer = "📶 Attempting to reconnect.."
-        elif is_rewind_mode():
-            label = rewind_weather_label(float(chance))
-            lines = [
-                f"# {label}",
-                drop_line,
-                eggs_line,
-                fortune_line,
-                "",
-                "⏪ Rewind Mode",
-                "-# 5–10 eggs/drop · ⏪ tokens · reverse-word air drops · retro skies",
-            ]
-            color = discord.Color.purple()
-            footer = "⏪ Tokens from hatching · /inventory"
         else:
             if chance <= 8:
                 label = "🌦️ Calm"
@@ -8216,10 +8134,6 @@ class DuckCog(commands.Cog):
             f"{egg_lines}"
             f"> **😇 Karma: {rec.get('karma', 0)}/{KARMA_PER_EGG}**\n"
         )
-        if is_rewind_mode():
-            description += (
-                f"> **⏪ Rewind tokens: {int(rec.get('rewind_tokens') or 0)}/{REWIND_TOKEN_CAP}**\n"
-            )
         if locked > 0:
             description += (
                 f"> -# 🔒 **{locked}** from nest wins (hatch/gift only · "
@@ -8432,7 +8346,7 @@ class DuckCog(commands.Cog):
             "**`🍀` Lucky**",
             "-# Better hatch odds (cuts common)",
             "**`⏪` Rewinder**",
-            "-# The ability to rewind using ⏪ reaction",
+            "-# Free ⏪ on drops / air drops for the hour",
             "**`🧪` Infected**",
             "-# React 🧪 on unclaimed drops to rot them",
             "**`🤢` Rotten Luck**",
