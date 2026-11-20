@@ -435,7 +435,7 @@ full_moon_purge_state: dict = {
 
 # Thanksgiving package — isolated toggle (/ty). No cross-talk with other events.
 THANKS_PHRASE = "i'm thankful for"
-THANKS_MIN_CHARS = 50  # meaningful letters/digits after the phrase
+THANKS_MIN_CHARS = 50  # characters after the phrase (spaces count)
 thanksgiving_state: dict = {
     "enabled": False,
     "channel_id": None,
@@ -443,6 +443,25 @@ thanksgiving_state: dict = {
     # user_id str -> message_id int (one submission per member)
     "submissions": {},
 }
+
+
+def _normalize_thanks_text(text: str) -> str:
+    """Normalize fancy apostrophes so “I’m” matches i'm."""
+    if not text:
+        return ""
+    for a in ("\u2019", "\u2018", "\u02bc", "\u0060", "´"):
+        text = text.replace(a, "'")
+    return text.strip()
+
+
+def _thanks_body_after_phrase(content: str) -> str | None:
+    """Return text after “I'm thankful for” if the message starts with it, else None."""
+    normalized = _normalize_thanks_text(content or "")
+    low = normalized.casefold()
+    if not low.startswith(THANKS_PHRASE):
+        return None
+    # Slice using the same length as the phrase on the normalized string
+    return normalized[len(THANKS_PHRASE) :].strip()
 
 # ---------------------------------------------------------------------------
 # Pond Status Perks (hourly presence) — duck-side, not Fortnite wins
@@ -7528,17 +7547,16 @@ class DuckCog(commands.Cog):
         duck_id = thanksgiving_state.get("duck_id")
         if not ch_id or not duck_id or duck_id not in duck_index:
             return
-        if message.channel.id != int(ch_id):
+        try:
+            if int(message.channel.id) != int(ch_id):
+                return
+        except (TypeError, ValueError):
             return
 
-        content = (message.content or "").strip()
-        low = content.casefold()
-        if not low.startswith(THANKS_PHRASE):
+        body = _thanks_body_after_phrase(message.content or "")
+        if body is None:
             return
 
-        body = content[len(THANKS_PHRASE):].strip() if low.startswith(THANKS_PHRASE) else content
-        # meaningful length of the thankful body
-        meaningful = _egg_drop_meaningful_len(body)
         uid = str(message.author.id)
         subs = thanksgiving_state.setdefault("submissions", {})
 
@@ -7557,7 +7575,8 @@ class DuckCog(commands.Cog):
                 pass
             return
 
-        if meaningful < THANKS_MIN_CHARS:
+        # Full body length after the phrase (spaces count) — not alnum-only
+        if len(body) < THANKS_MIN_CHARS:
             try:
                 await message.delete()
             except Exception:
@@ -7565,7 +7584,8 @@ class DuckCog(commands.Cog):
             try:
                 await message.author.send(
                     f"🦃 Your Thanksgiving post needs at least **{THANKS_MIN_CHARS}** "
-                    f"letters/numbers after “I'm thankful for…”. Try again with a fuller thought."
+                    f"characters after “I'm thankful for…”. "
+                    f"Yours had **{len(body)}**. Try again with a fuller thought."
                 )
             except Exception:
                 pass
@@ -7575,12 +7595,16 @@ class DuckCog(commands.Cog):
         rec = get_user_record(uid)
         if duck_id not in rec.get("collection", []):
             rec.setdefault("collection", []).append(duck_id)
-        subs[uid] = message.id
+        subs[uid] = int(message.id)
         await save_duck_state()
+        print(
+            f"[thanksgiving] rewarded {uid} duck={duck_id} "
+            f"msg={message.id} body_len={len(body)}"
+        )
         try:
             await message.add_reaction("🦃")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[thanksgiving] reaction failed: {e}")
 
     async def _revoke_thanksgiving(self, uid: str, reason: str):
         """Remove thanksgiving duck and clear submission."""
@@ -7633,12 +7657,9 @@ class DuckCog(commands.Cog):
         if not uid:
             return
         data = payload.data or {}
-        content = (data.get("content") or "").strip()
-        low = content.casefold()
-        ok = low.startswith(THANKS_PHRASE)
-        body = content[len(THANKS_PHRASE):].strip() if ok else ""
-        meaningful = _egg_drop_meaningful_len(body) if ok else 0
-        if not ok or meaningful < THANKS_MIN_CHARS:
+        content = data.get("content") or ""
+        body = _thanks_body_after_phrase(content)
+        if body is None or len(body) < THANKS_MIN_CHARS:
             await self._revoke_thanksgiving(
                 uid,
                 f"your post no longer starts with “I'm thankful for…” "
@@ -9087,8 +9108,8 @@ class ThanksgivingAdminView(discord.ui.View):
             f"**Reward duck:** {duck_s}",
             f"**Submissions:** **{n}**",
             "",
-            "-# Posts must start with **I'm thankful for…**",
-            f"-# At least **{THANKS_MIN_CHARS}** letters/numbers after that phrase",
+            "-# Posts must **start with** **I'm thankful for…**",
+            f"-# At least **{THANKS_MIN_CHARS}** characters after that phrase (spaces count)",
             "-# One post per member · delete/edit-below-min removes the duck",
         ]
         return discord.Embed(
