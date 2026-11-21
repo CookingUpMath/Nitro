@@ -557,11 +557,29 @@ pond_status_state: dict = {
     "holder_id": None,        # discord id str
     "holder_guild_id": None,
     "expires_at": 0.0,
-    "status_text": "steady as usual",
+    "status_text": "steady as usual",  # presence: EMOJI DisplayName or mood
+    "perk_label": None,       # footer: "🪞 Mirror" or mood text
     "blessed_eggs_given": 0,
     "mirror_pending": None,   # {"amount": int, "from_id": str} or None
     "charm_last_active_at": 0.0,  # last qualifying msg from Charm holder
 }
+
+
+def next_pond_status_hour_ts(now: float | None = None) -> float:
+    """Unix time of the next top-of-hour in America/New_York (status rotates on the hour)."""
+    eastern = ZoneInfo("America/New_York")
+    dt = (
+        datetime.now(eastern)
+        if now is None
+        else datetime.fromtimestamp(float(now), tz=eastern)
+    )
+    # If we're exactly on the hour, next boundary is +1h
+    base = dt.replace(minute=0, second=0, microsecond=0)
+    if dt > base:
+        base = base + timedelta(hours=1)
+    else:
+        base = base + timedelta(hours=1)
+    return base.timestamp()
 
 
 # Synodic month reference (UTC). Good enough for ±1h event windows.
@@ -1629,21 +1647,24 @@ async def apply_pond_status_presence(bot: commands.Bot) -> None:
 
 
 async def rotate_pond_status(bot: commands.Bot) -> None:
-    """Pick a new hourly perk/mood and push bot presence."""
+    """Pick a new perk/mood and push bot presence. Expires at next Eastern top-of-hour."""
     if not pond_status_state.get("enabled", True):
         return
     await ensure_environment_for_today()
     perk_id, holder_id, status_text = roll_pond_status_selection()
     pond_status_state["perk_id"] = perk_id
     pond_status_state["holder_id"] = holder_id
-    pond_status_state["expires_at"] = time.time() + POND_STATUS_DURATION
+    # Align to clock hours (ET), not a rolling 60 minutes from whenever we started
+    pond_status_state["expires_at"] = next_pond_status_hour_ts()
     pond_status_state["blessed_eggs_given"] = 0
     pond_status_state["mirror_pending"] = None
     pond_status_state["charm_last_active_at"] = 0.0
     pond_status_state["holder_guild_id"] = None
+    pond_status_state["perk_label"] = None
 
     if perk_id and holder_id:
-        emoji, _name, _t = POND_PERKS[perk_id]
+        emoji, name, _t = POND_PERKS[perk_id]
+        pond_status_state["perk_label"] = f"{emoji} {name}"
         display = None
         for g in bot.guilds:
             member = g.get_member(int(holder_id))
@@ -1657,12 +1678,20 @@ async def rotate_pond_status(bot: commands.Bot) -> None:
             display = "Someone"
         # Presence: perk emoji + member display name only (legend is /perks)
         status_text = f"{emoji} {display}"[:128]
+    else:
+        mood = status_text or pick_pond_status_mood()
+        status_text = mood
+        pond_status_state["perk_label"] = mood
 
-    pond_status_state["status_text"] = status_text or pick_pond_status_mood()
+    pond_status_state["status_text"] = status_text
     await save_duck_state()
     await apply_pond_status_presence(bot)
     who = f"holder={holder_id} perk={perk_id}" if holder_id else "nobody"
-    print(f"[pond_status] {pond_status_state['status_text']} ({who}) until {pond_status_state['expires_at']:.0f}")
+    print(
+        f"[pond_status] {pond_status_state['status_text']} "
+        f"label={pond_status_state.get('perk_label')} ({who}) "
+        f"until {pond_status_state['expires_at']:.0f}"
+    )
 
 
 def charm_is_hot() -> bool:
@@ -7730,27 +7759,33 @@ class DuckCog(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def pond_status_loop(self):
-        """Rotate pond status perk / mood about every hour."""
+        """Rotate pond status at each Eastern top-of-hour (and on first boot)."""
         if not pond_status_state.get("enabled", True):
             return
         now = time.time()
         exp = float(pond_status_state.get("expires_at") or 0)
-        # First boot or expired → roll immediately
+        # First boot (0) or past the hour boundary → roll now
         if exp <= now:
             try:
                 await rotate_pond_status(self.bot)
             except Exception as e:
                 print(f"[pond_status] rotate failed: {e}")
+                # Avoid tight failure loop — try again next minute, not every tick forever
+                pond_status_state["expires_at"] = now + 60
 
     @pond_status_loop.before_loop
     async def before_pond_status_loop(self):
         await self.bot.wait_until_ready()
-        # Apply current text on boot if still valid; else rotate next loop tick
+        # If a valid hour is already in progress, just restore presence;
+        # otherwise the loop will rotate on the first tick.
         if pond_status_active():
             try:
                 await apply_pond_status_presence(self.bot)
             except Exception:
                 pass
+        else:
+            # Force a rotate on first minute after ready
+            pond_status_state["expires_at"] = 0
 
     async def run_nest_reset(self, guild: discord.Guild, guild_id_str: str, state: dict):
         entries = state.get("entries", {})
@@ -8383,17 +8418,15 @@ class DuckCog(commands.Cog):
             "-# Half eggs earned",
         ]
         emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
-        cur = pond_status_state.get("status_text") or "—"
-        holder = pond_status_state.get("holder_id")
+        label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
         if not pond_status_state.get("enabled", True):
             emb.set_footer(text="Last: status perks off")
         elif pond_status_active():
             left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
             mins = left // 60
-            who = f"@{holder}" if holder else "nobody"
-            emb.set_footer(text=f"Now: {cur} · {who} · ~{mins}m left")
+            emb.set_footer(text=f"Now: {label} - {mins:02d}m remaining")
         else:
-            emb.set_footer(text=f"Last: {cur}")
+            emb.set_footer(text=f"Last: {label}")
         await interaction.response.send_message(embed=emb, ephemeral=True)
 
     @app_commands.command(name="yearbook", description="View live competitive Yearbook standings.")
