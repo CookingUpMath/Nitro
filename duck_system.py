@@ -1494,6 +1494,12 @@ def default_user_record():
         # Egg-gift karma farm cap: 10 counting gifts, then 48h cooldown
         "gift_karma_count": 0,
         "gift_karma_cooldown_until": 0,
+        # Pond status preferences (member-controlled via /perks)
+        "perk_reminder": False,       # DM when selected (opt-in)
+        "perk_off_enabled": False,    # skip selection during local quiet hours
+        "perk_off_start": 0,          # local hour 0–23 inclusive start
+        "perk_off_end": 0,            # local hour 0–23 exclusive end (cross-midnight OK)
+        "perk_off_tz": "America/New_York",
     }
 
 
@@ -1557,6 +1563,74 @@ def is_pond_perk(perk_id: str, discord_id: str | None = None) -> bool:
     return str(discord_id) == str(pond_status_state.get("holder_id") or "")
 
 
+# Short timezone labels → IANA (global server; users type short codes)
+_TZ_SHORTCUTS = {
+    "et": "America/New_York", "est": "America/New_York", "edt": "America/New_York",
+    "eastern": "America/New_York", "ny": "America/New_York", "nyc": "America/New_York",
+    "toronto": "America/Toronto", "ca": "America/Toronto", "canada": "America/Toronto",
+    "ct": "America/Chicago", "cst": "America/Chicago", "cdt": "America/Chicago", "central": "America/Chicago",
+    "mt": "America/Denver", "mst": "America/Denver", "mdt": "America/Denver", "mountain": "America/Denver",
+    "pt": "America/Los_Angeles", "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles",
+    "pacific": "America/Los_Angeles", "la": "America/Los_Angeles",
+    "az": "America/Phoenix", "phoenix": "America/Phoenix",
+    "utc": "UTC", "gmt": "UTC", "z": "UTC",
+    "uk": "Europe/London", "bst": "Europe/London", "london": "Europe/London",
+    "cet": "Europe/Paris", "cest": "Europe/Paris", "eu": "Europe/Paris", "paris": "Europe/Paris",
+    "berlin": "Europe/Berlin", "de": "Europe/Berlin",
+    "ist": "Asia/Kolkata", "india": "Asia/Kolkata",
+    "jst": "Asia/Tokyo", "tokyo": "Asia/Tokyo", "jp": "Asia/Tokyo",
+    "aest": "Australia/Sydney", "aedt": "Australia/Sydney", "sydney": "Australia/Sydney", "au": "Australia/Sydney",
+    "nz": "Pacific/Auckland", "nzst": "Pacific/Auckland",
+    "sgt": "Asia/Singapore", "singapore": "Asia/Singapore",
+    "hkt": "Asia/Hong_Kong", "hk": "Asia/Hong_Kong",
+    "kst": "Asia/Seoul", "kr": "Asia/Seoul",
+    "brt": "America/Sao_Paulo", "br": "America/Sao_Paulo",
+}
+
+
+def resolve_timezone_input(raw: str) -> str | None:
+    """Map short codes or IANA names to a valid zone. None if unknown."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    key = s.casefold().replace(" ", "_")
+    if key in _TZ_SHORTCUTS:
+        return _TZ_SHORTCUTS[key]
+    # Accept dotted / underscored IANA as typed
+    for candidate in (s, s.replace(" ", "_"), key):
+        try:
+            ZoneInfo(candidate)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def user_in_perk_off_hours(rec: dict, when: float | None = None) -> bool:
+    """True if this member's local clock is inside their off-hours window."""
+    if not rec.get("perk_off_enabled"):
+        return False
+    tz_name = rec.get("perk_off_tz") or "America/New_York"
+    try:
+        tz = ZoneInfo(str(tz_name))
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    now = datetime.fromtimestamp(when if when is not None else time.time(), tz=tz)
+    hour = now.hour
+    try:
+        start = int(rec.get("perk_off_start") or 0) % 24
+        end = int(rec.get("perk_off_end") or 0) % 24
+    except (TypeError, ValueError):
+        return False
+    if start == end:
+        # Full-day quiet if enabled with identical ends — treat as always off
+        return True
+    if start < end:
+        return start <= hour < end
+    # Crosses midnight e.g. 22 → 8
+    return hour >= start or hour < end
+
+
 def note_status_activity(discord_id: str) -> None:
     """Rolling 48h qualifying message count for status eligibility."""
     rec = get_user_record(discord_id)
@@ -1571,7 +1645,7 @@ def note_status_activity(discord_id: str) -> None:
 
 
 def eligible_pond_status_holders() -> list[str]:
-    """Members active in last 48h with enough qualifying messages."""
+    """Members active in last 48h with enough msgs, not in personal off-hours."""
     now = time.time()
     out = []
     for uid, rec in duck_users.items():
@@ -1579,6 +1653,8 @@ def eligible_pond_status_holders() -> list[str]:
         if not last or (now - last) > POND_STATUS_ACTIVE_WINDOW:
             continue
         if int(rec.get("status_msgs_48h") or 0) < POND_STATUS_MIN_MSGS:
+            continue
+        if user_in_perk_off_hours(rec, now):
             continue
         out.append(str(uid))
     return out
@@ -1692,6 +1768,21 @@ async def rotate_pond_status(bot: commands.Bot) -> None:
         f"label={pond_status_state.get('perk_label')} ({who}) "
         f"until {pond_status_state['expires_at']:.0f}"
     )
+    # Opt-in reminder DM (skipped if they somehow had off-hours — already filtered)
+    if perk_id and holder_id:
+        try:
+            rec = get_user_record(holder_id)
+            if rec.get("perk_reminder") and not user_in_perk_off_hours(rec):
+                label = pond_status_state.get("perk_label") or perk_id
+                left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
+                mins = left // 60
+                user = await bot.fetch_user(int(holder_id))
+                await user.send(
+                    f"**{label}** is on you for about **{mins}** minute(s).\n"
+                    f"-# Presence shows your name · details in `/perks`"
+                )
+        except Exception as e:
+            print(f"[pond_status] reminder DM failed for {holder_id}: {e}")
 
 
 def charm_is_hot() -> bool:
@@ -1851,6 +1942,11 @@ def get_user_record(discord_id: str) -> dict:
     rec.setdefault("activity_msgs_today", 0)
     rec.setdefault("gift_karma_count", 0)
     rec.setdefault("gift_karma_cooldown_until", 0)
+    rec.setdefault("perk_reminder", False)
+    rec.setdefault("perk_off_enabled", False)
+    rec.setdefault("perk_off_start", 0)
+    rec.setdefault("perk_off_end", 0)
+    rec.setdefault("perk_off_tz", "America/New_York")
     # One-time style cleanup: duplicate ids inflate /collection summary
     col = rec.get("collection")
     if isinstance(col, list) and len(col) != len(set(col)):
@@ -4245,6 +4341,187 @@ class SystemTogglesView(discord.ui.View):
             pond_status_state["expires_at"] = 0
         await save_duck_state()
         await self._refresh(interaction)
+
+
+
+def build_perks_embed(discord_id: str) -> discord.Embed:
+    """Public /perks legend + eligibility + personal reminder/off-hours state."""
+    rec = get_user_record(discord_id)
+    now = time.time()
+    last = float(rec.get("last_qualifying_activity_at") or 0)
+    msgs = int(rec.get("status_msgs_48h") or 0)
+    eligible = (
+        last > 0
+        and (now - last) <= POND_STATUS_ACTIVE_WINDOW
+        and msgs >= POND_STATUS_MIN_MSGS
+    )
+    elig_line = (
+        "## ```✅ Currently: Eligible ```"
+        if eligible
+        else f"## ```❌ Currently: Not eligible ({msgs}/{POND_STATUS_MIN_MSGS} msgs) ```"
+    )
+    lines = [
+        "**Every hour** the bot may pick **one** active member for a perk/curse, or nobody. "
+        "Status will display `EMOJI DisplayName` for perks, or a mood when nobody is chosen. "
+        f"**{POND_STATUS_MIN_MSGS}** messages in the last **48 hours** to qualify.",
+        elig_line,
+    ]
+    if rec.get("perk_off_enabled"):
+        lines.append("-# ⚠️ Off-hours currently enabled")
+    lines += [
+        "## Common",
+        "**`❤️` Charm**",
+        "-# 2x drop rate for everyone while Charm is actively chatting",
+        "**`🌟` Blessed**",
+        "-# Replies can grant 1-3 eggs to others (cap 200)",
+        "**`🧑‍🎄` Santa**",
+        "-# Your egg gifts never lose eggs; duck gifts always succeed",
+        "**`🧼` Slippery**",
+        "-# Eggs you earn go straight to the nest",
+        "**`🪞` Mirror**",
+        "-# 50% chance the next chatter mirrors your gain",
+        "## Uncommon",
+        "**`🍀` Lucky**",
+        "-# Better hatch odds (cuts common)",
+        "**`⏪` Rewinder**",
+        "-# Free ⏪ on drops / air drops for the hour",
+        "**`🧪` Infected**",
+        "-# React 🧪 on unclaimed drops to rot them",
+        "**`🤢` Rotten Luck**",
+        "-# Your ground drops are rotten",
+        "## Rare",
+        "**`🥷` Thief**",
+        "-# React 🥷 to steal drops (50/50 | off on Purge)",
+        "**`🎯` Auto Win**",
+        "-# Clear air drops as a ghost (doesn't take a slot)",
+        "**`🧲` Magnetic**",
+        "-# Max drop rate + max eggs for you",
+        "**`💔` Fragile**",
+        "-# Half eggs earned",
+    ]
+    emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
+    label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
+    if not pond_status_state.get("enabled", True):
+        emb.set_footer(text="Last: status perks off")
+    elif pond_status_active():
+        left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
+        mins = left // 60
+        emb.set_footer(text=f"Now: {label} - {mins:02d}m remaining")
+    else:
+        emb.set_footer(text=f"Last: {label}")
+    return emb
+
+
+class PerkOffHoursModal(discord.ui.Modal, title="Off-hours"):
+    """Hour-only quiet window in the member's timezone."""
+
+    start_hour = discord.ui.TextInput(
+        label="Start hour (0–23)",
+        placeholder="22",
+        max_length=2,
+        required=True,
+    )
+    end_hour = discord.ui.TextInput(
+        label="End hour (0–23, exclusive)",
+        placeholder="8",
+        max_length=2,
+        required=True,
+    )
+    timezone = discord.ui.TextInput(
+        label="Timezone short or IANA",
+        placeholder="ET, PT, UTC, Europe/London…",
+        max_length=40,
+        required=True,
+    )
+
+    def __init__(self, user_id: int):
+        super().__init__()
+        self.user_id = user_id
+        rec = get_user_record(str(user_id))
+        self.start_hour.default = str(int(rec.get("perk_off_start") or 0))
+        self.end_hour.default = str(int(rec.get("perk_off_end") or 0))
+        self.timezone.default = str(rec.get("perk_off_tz") or "ET")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            start = int(str(self.start_hour.value).strip())
+            end = int(str(self.end_hour.value).strip())
+        except ValueError:
+            return await interaction.response.send_message(
+                "Hours must be whole numbers from **0** to **23**.", ephemeral=True
+            )
+        if not (0 <= start <= 23 and 0 <= end <= 23):
+            return await interaction.response.send_message(
+                "Hours must be between **0** and **23**.", ephemeral=True
+            )
+        tz = resolve_timezone_input(str(self.timezone.value))
+        if not tz:
+            return await interaction.response.send_message(
+                "Unknown timezone. Try a short code like **ET**, **PT**, **UTC**, "
+                "**UK**, **JST**, or a full name like **Europe/London**.",
+                ephemeral=True,
+            )
+        rec = get_user_record(str(self.user_id))
+        rec["perk_off_start"] = start
+        rec["perk_off_end"] = end
+        rec["perk_off_tz"] = tz
+        rec["perk_off_enabled"] = True
+        await save_duck_state()
+        cross = " (crosses midnight)" if start > end else ""
+        await interaction.response.edit_message(
+            embed=build_perks_embed(str(self.user_id)),
+            view=PerksMenuView(self.user_id),
+        )
+        await interaction.followup.send(
+            f"⚠️ Off-hours **ON**: **{start:02d}:00–{end:02d}:00** local "
+            f"({tz}){cross}. You won't be picked for perks in that window.",
+            ephemeral=True,
+        )
+
+
+class PerksMenuView(discord.ui.View):
+    """Reminder + off-hours controls under /perks."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu is only for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Reminder", style=discord.ButtonStyle.primary, emoji="🔔", row=0)
+    async def toggle_reminder(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rec = get_user_record(str(self.owner_id))
+        rec["perk_reminder"] = not bool(rec.get("perk_reminder"))
+        await save_duck_state()
+        on = rec["perk_reminder"]
+        await interaction.response.edit_message(
+            embed=build_perks_embed(str(self.owner_id)),
+            view=self,
+        )
+        await interaction.followup.send(
+            f"🔔 Perk reminders are now **{'ON' if on else 'OFF'}**."
+            + (" You'll get a DM when you're selected." if on else ""),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Off-hours", style=discord.ButtonStyle.secondary, emoji="🌙", row=0)
+    async def off_hours(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PerkOffHoursModal(self.owner_id))
+
+    @discord.ui.button(label="Clear off-hours", style=discord.ButtonStyle.danger, emoji="☀️", row=0)
+    async def clear_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rec = get_user_record(str(self.owner_id))
+        rec["perk_off_enabled"] = False
+        await save_duck_state()
+        await interaction.response.edit_message(
+            embed=build_perks_embed(str(self.owner_id)),
+            view=self,
+        )
+        await interaction.followup.send("☀️ Off-hours cleared — you can be selected any hour.", ephemeral=True)
 
 
 class DuckGivingToggleView(discord.ui.View):
@@ -8368,66 +8645,12 @@ class DuckCog(commands.Cog):
     @app_commands.command(name="perks", description="Pond status perks, curses, and your eligibility.")
     async def perks_cmd(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
-        rec = get_user_record(uid)
-        now = time.time()
-        last = float(rec.get("last_qualifying_activity_at") or 0)
-        msgs = int(rec.get("status_msgs_48h") or 0)
-        eligible = (
-            last > 0
-            and (now - last) <= POND_STATUS_ACTIVE_WINDOW
-            and msgs >= POND_STATUS_MIN_MSGS
+        emb = build_perks_embed(uid)
+        await interaction.response.send_message(
+            embed=emb,
+            view=PerksMenuView(interaction.user.id),
+            ephemeral=True,
         )
-        elig_line = (
-            "## ```✅ Currently: Eligible ```"
-            if eligible
-            else f"## ```❌ Currently: Not eligible ({msgs}/{POND_STATUS_MIN_MSGS} msgs) ```"
-        )
-        lines = [
-            "**Every hour** the bot may pick **one** active member for a perk/curse, or nobody. "
-            "Status will display `EMOJI DisplayName` for perks, or a mood when nobody is chosen. "
-            f"**{POND_STATUS_MIN_MSGS}** messages in the last **48 hours** to qualify.",
-            elig_line,
-            "## Common",
-            "**`❤️` Charm**",
-            "-# 2x drop rate for everyone while Charm is actively chatting",
-            "**`🌟` Blessed**",
-            "-# Replies can grant 1-3 eggs to others (cap 200)",
-            "**`🧑‍🎄` Santa**",
-            "-# Your egg gifts never lose eggs; duck gifts always succeed",
-            "**`🧼` Slippery**",
-            "-# Eggs you earn go straight to the nest",
-            "**`🪞` Mirror**",
-            "-# 50% chance the next chatter mirrors your gain",
-            "## Uncommon",
-            "**`🍀` Lucky**",
-            "-# Better hatch odds (cuts common)",
-            "**`⏪` Rewinder**",
-            "-# Free ⏪ on drops / air drops for the hour",
-            "**`🧪` Infected**",
-            "-# React 🧪 on unclaimed drops to rot them",
-            "**`🤢` Rotten Luck**",
-            "-# Your ground drops are rotten",
-            "## Rare",
-            "**`🥷` Thief**",
-            "-# React 🥷 to steal drops (50/50 | off on Purge)",
-            "**`🎯` Auto Win**",
-            "-# Clear air drops as a ghost (doesn't take a slot)",
-            "**`🧲` Magnetic**",
-            "-# Max drop rate + max eggs for you",
-            "**`💔` Fragile**",
-            "-# Half eggs earned",
-        ]
-        emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
-        label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
-        if not pond_status_state.get("enabled", True):
-            emb.set_footer(text="Last: status perks off")
-        elif pond_status_active():
-            left = max(0, int(float(pond_status_state.get("expires_at") or 0) - time.time()))
-            mins = left // 60
-            emb.set_footer(text=f"Now: {label} - {mins:02d}m remaining")
-        else:
-            emb.set_footer(text=f"Last: {label}")
-        await interaction.response.send_message(embed=emb, ephemeral=True)
 
     @app_commands.command(name="yearbook", description="View live competitive Yearbook standings.")
     async def yearbook_cmd(self, interaction: discord.Interaction):
