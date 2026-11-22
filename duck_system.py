@@ -541,14 +541,14 @@ POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery", "mirror"]
 POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck"]
 POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile"]
 
-# Lucky hatcher: cut common ~in half, redistribute freed mass upward
+# Lucky hatcher: no common rolls — mass moved into higher tiers
 LUCKY_RARITY_WEIGHTS = {
-    "common": 30.0,
-    "rare": 35.0,
-    "legendary": 18.0,
-    "divine": 9.0,
-    "secret": 5.0,
-    "quackpot": 3.0,
+    "common": 0.0,
+    "rare": 48.0,
+    "legendary": 26.0,
+    "divine": 14.0,
+    "secret": 8.0,
+    "quackpot": 4.0,
 }
 
 pond_status_state: dict = {
@@ -1598,15 +1598,34 @@ _TZ_SHORTCUTS = {
 
 
 def resolve_timezone_input(raw: str) -> str | None:
-    """Map short codes or IANA names to a valid zone. None if unknown."""
-    s = (raw or "").strip()
+    """Map short codes or IANA names to a valid zone. Case-insensitive."""
+    s = (raw or "").strip().strip(".")
     if not s:
         return None
-    key = s.casefold().replace(" ", "_")
+    # Strip common noise: "ET.", "e.t.", "US Eastern"
+    key = s.casefold().replace(" ", "_").replace(".", "").replace("-", "_")
     if key in _TZ_SHORTCUTS:
         return _TZ_SHORTCUTS[key]
-    # Accept dotted / underscored IANA as typed
-    for candidate in (s, s.replace(" ", "_"), key):
+    # Title-case IANA segments: america/new_york → America/New_York
+    def _iana_title(text: str) -> str:
+        parts = text.replace(" ", "_").split("/")
+        return "/".join(
+            "_".join(seg.capitalize() for seg in part.split("_"))
+            for part in parts
+        )
+
+    candidates = [
+        s,
+        s.replace(" ", "_"),
+        key,
+        _iana_title(s),
+        _iana_title(s.casefold()),
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             ZoneInfo(candidate)
             return candidate
@@ -2165,6 +2184,12 @@ async def load_duck_state():
             tg = data.get("duck_thanksgiving")
             if isinstance(tg, dict):
                 thanksgiving_state.update(tg)
+                # Keys must always be str discord ids
+                raw = thanksgiving_state.get("submissions") or {}
+                if isinstance(raw, dict):
+                    thanksgiving_state["submissions"] = {
+                        str(k): int(v) for k, v in raw.items() if v is not None
+                    }
             ps = data.get("duck_pond_status")
             if isinstance(ps, dict):
                 pond_status_state.update(ps)
@@ -2574,8 +2599,12 @@ def roll_duck_id(*, rotten: bool = False, error_egg: bool = False, lucky: bool =
         table = LUCKY_RARITY_WEIGHTS
     else:
         table = RARITY_WEIGHTS
-    available_tiers = [r for r in RARITY_ORDER if by_rarity[r]]
-    weights = [table[r] for r in available_tiers]
+    # Skip tiers with no ducks or zero weight (Lucky must never roll common)
+    available_tiers = [
+        r for r in RARITY_ORDER
+        if by_rarity[r] and float(table.get(r) or 0) > 0
+    ]
+    weights = [float(table[r]) for r in available_tiers]
 
     # ERROR ducks only on fresh (or dedicated error-egg hatches) — never from rotten
     if error_ducks and not rotten:
@@ -4392,7 +4421,7 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         "-# 50% chance the next chatter mirrors your gain",
         "## Uncommon",
         "**`🍀` Lucky**",
-        "-# Better hatch odds (cuts common)",
+        "-# No common hatches — odds shifted up the tiers",
         "**`⏪` Rewinder**",
         "-# Free ⏪ on drops / air drops for the hour",
         "**`🧪` Infected**",
@@ -7889,22 +7918,40 @@ class DuckCog(commands.Cog):
             return
 
         uid = str(message.author.id)
-        subs = thanksgiving_state.setdefault("submissions", {})
+        # Normalize keys to str (old saves may have mixed types)
+        raw_subs = thanksgiving_state.setdefault("submissions", {})
+        subs = {str(k): v for k, v in raw_subs.items()}
+        thanksgiving_state["submissions"] = subs
 
-        # Second submission: delete the new post, no duck
+        # Second submission: only block if a prior post still exists in-channel
         if uid in subs:
+            stale = False
             try:
-                await message.delete()
-            except Exception:
-                pass
-            try:
-                await message.author.send(
-                    "🦃 You already submitted a Thanksgiving post for this event — "
-                    "only **one** counts. Extra posts are removed."
-                )
-            except Exception:
-                pass
-            return
+                old_mid = int(subs[uid])
+                try:
+                    await message.channel.fetch_message(old_mid)
+                except discord.NotFound:
+                    stale = True
+                except discord.HTTPException:
+                    # Can't verify — treat as real double to be safe
+                    stale = False
+            except (TypeError, ValueError):
+                stale = True
+            if stale:
+                subs.pop(uid, None)
+            else:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    await message.author.send(
+                        "🦃 You already submitted a Thanksgiving post for this event — "
+                        "only **one** counts. Extra posts are removed."
+                    )
+                except Exception:
+                    pass
+                return
 
         # Full body length after the phrase (spaces count) — not alnum-only
         if len(body) < THANKS_MIN_CHARS:
