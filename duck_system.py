@@ -796,6 +796,7 @@ def build_yearbook_seat_embed(
     user_id: str | None = None,
     color: int = 0xF02AE0,
     avatar_url: str | None = None,
+    empty_label: str | None = None,
 ) -> discord.Embed:
     if user_id:
         body = (
@@ -804,9 +805,10 @@ def build_yearbook_seat_embed(
             f"-# ❝{line}❞"
         )
     else:
+        label = empty_label or "Awaiting winners"
         body = (
             f"# ⭐️ {title}\n"
-            f"## Awaiting winners\n"
+            f"## {label}\n"
             f"-# ❝{line}❞"
         )
     emb = discord.Embed(description=body, color=discord.Color(color))
@@ -1016,15 +1018,22 @@ async def publish_yearbook_board(bot: commands.Bot, winners: list | None = None)
         for i, seat in enumerate(seats):
             placed = by_title.get(seat["title"]) or []
             if placed:
-                # One embed per tied winner for that title
+                # One embed per tied winner, or a single "Nominations not met" placeholder
                 for j, w in enumerate(placed):
+                    if w.get("unmet") or not w.get("user_id"):
+                        embeds.append(build_yearbook_seat_embed(
+                            seat["title"], seat.get("line") or "",
+                            color=colors[i],
+                            empty_label="Nominations not met",
+                        ))
+                        break
                     uid = w.get("user_id")
                     member = guild.get_member(int(uid)) if uid else None
                     av = member.display_avatar.url if member else None
                     col = colors[i] if j == 0 else yearbook_color_sequence(2)[1]
                     embeds.append(build_yearbook_seat_embed(
                         seat["title"], seat.get("line") or "",
-                        user_id=str(uid) if uid else None,
+                        user_id=str(uid),
                         color=col,
                         avatar_url=av,
                     ))
@@ -4366,7 +4375,8 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         f"**{POND_STATUS_MIN_MSGS}** messages in the last **48 hours** to qualify.",
         elig_line,
     ]
-    if rec.get("perk_off_enabled"):
+    # Only show while the member is inside their quiet window (not merely configured)
+    if user_in_perk_off_hours(rec, now):
         lines.append("-# ⚠️ Off-hours currently enabled")
     lines += [
         "## Common",
@@ -7708,6 +7718,7 @@ class DuckCog(commands.Cog):
                     "score": best_n,
                 })
         # Nominations — min votes required; exact first-place ties all win
+        nom_titles_resolved = set()
         for t in titles_snapshot:
             title = t["title"]
             seat = votes_snapshot.get(title) or {}
@@ -7721,6 +7732,16 @@ class DuckCog(commands.Cog):
                 if c > best_n:
                     best_n = c
             if best_n < YEARBOOK_NOMINATE_MIN_VOTES:
+                # Placeholder so the board can show “Nominations not met”
+                winners.append({
+                    "kind": "nom",
+                    "title": title,
+                    "line": t.get("line") or "",
+                    "user_id": None,
+                    "score": 0,
+                    "unmet": True,
+                })
+                nom_titles_resolved.add(title)
                 continue
             tied = []
             for nid, entry in seat.items():
@@ -7740,17 +7761,21 @@ class DuckCog(commands.Cog):
                     "score": best_n,
                     "tie_count": len(tied),
                 })
+            nom_titles_resolved.add(title)
 
         eggs_amt = int(yearbook_state.get("winner_eggs") or 500)
         duck_id = yearbook_state.get("winner_duck_id")
         role_id = yearbook_state.get("role_id")
 
-        # Pay winners first; only then mark resolved / clear (so a crash mid-pay can retry)
+        # Pay real winners only (skip unmet nomination placeholders)
+        paid = []
         for w in winners:
-            uid = w["user_id"]
+            if w.get("unmet") or not w.get("user_id"):
+                continue
+            uid = str(w["user_id"])
             share = eggs_amt
             if w.get("kind") == "nom" and int(w.get("tie_count") or 1) > 1:
-                share = eggs_amt // int(w["tie_count"])
+                share = max(1, eggs_amt // int(w["tie_count"]))
             w["eggs_awarded"] = share
             add_eggs(uid, share, kind="fresh")
             rec = get_user_record(uid)
@@ -7760,14 +7785,14 @@ class DuckCog(commands.Cog):
                 w["duck_given"] = True
             else:
                 w["duck_given"] = False
+            paid.append(w)
 
-        if winners:
-            yearbook_state["last_winners"] = winners
-        else:
-            # Do NOT wipe prior board names when this cycle had nobody to pay
+        # Always store this cycle's results (includes unmet nom seats for board text)
+        yearbook_state["last_winners"] = winners
+        if not paid:
             print(
-                f"[yearbook] {wid}: 0 winners "
-                f"(stats_users={stats_n}, vote_seats={votes_n}) — keeping previous last_winners on board"
+                f"[yearbook] {wid}: 0 paid winners "
+                f"(stats_users={stats_n}, vote_seats={votes_n}) — board will show unmet noms if any"
             )
 
         yearbook_state["last_resolved_week"] = wid
@@ -7777,10 +7802,12 @@ class DuckCog(commands.Cog):
         await save_duck_state()
         print(f"[yearbook] resolved {wid}: {len(winners)} winner slot(s)")
 
-        # Roles + DMs
+        # Roles + DMs (real winners only)
         for guild in self.bot.guilds:
             role = guild.get_role(int(role_id)) if role_id else None
             for w in winners:
+                if w.get("unmet") or not w.get("user_id"):
+                    continue
                 member = guild.get_member(int(w["user_id"]))
                 if member and role and role not in member.roles:
                     try:
@@ -7809,23 +7836,21 @@ class DuckCog(commands.Cog):
                     except Exception:
                         pass
 
-        # Board: only republish when we have new winners (avoids blanking the channel)
-        if winners:
-            # Temporarily ensure seat titles match this cycle for nomination embeds
-            yearbook_state["nominate_titles"] = titles_snapshot
-            try:
-                status = await publish_yearbook_board(self.bot, winners)
-                print(f"[yearbook] board: {status}")
-            except Exception as e:
-                print(f"[yearbook] board publish failed: {e}")
+        # Always republish so competitive winners + “Nominations not met” seats show
+        yearbook_state["nominate_titles"] = titles_snapshot
+        try:
+            status = await publish_yearbook_board(self.bot, winners)
+            print(f"[yearbook] board: {status}")
+        except Exception as e:
+            print(f"[yearbook] board publish failed: {e}")
         try:
             log_status = await post_yearbook_log(
                 self.bot,
-                winners if winners else (yearbook_state.get("last_winners") or []),
+                [w for w in winners if not w.get("unmet") and w.get("user_id")],
                 note=(
-                    "Automatic weekly resolve"
-                    if winners
-                    else f"Automatic weekly resolve — 0 winners (stats={stats_n}, votes={votes_n})"
+                    f"Automatic weekly resolve — paid={len(paid)} "
+                    f"unmet_noms={sum(1 for w in winners if w.get('unmet'))} "
+                    f"(stats={stats_n}, votes={votes_n})"
                 ),
             )
             print(f"[yearbook] log: {log_status}")
