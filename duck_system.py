@@ -2786,11 +2786,14 @@ def resolve_hatch(
     error_egg_gained = False
 
     # IMPORTANT: never append on duplicate — skip_bonus must not fall into an else-append
+    # Rotten eggs never grant bonus eggs (fresh / error-egg hatches only)
     if is_duplicate:
-        if not skip_bonus and random.random() < DUPLICATE_BONUS_CHANCE:
-            # Fresh (and error-egg hatches) → fresh bonus. Rotten → rotten bonus only.
-            bonus_kind = "rotten" if rotten else "fresh"
-            add_eggs(discord_id, 1, kind=bonus_kind)
+        if (
+            not skip_bonus
+            and not rotten
+            and random.random() < DUPLICATE_BONUS_CHANCE
+        ):
+            add_eggs(discord_id, 1, kind="fresh")
             bonus_egg = True
     else:
         rec["collection"].append(duck_id)
@@ -7923,37 +7926,7 @@ class DuckCog(commands.Cog):
         subs = {str(k): v for k, v in raw_subs.items()}
         thanksgiving_state["submissions"] = subs
 
-        # Second submission: only block if a prior post still exists in-channel
-        if uid in subs:
-            stale = False
-            try:
-                old_mid = int(subs[uid])
-                try:
-                    await message.channel.fetch_message(old_mid)
-                except discord.NotFound:
-                    stale = True
-                except discord.HTTPException:
-                    # Can't verify — treat as real double to be safe
-                    stale = False
-            except (TypeError, ValueError):
-                stale = True
-            if stale:
-                subs.pop(uid, None)
-            else:
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                try:
-                    await message.author.send(
-                        "🦃 You already submitted a Thanksgiving post for this event — "
-                        "only **one** counts. Extra posts are removed."
-                    )
-                except Exception:
-                    pass
-                return
-
-        # Full body length after the phrase (spaces count) — not alnum-only
+        # Multiple posts allowed — still only one duck (collection has no duplicates)
         if len(body) < THANKS_MIN_CHARS:
             try:
                 await message.delete()
@@ -7969,14 +7942,16 @@ class DuckCog(commands.Cog):
                 pass
             return
 
-        duck = duck_index[duck_id]
         rec = get_user_record(uid)
+        granted = False
         if duck_id not in rec.get("collection", []):
             rec.setdefault("collection", []).append(duck_id)
+            granted = True
+        # Track latest valid post (delete-to-revoke still uses this)
         subs[uid] = int(message.id)
         await save_duck_state()
         print(
-            f"[thanksgiving] rewarded {uid} duck={duck_id} "
+            f"[thanksgiving] uid={uid} duck={duck_id} granted={granted} "
             f"msg={message.id} body_len={len(body)}"
         )
         try:
@@ -9438,7 +9413,7 @@ class ThanksgivingAdminView(discord.ui.View):
             "",
             "-# Posts must **start with** **I'm thankful for…**",
             f"-# At least **{THANKS_MIN_CHARS}** characters after that phrase (spaces count)",
-            "-# One post per member · delete/edit-below-min removes the duck",
+            "-# Multiple posts OK · duck only once · delete/edit-below-min removes the duck",
         ]
         return discord.Embed(
             description="\n".join(lines),
