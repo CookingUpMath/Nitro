@@ -104,23 +104,14 @@ ENVIRONMENT_MAX_CHANCE = 15.0
 # Triangular distribution peaked at the low end — most days land near 6%,
 # 15% is a genuinely rare high.
 
-# --- Eggs per drop: 1-5, weighted (sums to 100). ---
+# --- Eggs per drop: 5–10, weighted (sums to 100). ---
 EGG_COUNT_WEIGHTS = [
-    (1, 75.0),   # typical
-    (2, 15.0),
-    (3, 5.0),
-    (4, 3.5),
-    (5, 1.5),    # rare high day
-]
-
-# Elevated egg-count table used while Rewind mode is on (5–10)
-REWIND_EGG_COUNT_WEIGHTS = [
-    (5, 50.0),
+    (5, 50.0),   # typical
     (6, 25.0),
     (7, 12.0),
     (8, 7.0),
     (9, 4.0),
-    (10, 2.0),
+    (10, 2.0),  # rare high day
 ]
 
 # --- Karma ---
@@ -412,7 +403,7 @@ def format_limited_remaining(limited_until: float | None) -> str:
 environment_state = {
     "date": None,
     "drop_chance_percent": ENVIRONMENT_MIN_CHANCE,
-    "egg_count": 1,
+    "egg_count": 5,
     "error_mode": False,
     "purge_mode": False,
     "rewind_mode": False,  # November Rewind package (tokens, ⏪, retro weather)
@@ -527,6 +518,7 @@ POND_PERKS = {
     "auto_win": ("🎯", "Auto Win", "rare"),
     "magnetic": ("🧲", "Magnetic", "rare"),
     "fragile": ("💔", "Fragile", "rare"),
+    "hauler": ("💪", "Hauler", "rare"),
 }
 
 # Tier roll weights (nobody is rolled inside common)
@@ -539,7 +531,7 @@ POND_TIER_WEIGHTS = [
 POND_COMMON_NOBODY_WEIGHT = 55  # % of common rolls that are nobody
 POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery", "mirror"]
 POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck"]
-POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile"]
+POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile", "hauler"]
 
 # Lucky hatcher: no common rolls — mass moved into higher tiers
 LUCKY_RARITY_WEIGHTS = {
@@ -1833,9 +1825,9 @@ def effective_drop_chance_percent(discord_id: str | None = None) -> float:
 
 
 def effective_eggs_per_drop(discord_id: str | None = None) -> int:
-    base = int(environment_state.get("egg_count") or 1)
+    base = int(environment_state.get("egg_count") or 5)
     if is_pond_perk("magnetic", discord_id):
-        return 5
+        return 10  # max of the 5–10 daily range
     return base
 
 
@@ -2203,7 +2195,7 @@ async def load_duck_state():
                     "purge_mode": False,
                 },
             )
-            environment_state.setdefault("egg_count", 1)  # backfill for saves from before this field existed
+            environment_state.setdefault("egg_count", 5)  # backfill for saves from before this field existed
             environment_state.setdefault("error_mode", False)
             environment_state.setdefault("purge_mode", False)
             environment_state["rewind_mode"] = False  # event package removed
@@ -4440,6 +4432,8 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         "-# Max drop rate + max eggs for you",
         "**`💔` Fragile**",
         "-# Half eggs earned",
+        "**`💪` Hauler**",
+        "-# 2x eggs from air drops",
     ]
     emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
     label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
@@ -7013,6 +7007,9 @@ class DuckCog(commands.Cog):
             return
 
         eggs = int(cur["eggs"])
+        # Hauler: 2× air-drop payout for the selected member
+        if is_pond_perk("hauler", uid):
+            eggs = eggs * 2
         if is_ghost:
             # Ghost: earns eggs but does not consume a winner slot
             ghost_wins.append(uid)
@@ -8339,7 +8336,7 @@ class DuckCog(commands.Cog):
         await interaction.response.defer()
         env = await ensure_environment_for_today()
         chance = env["drop_chance_percent"]
-        egg_count = env.get("egg_count", 1)
+        egg_count = env.get("egg_count", 5)
         egg_word = "egg" if egg_count == 1 else "eggs"
 
         fortune_name, _ = give_fortune_for_drop_chance(float(chance))
