@@ -631,23 +631,32 @@ def is_active_moon_duck(duck_id: str) -> bool:
 
 
 def pick_and_activate_moon_duck() -> str | None:
-    """Pick 1 of N configured moon ducks and activate it. Returns duck_id or None."""
+    """Pick 1 of N configured moon ducks and force it into the hatch pool."""
     ids = [d for d in (full_moon_purge_state.get("moon_duck_ids") or []) if d in duck_index]
     if not ids:
         full_moon_purge_state["active_moon_duck_id"] = None
+        print("[full_moon] no moon ducks configured in /purge — pool unchanged")
         return None
-    choice = random.choice(ids)
+    # Prefer a fresh pick; if one is already active and still valid, keep it
+    current = full_moon_purge_state.get("active_moon_duck_id")
+    if current in ids:
+        choice = current
+    else:
+        choice = random.choice(ids)
     full_moon_purge_state["active_moon_duck_id"] = choice
     duck = duck_index[choice]
     duck["active"] = True
     duck["clear_immune"] = True
+    print(f"[full_moon] moon duck activated: {choice} ({duck.get('title')})")
     return choice
 
 
 def deactivate_moon_duck() -> None:
     aid = full_moon_purge_state.get("active_moon_duck_id")
     if aid and aid in duck_index:
+        # Moon ducks stay out of the normal pool when the event ends
         duck_index[aid]["active"] = False
+        duck_index[aid]["clear_immune"] = True  # still protected from clear-pool
     full_moon_purge_state["active_moon_duck_id"] = None
 
 
@@ -662,6 +671,28 @@ def start_purge_event(*, manual: bool = False, window_id: str | None = None) -> 
     if window_id:
         full_moon_purge_state["started_for"] = window_id
     return pick_and_activate_moon_duck()
+
+
+def resolve_purge_announce_channel(bot: commands.Bot):
+    """Warning channel, else first configured air-drop channel."""
+    ch_id = full_moon_purge_state.get("warning_channel_id")
+    if ch_id:
+        channel = bot.get_channel(int(ch_id))
+        if channel is not None:
+            return channel
+        try:
+            # May still be fetchable later; try guilds' cache only here
+            pass
+        except Exception:
+            pass
+    for _gid, cfg in (duck_config or {}).items():
+        aid = cfg.get("air_drop_channel_id")
+        if not aid:
+            continue
+        channel = bot.get_channel(int(aid))
+        if channel is not None:
+            return channel
+    return None
 
 
 def stop_purge_event() -> None:
@@ -8029,42 +8060,78 @@ class DuckCog(commands.Cog):
         start, peak, end, wid = full_moon_window(now)
         changed = False
 
-        # 1h warning (only before the window, not during)
+        async def _announce(text: str) -> None:
+            channel = resolve_purge_announce_channel(self.bot)
+            if channel is None:
+                # Last resort: fetch warning id if cache miss
+                ch_id = full_moon_purge_state.get("warning_channel_id")
+                if ch_id:
+                    try:
+                        channel = await self.bot.fetch_channel(int(ch_id))
+                    except Exception as e:
+                        print(f"[full_moon] fetch warning channel failed: {e}")
+                if channel is None:
+                    for _gid, cfg in (duck_config or {}).items():
+                        aid = cfg.get("air_drop_channel_id")
+                        if not aid:
+                            continue
+                        try:
+                            channel = await self.bot.fetch_channel(int(aid))
+                            break
+                        except Exception:
+                            continue
+            if channel is None:
+                print("[full_moon] no warning/air-drop channel available for announce")
+                return
+            try:
+                await channel.send(text)
+            except Exception as e:
+                print(f"[full_moon] announce failed: {e}")
+
+        # 1h warning (only before the window)
         secs_to_start = (start - now).total_seconds()
         if 0 < secs_to_start <= 3600:
             if full_moon_purge_state.get("warning_sent_for") != wid:
-                ch_id = full_moon_purge_state.get("warning_channel_id")
-                if ch_id:
-                    channel = self.bot.get_channel(int(ch_id))
-                    if channel:
-                        try:
-                            ts = int(start.timestamp())
-                            await channel.send(f"-# ☠️ Purge mode enabled in <t:{ts}:R>")
-                        except Exception as e:
-                            print(f"[full_moon] warning post failed: {e}")
+                ts = int(start.timestamp())
+                await _announce(f"-# ☠️ Purge mode enabled in <t:{ts}:R>")
                 full_moon_purge_state["warning_sent_for"] = wid
                 changed = True
 
         in_window = start <= now <= end
         if in_window:
-            if not is_purge_mode() or full_moon_purge_state.get("started_for") != wid:
+            need_start = (
+                not is_purge_mode()
+                or full_moon_purge_state.get("started_for") != wid
+            )
+            if need_start:
                 chosen = start_purge_event(manual=False, window_id=wid)
                 changed = True
                 print(f"[full_moon] purge ON for {wid}; moon duck={chosen}")
+                # If we missed the 1h warning (bot offline), announce live now
+                if full_moon_purge_state.get("warning_sent_for") != wid:
+                    await _announce("-# ☠️ Purge mode is **live** — stealing enabled")
+                    full_moon_purge_state["warning_sent_for"] = wid
+            else:
+                # Recovery: purge is on but moon duck never made it into the pool
+                aid = full_moon_purge_state.get("active_moon_duck_id")
+                if not aid or aid not in duck_index or not duck_index[aid].get("active"):
+                    chosen = pick_and_activate_moon_duck()
+                    changed = True
+                    print(f"[full_moon] recovered moon duck={chosen}")
         else:
-            # End of window — only auto-stop if we started this window
+            # End of window — only auto-stop if we started this (or an older) window
             if is_purge_mode() and not full_moon_purge_state.get("manual_lock"):
-                if full_moon_purge_state.get("started_for") == wid or (
-                    full_moon_purge_state.get("started_for")
-                    and full_moon_purge_state.get("started_for") != wid
-                    and now > end
-                ):
-                    # If started_for is an older window and we're past current end, stop
+                started = full_moon_purge_state.get("started_for")
+                if started == wid or (started and now > end):
                     stop_purge_event()
-                    # restore drop chance
                     today_str = time.strftime("%Y-%m-%d", time.gmtime())
                     chance = round(
-                        random.triangular(ENVIRONMENT_MIN_CHANCE, ENVIRONMENT_MAX_CHANCE, ENVIRONMENT_MIN_CHANCE), 2
+                        random.triangular(
+                            ENVIRONMENT_MIN_CHANCE,
+                            ENVIRONMENT_MAX_CHANCE,
+                            ENVIRONMENT_MIN_CHANCE,
+                        ),
+                        2,
                     )
                     environment_state["date"] = today_str
                     environment_state["drop_chance_percent"] = chance
@@ -9370,6 +9437,9 @@ class PurgeDucksModal(discord.ui.Modal):
                 if did not in ids:
                     ids.append(did)
                 duck["clear_immune"] = True
+                # Stay out of the pool until a purge activates one
+                if full_moon_purge_state.get("active_moon_duck_id") != did:
+                    duck["active"] = False
                 added.append(duck["title"])
         await save_duck_state()
         parts = []
