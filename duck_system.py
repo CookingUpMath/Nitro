@@ -204,6 +204,9 @@ duck_index = {}
 # }
 # A duck may appear in multiple series. Empty series are deleted automatically.
 duck_series: dict = {}
+# Manual display order for series (casefold keys). Series not listed here
+# append after, sorted by created_at (oldest → newest so new ones land at the end).
+series_order: list = []
 
 # duck_users[discord_id] = {
 #   "inventory": int, "collection": [duck_id, ...], "last_roll_check_ts": float
@@ -2175,7 +2178,7 @@ _bot = None
 
 
 async def load_duck_state():
-    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, yearbook_state, full_moon_purge_state, thanksgiving_state, pond_status_state
+    global duck_index, duck_users, duck_config, duck_stats, pending_invite_karma, redeem_codes, nest_state, environment_state, pending_gifts, air_drop_state, duck_series, series_order, yearbook_state, full_moon_purge_state, thanksgiving_state, pond_status_state
     if _pool is None:
         return
     try:
@@ -2184,7 +2187,7 @@ async def load_duck_state():
                 "SELECT key, value FROM bot_state WHERE key IN "
                 "('duck_index','duck_users','duck_config','duck_stats','duck_pending_invites',"
                 "'duck_redeem_codes','duck_nest_state','duck_environment','duck_pending_gifts',"
-                "'duck_air_drop_state','duck_series','duck_yearbook',"
+                "'duck_air_drop_state','duck_series','duck_series_order','duck_yearbook',"
                 "'duck_full_moon_purge','duck_thanksgiving','duck_pond_status')"
             )
             data = {row["key"]: json.loads(row["value"]) for row in rows}
@@ -2198,6 +2201,8 @@ async def load_duck_state():
             pending_gifts = data.get("duck_pending_gifts", {})
             air_drop_state = data.get("duck_air_drop_state", {})
             duck_series = data.get("duck_series", {})
+            so = data.get("duck_series_order")
+            series_order = list(so) if isinstance(so, list) else []
             yb = data.get("duck_yearbook")
             if isinstance(yb, dict):
                 yearbook_state.update(yb)
@@ -2275,6 +2280,7 @@ async def save_duck_state() -> bool:
                     ("duck_pending_gifts", json.dumps(pending_gifts)),
                     ("duck_air_drop_state", json.dumps(air_drop_state)),
                     ("duck_series", json.dumps(duck_series)),
+                    ("duck_series_order", json.dumps(series_order)),
                     ("duck_yearbook", json.dumps(yearbook_state)),
                     ("duck_full_moon_purge", json.dumps(full_moon_purge_state)),
                     ("duck_thanksgiving", json.dumps(thanksgiving_state)),
@@ -2309,12 +2315,65 @@ def series_key(name: str) -> str:
     return name.strip().casefold()
 
 
+def ordered_series_keys(candidate_keys: list[str] | None = None) -> list[str]:
+    """Manual series_order first, then any remaining by created_at (oldest → newest)."""
+    if candidate_keys is None:
+        pool = set(duck_series.keys())
+    else:
+        pool = set(candidate_keys)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for key in series_order:
+        k = str(key).casefold()
+        if k in pool and k not in seen and k in duck_series:
+            ordered.append(k)
+            seen.add(k)
+    rest = [
+        k for k in pool
+        if k not in seen and k in duck_series
+    ]
+    rest.sort(key=lambda k: float((duck_series.get(k) or {}).get("created_at") or 0))
+    ordered.extend(rest)
+    return ordered
+
+
+def set_series_order_from_names(names: list[str]) -> tuple[list[str], list[str]]:
+    """Replace series_order from typed names. Returns (applied_display_names, missing_names)."""
+    global series_order
+    applied: list[str] = []
+    missing: list[str] = []
+    new_order: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        key = series_key(name)
+        entry = duck_series.get(key)
+        if not entry:
+            missing.append(name)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        new_order.append(key)
+        applied.append(entry.get("name") or name)
+    series_order = new_order
+    return applied, missing
+
+
+def prune_series_order() -> None:
+    """Drop order entries that no longer exist."""
+    global series_order
+    series_order = [k for k in series_order if k in duck_series]
+
+
 def list_series_names() -> list[str]:
-    """Display names sorted case-insensitively."""
-    return sorted(
-        (s.get("name") or k for k, s in duck_series.items()),
-        key=lambda n: n.casefold(),
-    )
+    """Display names in configured order (manual list, then creation order)."""
+    return [
+        (duck_series[k].get("name") or k)
+        for k in ordered_series_keys()
+    ]
 
 
 def toggle_duck_in_series(series_name: str, duck_id: str) -> str:
@@ -2342,6 +2401,7 @@ def toggle_duck_in_series(series_name: str, duck_id: str) -> str:
         ids.remove(duck_id)
         if not ids:
             duck_series.pop(key, None)
+            prune_series_order()
             return "removed_series"
         return "removed"
 
@@ -2360,6 +2420,8 @@ def remove_duck_from_all_series(duck_id: str) -> None:
             empty_keys.append(key)
     for key in empty_keys:
         duck_series.pop(key, None)
+    if empty_keys:
+        prune_series_order()
 
 
 def get_air_drop_state(guild_id: str) -> dict:
@@ -2879,16 +2941,14 @@ def pad3(n: int) -> str:
 
 
 def owned_series_keys(owned: list) -> list[str]:
-    """Series keys the user owns at least one duck from, newest first."""
+    """Series keys the user owns at least one duck from, in display order."""
     owned_set = set(owned)
-    scored = []
+    owned_keys = []
     for key, entry in duck_series.items():
         ids = [d for d in (entry.get("duck_ids") or []) if d in owned_set and d in duck_index]
-        if not ids:
-            continue
-        scored.append((float(entry.get("created_at") or 0), key))
-    scored.sort(key=lambda t: -t[0])
-    return [k for _, k in scored]
+        if ids:
+            owned_keys.append(key)
+    return ordered_series_keys(owned_keys)
 
 
 def filter_owned_ids(owned: list, *, series_key_name: str | None = None, rarity: str | None = None) -> list:
@@ -3011,12 +3071,8 @@ def all_series_member_ids() -> set:
 
 
 def index_series_keys_newest_first() -> list[str]:
-    scored = [
-        (float(entry.get("created_at") or 0), key)
-        for key, entry in duck_series.items()
-    ]
-    scored.sort(key=lambda t: -t[0])
-    return [k for _, k in scored]
+    """Series keys for /index navigation — respects manual order when set."""
+    return ordered_series_keys()
 
 
 def index_filter_ids(ids: list, activity: str) -> list:
@@ -3175,7 +3231,7 @@ def format_series_archive_page(
 
 
 def archive_visible_series_keys() -> list[str]:
-    """Series shown in /archive (not hidden, has at least one duck). Newest first."""
+    """Series shown in /archive (not hidden, has at least one duck). Display order."""
     keys = []
     for key, entry in duck_series.items():
         if entry.get("hidden_from_archive"):
@@ -3184,8 +3240,7 @@ def archive_visible_series_keys() -> list[str]:
         if not ids:
             continue
         keys.append(key)
-    keys.sort(key=lambda k: -float((duck_series.get(k) or {}).get("created_at") or 0))
-    return keys
+    return ordered_series_keys(keys)
 
 
 def format_egg_channel_name(count: int) -> str:
@@ -3763,7 +3818,7 @@ class DuckToggleActiveModal(discord.ui.Modal, title="Toggle Duck Activation"):
 
 
 class SeriesHubView(discord.ui.View):
-    """Editor → Manage Series: pick Manage ducks or Hide/Unhide for archive."""
+    """Editor → Manage Series: ducks, hide, and display order."""
 
     def __init__(self):
         super().__init__(timeout=180)
@@ -3775,6 +3830,10 @@ class SeriesHubView(discord.ui.View):
     @discord.ui.button(label="Hide", style=discord.ButtonStyle.secondary, emoji="🙈")
     async def hide_series(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SeriesHideModal())
+
+    @discord.ui.button(label="Arrange", style=discord.ButtonStyle.secondary, emoji="↕️")
+    async def arrange_series(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SeriesArrangeModal())
 
 
 class ArchiveBrowserView(discord.ui.View):
@@ -3860,6 +3919,54 @@ class ArchiveBrowserView(discord.ui.View):
         embed = self.build_embed()
         self._rebuild()
         await interaction.response.edit_message(embed=embed, view=self)
+
+
+class SeriesArrangeModal(discord.ui.Modal, title="Arrange Series Order"):
+    """Type series names top→bottom; unlisted series stay after in creation order."""
+
+    names = discord.ui.TextInput(
+        label="Series names (top = first)",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        placeholder="One per line or comma-separated",
+        required=True,
+    )
+
+    def __init__(self):
+        super().__init__()
+        current = list_series_names()
+        if current:
+            self.names.default = "\n".join(current[:40])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.names.value or "")
+        parts = []
+        for line in raw.replace(",", "\n").split("\n"):
+            line = line.strip()
+            if line:
+                parts.append(line)
+        applied, missing = set_series_order_from_names(parts)
+        await save_duck_state()
+        lines = []
+        if applied:
+            numbered = "\n".join(f"**{i}.** {n}" for i, n in enumerate(applied, 1))
+            lines.append(f"✅ **Series order set** ({len(applied)}):\n{numbered}")
+        else:
+            lines.append("⚠️ No matching series names — order cleared.")
+        if missing:
+            lines.append("⚠️ Not found: " + ", ".join(missing))
+        unlisted = [
+            (duck_series[k].get("name") or k)
+            for k in ordered_series_keys()
+            if k not in series_order
+        ]
+        if unlisted:
+            lines.append(
+                "-# Not on the list (show after, by creation): "
+                + ", ".join(unlisted[:20])
+                + ("…" if len(unlisted) > 20 else "")
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 class SeriesHideModal(discord.ui.Modal, title="Hide / Unhide Series"):
