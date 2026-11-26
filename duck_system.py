@@ -518,10 +518,11 @@ POND_PERKS = {
     "infected": ("🧪", "Infected", "uncommon"),
     "rotten_luck": ("🤢", "Rotten Luck", "uncommon"),
     "thief": ("🥷", "Thief", "rare"),
-    "auto_win": ("🎯", "Auto Win", "rare"),
+    "phantom": ("👻", "Phantom", "rare"),
     "magnetic": ("🧲", "Magnetic", "rare"),
     "fragile": ("💔", "Fragile", "rare"),
     "hauler": ("💪", "Hauler", "rare"),
+    "sunshine": ("☀️", "Sunshine", "rare"),
 }
 
 # Tier roll weights (nobody is rolled inside common)
@@ -534,7 +535,7 @@ POND_TIER_WEIGHTS = [
 POND_COMMON_NOBODY_WEIGHT = 55  # % of common rolls that are nobody
 POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery", "mirror"]
 POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck"]
-POND_RARE_PERK_IDS = ["thief", "auto_win", "magnetic", "fragile", "hauler"]
+POND_RARE_PERK_IDS = ["thief", "phantom", "magnetic", "fragile", "hauler", "sunshine"]
 
 # Lucky hatcher: no common rolls — mass moved into higher tiers
 LUCKY_RARITY_WEIGHTS = {
@@ -1591,11 +1592,20 @@ def pond_status_holder_id() -> str | None:
 
 
 def is_pond_perk(perk_id: str, discord_id: str | None = None) -> bool:
-    if pond_status_perk_id() != perk_id:
+    current = pond_status_perk_id()
+    # Legacy id from before Auto Win → Phantom rename
+    if perk_id == "phantom" and current == "auto_win":
+        current = "phantom"
+    if current != perk_id:
         return False
     if discord_id is None:
         return True
     return str(discord_id) == str(pond_status_state.get("holder_id") or "")
+
+
+def is_phantom_perk(discord_id: str | None = None) -> bool:
+    """Ghost air-drop claimer (Phantom / legacy Auto Win)."""
+    return is_pond_perk("phantom", discord_id) or is_pond_perk("auto_win", discord_id)
 
 
 # Short timezone labels → IANA (global server; users type short codes)
@@ -2074,9 +2084,9 @@ def award_karma(discord_id: str, points: int = 1):
     rec["karma"] = rec.get("karma", 0) + points
     if points > 0:
         yb_add_karma(discord_id, points)
-    # Normal: 10 karma → 1 egg. Rewind mode: 10 karma → 10 eggs.
+    # Normal: 10 karma → 1 egg. Sunshine perk: 10 karma → 50 eggs (that hour only).
     # Each conversion also has a tiny chance at an error egg (same as rotten item rate).
-    eggs_per_threshold = 1
+    eggs_per_threshold = 50 if is_pond_perk("sunshine", discord_id) else 1
     error_eggs_found = 0
     while rec["karma"] >= KARMA_PER_EGG:
         rec["karma"] -= KARMA_PER_EGG
@@ -4564,14 +4574,16 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         "## Rare",
         "**`🥷` Thief**",
         "-# React 🥷 to steal drops (50/50 | off on Purge)",
-        "**`🎯` Auto Win**",
-        "-# Clear air drops as a ghost (doesn't take a slot)",
+        "**`👻` Phantom**",
+        "-# Claim air drops as a ghost until they expire (doesn't take a slot)",
         "**`🧲` Magnetic**",
         "-# Max drop rate + max eggs for you",
         "**`💔` Fragile**",
         "-# Half eggs earned",
         "**`💪` Hauler**",
         "-# 2x eggs from air drops",
+        "**`☀️` Sunshine**",
+        "-# Karma payout is 50 eggs per threshold (instead of 1)",
     ]
     emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
     label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
@@ -7120,26 +7132,40 @@ class DuckCog(commands.Cog):
         winner: discord.abc.User,
         active: dict,
     ):
-        """Award eggs for one winner slot. Clears the drop only when all slots are filled."""
+        """Award eggs for one winner slot. Clears the drop only when all slots are filled.
+
+        Phantom (ghost) can still claim from a completed drop until AIR_DROP_EXPIRY_SECONDS.
+        """
         state = get_air_drop_state(guild_id)
         slot_key = None
         cur = None
+        mid = int(active.get("message_id") or 0)
         for key in ("active", "secondary"):
             cand = state.get(key)
-            if cand and cand.get("message_id") == active.get("message_id"):
+            if cand and int(cand.get("message_id") or 0) == mid:
                 slot_key, cur = key, cand
                 break
-        if not cur:
-            return  # already finished / expired
 
         uid = str(winner.id)
+        is_ghost = is_phantom_perk(uid)
+
+        # Drop already finished (slots full) — still allow Phantom until expiry
+        if not cur and mid:
+            snap = recent_air_drops.get(mid)
+            if snap and is_ghost:
+                created = float(snap.get("created_at") or 0)
+                if created and (time.time() - created) <= AIR_DROP_EXPIRY_SECONDS:
+                    cur = snap
+                    slot_key = "recent"
+        if not cur:
+            return  # finished / expired / not found
+
         winners = cur.setdefault("winners", [])
         ghost_wins = cur.setdefault("ghost_wins", [])
         if uid in winners or uid in ghost_wins:
-            return  # already claimed a slot on this drop
+            return  # already claimed on this drop
 
         slots = max(1, int(cur.get("slots") or 1))
-        is_ghost = is_pond_perk("auto_win", uid)
 
         if not is_ghost and len(winners) >= slots:
             return
@@ -7151,6 +7177,9 @@ class DuckCog(commands.Cog):
         if is_ghost:
             # Ghost: earns eggs but does not consume a winner slot
             ghost_wins.append(uid)
+            # Keep snapshot in sync if this was a completed drop
+            if slot_key == "recent" and mid:
+                recent_air_drops[mid] = cur
             add_eggs(uid, eggs, kind="fresh")
             yb_add_earned(uid, eggs)
             rec = get_user_record(uid)
@@ -7240,6 +7269,26 @@ class DuckCog(commands.Cog):
                 return True
         return False
 
+    def _air_drops_for_channel(self, guild_id: str, channel_id: int, *, phantom_only_recent: bool = False):
+        """Live actives, plus completed-but-not-expired drops for Phantom claims."""
+        drops = []
+        for key, active in self._iter_air_drop_actives(guild_id):
+            if int(active.get("channel_id", 0)) == channel_id:
+                drops.append(active)
+        if phantom_only_recent:
+            now = time.time()
+            seen = {int(d.get("message_id") or 0) for d in drops}
+            for mid, snap in list(recent_air_drops.items()):
+                if mid in seen:
+                    continue
+                if int(snap.get("channel_id", 0)) != channel_id:
+                    continue
+                created = float(snap.get("created_at") or 0)
+                if not created or (now - created) > AIR_DROP_EXPIRY_SECONDS:
+                    continue
+                drops.append(snap)
+        return drops
+
     async def _process_air_drop_message(self, message: discord.Message):
         """Count a qualifying message toward a message-type air drop, or reverse-word claim."""
         guild_id = str(message.guild.id)
@@ -7251,12 +7300,21 @@ class DuckCog(commands.Cog):
             return
 
         uid = str(message.author.id)
-        for _key, active in self._iter_air_drop_actives(guild_id):
-            if int(active.get("channel_id", 0)) != message.channel.id:
-                continue
+        phantom = is_phantom_perk(uid)
+        for active in self._air_drops_for_channel(
+            guild_id, message.channel.id, phantom_only_recent=phantom
+        ):
             if message.created_at.timestamp() < float(active.get("created_at", 0)):
                 continue
-            if uid in (active.get("winners") or []):
+            if uid in (active.get("winners") or []) or uid in (active.get("ghost_wins") or []):
+                continue
+            # Non-phantoms never claim from a completed snapshot
+            mid = int(active.get("message_id") or 0)
+            live = any(
+                int((c or {}).get("message_id") or 0) == mid
+                for _k, c in self._iter_air_drop_actives(guild_id)
+            )
+            if not live and not phantom:
                 continue
 
             kind = active.get("kind", "messages")
@@ -7274,6 +7332,8 @@ class DuckCog(commands.Cog):
             target = int(active["target"])
 
             if progress[uid] < target:
+                if mid and mid in recent_air_drops:
+                    recent_air_drops[mid] = active
                 await save_duck_state()
                 continue
 
@@ -7463,6 +7523,9 @@ class DuckCog(commands.Cog):
         if payload.emoji.id is not None:
             return  # custom emoji
 
+        uid = str(payload.user_id)
+        phantom = is_phantom_perk(uid)
+
         active = None
         for _key, cand in self._iter_air_drop_actives(guild_id):
             if cand.get("kind") != "reaction":
@@ -7475,11 +7538,22 @@ class DuckCog(commands.Cog):
                 continue
             active = cand
             break
+        # Phantom can still react-claim a filled drop until expiry
+        if not active and phantom:
+            snap = recent_air_drops.get(payload.message_id)
+            if snap and snap.get("kind") == "reaction":
+                created = float(snap.get("created_at") or 0)
+                if (
+                    created
+                    and (time.time() - created) <= AIR_DROP_EXPIRY_SECONDS
+                    and int(snap.get("channel_id", 0)) == payload.channel_id
+                    and payload.emoji.name == snap.get("emoji")
+                ):
+                    active = snap
         if not active:
             return
 
-        uid = str(payload.user_id)
-        if uid in (active.get("winners") or []):
+        if uid in (active.get("winners") or []) or uid in (active.get("ghost_wins") or []):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
