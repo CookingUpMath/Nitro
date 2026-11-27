@@ -4618,7 +4618,7 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         "**`⏪` Rewinder**",
         "-# Free ⏪ on drops / air drops for the hour",
         "**`🧪` Infected**",
-        "-# React 🧪 on unclaimed drops to rot them",
+        "-# React 🧪 on unclaimed drops to rot them — you gain that many fresh eggs",
         "**`🤢` Rotten Luck**",
         "-# Your ground drops are rotten",
         "## Rare",
@@ -7401,7 +7401,7 @@ class DuckCog(commands.Cog):
         uid = str(payload.user_id)
         mid = payload.message_id
 
-        # Infected: holder reacts 🧪 on an unclaimed ground drop
+        # Infected: holder reacts 🧪 on an unclaimed ground drop → rot it, gain that many fresh
         if name == "🧪" and is_pond_perk("infected", uid):
             view = active_egg_drops.get(mid)
             if view is None or view.claimed:
@@ -7410,6 +7410,11 @@ class DuckCog(commands.Cog):
                 return
             view.infected = True
             view.egg_kind = "rotten"
+            amount = int(view.egg_count or 0)
+            if amount > 0:
+                add_eggs(uid, amount, kind="fresh")
+                yb_add_earned(uid, amount)
+                await save_duck_state()
             channel = self.bot.get_channel(payload.channel_id)
             if channel and view.message:
                 try:
