@@ -523,6 +523,7 @@ POND_PERKS = {
     "fragile": ("💔", "Fragile", "rare"),
     "hauler": ("💪", "Hauler", "rare"),
     "sunshine": ("☀️", "Sunshine", "rare"),
+    "rage": ("🤬", "Rage", "rare"),
 }
 
 # Tier roll weights (nobody is rolled inside common)
@@ -535,7 +536,7 @@ POND_TIER_WEIGHTS = [
 POND_COMMON_NOBODY_WEIGHT = 55  # % of common rolls that are nobody
 POND_COMMON_PERK_IDS = ["charm", "blessed", "santa", "slippery", "mirror"]
 POND_UNCOMMON_PERK_IDS = ["lucky", "rewinder", "infected", "rotten_luck"]
-POND_RARE_PERK_IDS = ["thief", "phantom", "magnetic", "fragile", "hauler", "sunshine"]
+POND_RARE_PERK_IDS = ["thief", "phantom", "magnetic", "fragile", "hauler", "sunshine", "rage"]
 
 # Lucky hatcher: no common rolls — mass moved into higher tiers
 LUCKY_RARITY_WEIGHTS = {
@@ -1695,6 +1696,33 @@ def user_in_perk_off_hours(rec: dict, when: float | None = None) -> bool:
     return hour >= start or hour < end
 
 
+def perk_off_hours_span(rec: dict) -> int:
+    """Length of configured off-hours window in hours (0 if disabled)."""
+    if not rec.get("perk_off_enabled"):
+        return 0
+    try:
+        start = int(rec.get("perk_off_start") or 0) % 24
+        end = int(rec.get("perk_off_end") or 0) % 24
+    except (TypeError, ValueError):
+        return 0
+    if start == end:
+        return 24
+    if start < end:
+        return end - start
+    return (24 - start) + end
+
+
+def pond_status_selection_weight(discord_id: str) -> float:
+    """Higher weight for larger off-hours windows. Cap 2×. Min 4h before any boost."""
+    rec = get_user_record(str(discord_id))
+    span = perk_off_hours_span(rec)
+    if span < 4:
+        return 1.0
+    # ~+0.05 per hour past the floor, hard-capped at 2×
+    weight = 1.0 + 0.05 * span
+    return min(2.0, max(1.25, weight))
+
+
 def note_status_activity(discord_id: str) -> None:
     """Rolling 48h qualifying message count for status eligibility."""
     rec = get_user_record(discord_id)
@@ -1773,7 +1801,8 @@ def roll_pond_status_selection() -> tuple[str | None, str | None, str]:
     if not holders:
         text = pick_pond_status_mood(chance)
         return None, None, text
-    holder = random.choice(holders)
+    weights = [pond_status_selection_weight(h) for h in holders]
+    holder = random.choices(holders, weights=weights, k=1)[0]
     # status_text filled in rotate_pond_status as "EMOJI DisplayName"
     return perk_id, holder, ""
 
@@ -3304,6 +3333,8 @@ class EggDropView(discord.ui.View):
             line += "\n-# 🤢 These eggs are **rotten**"
         if self.purge:
             line += "\n-# 🚨 Purge — others can try **🥷 Steal** (50/50)"
+        if is_pond_perk("rage", str(self.owner_id)):
+            line += "\n-# 🤬 **Rage** — anyone but the finder can Hatch / Inventory these"
         return line
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -3317,6 +3348,25 @@ class EggDropView(discord.ui.View):
             return False
         if self.claimed:
             await interaction.response.send_message("These eggs are already gone.", ephemeral=True)
+            return False
+        return True
+
+    async def _require_claim_access(self, interaction: discord.Interaction) -> bool:
+        """Normal drops: finder only. Rage: everyone *except* the finder."""
+        if self.claimed:
+            await interaction.response.send_message("These eggs are already gone.", ephemeral=True)
+            return False
+        owner_raged = is_pond_perk("rage", str(self.owner_id))
+        if owner_raged:
+            if interaction.user.id == self.owner_id:
+                await interaction.response.send_message(
+                    "😂 You thought these were for you!",
+                    ephemeral=True,
+                )
+                return False
+            return True
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This egg isn't yours!", ephemeral=True)
             return False
         return True
 
@@ -3336,7 +3386,7 @@ class EggDropView(discord.ui.View):
 
     @discord.ui.button(label="Hatch", style=discord.ButtonStyle.success, emoji="🐣")
     async def hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._require_owner(interaction):
+        if not await self._require_claim_access(interaction):
             return
         await interaction.response.defer()
         self.claimed = True
@@ -3414,7 +3464,7 @@ class EggDropView(discord.ui.View):
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, emoji="🎒")
     async def store(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._require_owner(interaction):
+        if not await self._require_claim_access(interaction):
             return
         await interaction.response.defer()
         self.claimed = True
@@ -4584,6 +4634,8 @@ def build_perks_embed(discord_id: str) -> discord.Embed:
         "-# 2x eggs from air drops",
         "**`☀️` Sunshine**",
         "-# Karma payout is 50 eggs per threshold (instead of 1)",
+        "**`🤬` Rage**",
+        "-# Others can Hatch/Inventory your drops — you can't",
     ]
     emb = discord.Embed(description="\n".join(lines), color=0x373B3D)
     label = pond_status_state.get("perk_label") or pond_status_state.get("status_text") or "—"
