@@ -1413,7 +1413,7 @@ async def ensure_environment_for_today() -> dict:
     # Error Mode: lock at maximum drop stats; skip daily re-roll
     if environment_state.get("error_mode"):
         environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
-        environment_state["egg_count"] = 5
+        environment_state["egg_count"] = 10
         return environment_state
 
     # Purge Mode: lock drop chance only; keep today's egg_count (or roll if none yet)
@@ -4326,12 +4326,12 @@ class ErrorAdminView(discord.ui.View):
 
         if turning_on:
             environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
-            environment_state["egg_count"] = 5
+            environment_state["egg_count"] = 10
             await save_duck_state()
             msg = (
                 "⚠️ **Error Mode ON**\n"
                 f"• Drop chance locked at **{ENVIRONMENT_MAX_CHANCE:g}%**\n"
-                "• Eggs per drop locked at **5**\n"
+                "• Eggs per drop locked at **10**\n"
                 f"• ERROR weight **{ERROR_WEIGHT} → {ERROR_WEIGHT_EVENT}** (Quackpot-tier)\n"
                 "• Daily weather re-roll paused until you turn this off"
             )
@@ -4383,11 +4383,11 @@ class ErrorAdminView(discord.ui.View):
         else:
             if is_error_mode():
                 environment_state["drop_chance_percent"] = ENVIRONMENT_MAX_CHANCE
-                environment_state["egg_count"] = 5
+                environment_state["egg_count"] = 10
                 await save_duck_state()
                 msg = (
                     "✅ **Purge Mode OFF** (Error Mode still active)\n"
-                    f"• Drop chance stays **{ENVIRONMENT_MAX_CHANCE:g}%** · eggs per drop **5**\n"
+                    f"• Drop chance stays **{ENVIRONMENT_MAX_CHANCE:g}%** · eggs per drop **10**\n"
                     "• Steal button removed from new drops"
                 )
             else:
